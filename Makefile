@@ -1,8 +1,9 @@
 UPSTREAM_DIR := deepseek-harness
 UPSTREAM_COMMIT := $(shell sed -n 's/^commit=//p' upstream.lock)
 UPSTREAM_REPOSITORY := $(shell sed -n 's/^repository=//p' upstream.lock)
+DEV_PORT ?= 13080
 
-.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog test smoke-standalone smoke-clean-archive
+.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog dev test smoke-standalone smoke-clean-archive
 
 prepare:
 	@test -n "$(UPSTREAM_COMMIT)" && test -n "$(UPSTREAM_REPOSITORY)"
@@ -67,6 +68,9 @@ generate-dynamic-inspect-catalog: check-upstream-clean
 
 verify-dynamic-inspect-catalog: check-upstream-clean
 	pnpm --dir "$(UPSTREAM_DIR)" exec tsx ../scripts/gen_dynamic_inspect_catalog.ts --check
+
+dev:
+	go run ./cmd/dsh web --no-open --port "$(DEV_PORT)"
 
 test:
 	go test -count=1 ./...
