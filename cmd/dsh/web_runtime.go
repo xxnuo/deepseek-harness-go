@@ -178,6 +178,7 @@ func newReloadableWebServer(engine *harness.Engine, profileRuntime *profileRunti
 	if err != nil {
 		return nil, err
 	}
+	engine.SetWebServerListener(listener)
 	runtime := &reloadableWebServer{
 		listener: listener, configuredAddr: configuredAddr,
 		serveErrors: make(chan error, 1), profileResults: make(chan webProfileResult, 1), stdout: stdout, stderr: stderr,
@@ -253,7 +254,15 @@ func (runtime *reloadableWebServer) replace(engine *harness.Engine, profileRunti
 			return err
 		}
 	}
+	runtime.mu.RLock()
+	currentListener := runtime.listener
+	runtime.mu.RUnlock()
 	next := newWebGeneration(engine, profileRuntime)
+	if nextListener != nil {
+		engine.SetWebServerListener(nextListener)
+	} else {
+		engine.SetWebServerListener(currentListener)
+	}
 	runtime.mu.Lock()
 	previous := runtime.generation
 	previousListener := runtime.listener

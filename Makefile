@@ -3,7 +3,7 @@ UPSTREAM_COMMIT := $(shell sed -n 's/^commit=//p' upstream.lock)
 UPSTREAM_REPOSITORY := $(shell sed -n 's/^repository=//p' upstream.lock)
 DEV_PORT ?= 13080
 
-.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog dev test smoke-standalone smoke-clean-archive
+.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test smoke-standalone smoke-clean-archive
 
 prepare:
 	@test -n "$(UPSTREAM_COMMIT)" && test -n "$(UPSTREAM_REPOSITORY)"
@@ -48,7 +48,9 @@ verify-upstream: check-upstream-clean
 	@$(MAKE) verify-runtime-assets
 	@$(MAKE) verify-pi-ai-catalog
 	@$(MAKE) verify-dynamic-inspect-catalog
-	@go test -count=1 -run '^TestUpstreamContract' .
+	@$(MAKE) verify-upstream-inventory
+	@$(MAKE) verify-public-facade
+	@go test -count=1 -run '^TestUpstreamContract' ./internal/harness
 	@go test -count=1 -run '^TestUpstreamCLIContract$$' ./cmd/dsh
 
 sync-runtime-assets: check-upstream-clean
@@ -68,6 +70,18 @@ generate-dynamic-inspect-catalog: check-upstream-clean
 
 verify-dynamic-inspect-catalog: check-upstream-clean
 	pnpm --dir "$(UPSTREAM_DIR)" exec tsx ../scripts/gen_dynamic_inspect_catalog.ts --check
+
+generate-upstream-inventory: check-upstream-clean
+	UPDATE_UPSTREAM_INVENTORY=1 go test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
+
+verify-upstream-inventory: check-upstream-clean
+	go test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
+
+generate-public-facade:
+	go run ./scripts/gen_public_facade
+
+verify-public-facade:
+	go run ./scripts/gen_public_facade -check
 
 dev:
 	go run ./cmd/dsh web --no-open --port "$(DEV_PORT)"

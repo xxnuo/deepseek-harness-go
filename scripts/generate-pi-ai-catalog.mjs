@@ -4,7 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const packageRoot = resolve(root, 'deepseek-harness/packages/llm/llm-pi-ai/node_modules/@earendil-works/pi-ai')
-const outputPath = resolve(root, 'pi_ai_catalog.json')
+const outputPath = resolve(root, 'internal/harness/pi_ai_catalog.json')
 const supported = new Set([
   'anthropic-messages',
   'azure-openai-responses',
@@ -45,6 +45,18 @@ const providers = builtinProviders().map((provider) => {
     id: provider.id,
     name: provider.name,
     baseUrl: provider.baseUrl,
+    auth: {
+      ...(provider.auth.apiKey === undefined ? {} : {
+        apiKey: { name: provider.auth.apiKey.name, login: provider.auth.apiKey.login !== undefined },
+      }),
+      ...(provider.auth.oauth === undefined ? {} : {
+        oauth: {
+          name: provider.auth.oauth.name,
+          ...(provider.auth.oauth.loginLabel === undefined ? {} : { loginLabel: provider.auth.oauth.loginLabel }),
+          login: provider.auth.oauth.login !== undefined,
+        },
+      }),
+    },
     models,
   }
 })

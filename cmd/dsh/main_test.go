@@ -698,7 +698,7 @@ func TestStandaloneBinaryServesEmbeddedRuntime(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("standalone UI response = %d, %v", response.StatusCode, err)
 	}
-	const bootPrefix = "window.__DSH_BOOT__ = "
+	const bootPrefix = `globalThis["__DSH_BOOT__"] = `
 	start := bytes.Index(html, []byte(bootPrefix))
 	if start < 0 {
 		t.Fatal("standalone UI missed boot graph")

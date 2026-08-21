@@ -7,11 +7,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	harness "github.com/xxnuo/deepseek-harness-go"
+	core "github.com/xxnuo/deepseek-harness-go/internal/harness"
 )
+
+func TestPublicFacadeInitialVariablesMatchImplementation(t *testing.T) {
+	if harness.ErrEngineClosed != core.ErrEngineClosed ||
+		!reflect.DeepEqual(harness.DefaultFileReferenceExcludedDirectories, core.DefaultFileReferenceExcludedDirectories) ||
+		!reflect.DeepEqual(harness.PythonWireFrameFields, core.PythonWireFrameFields) {
+		t.Fatal("public facade variables do not match the implementation defaults")
+	}
+}
 
 func TestPublicLibraryRoundTrip(t *testing.T) {
 	e, err := harness.New(

@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	core "github.com/xxnuo/deepseek-harness-go/internal/harness"
 )
 
 //go:embed upstream.lock runtime-assets/deepseek-harness
@@ -24,12 +26,7 @@ var defaultAssets struct {
 	err   error
 }
 
-type AssetPaths struct {
-	UpstreamDir string
-	FrontendDir string
-	PluginDir   string
-	PresetDir   string
-}
+type AssetPaths = core.AssetPaths
 
 // MaterializeAssets makes the original UI and its runtime configuration
 // available to filesystem-based hosts without requiring an upstream checkout.
