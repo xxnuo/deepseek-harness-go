@@ -13,23 +13,47 @@ import (
 
 const defaultClaudeCodeDisposeGrace = 3 * time.Second
 
-// ClaudeCodeSubagentConfig configures the fixed Claude Code one-shot
-// provider. Executable defaults to claude; an explicit path is useful for
-// packaged applications that do not inherit a shell PATH.
+// ClaudeCodePermissionMode fixes the native non-interactive policy for one
+// Claude Code provider instance.
+type ClaudeCodePermissionMode string
+
+const (
+	ClaudeCodePermissionDontAsk           ClaudeCodePermissionMode = "dontAsk"
+	ClaudeCodePermissionAcceptEdits       ClaudeCodePermissionMode = "acceptEdits"
+	ClaudeCodePermissionAuto              ClaudeCodePermissionMode = "auto"
+	ClaudeCodePermissionPlan              ClaudeCodePermissionMode = "plan"
+	ClaudeCodePermissionBypassPermissions ClaudeCodePermissionMode = "bypassPermissions"
+)
+
+// ClaudeCodeSubagentConfig configures one named Claude Code provider.
+// Executable defaults to claude; an explicit path is useful for packaged
+// applications that do not inherit a shell PATH.
 type ClaudeCodeSubagentConfig struct {
-	Executable   string
-	Env          map[string]string
-	DisposeGrace time.Duration
+	ProviderName   string
+	PermissionMode ClaudeCodePermissionMode
+	Executable     string
+	Env            map[string]string
+	DisposeGrace   time.Duration
 }
 
 // ClaudeCodeSubagentProvider drives the Claude Code stream-json CLI protocol.
 type ClaudeCodeSubagentProvider struct {
-	executable   string
-	env          map[string]string
-	disposeGrace time.Duration
+	name           string
+	permissionMode ClaudeCodePermissionMode
+	executable     string
+	env            map[string]string
+	disposeGrace   time.Duration
 }
 
 func NewClaudeCodeSubagentProvider(config ClaudeCodeSubagentConfig) (*ClaudeCodeSubagentProvider, error) {
+	name := strings.TrimSpace(config.ProviderName)
+	if name == "" {
+		name = "claude-code"
+	}
+	permissionMode, err := resolveClaudeCodePermissionMode(config.PermissionMode)
+	if err != nil {
+		return nil, err
+	}
 	executable := strings.TrimSpace(config.Executable)
 	if executable == "" {
 		executable = "claude"
@@ -48,10 +72,27 @@ func NewClaudeCodeSubagentProvider(config ClaudeCodeSubagentConfig) (*ClaudeCode
 	if _, ok := env["CLAUDE_AGENT_SDK_VERSION"]; !ok {
 		env["CLAUDE_AGENT_SDK_VERSION"] = "0.3.220"
 	}
-	return &ClaudeCodeSubagentProvider{executable: executable, env: env, disposeGrace: grace}, nil
+	return &ClaudeCodeSubagentProvider{name: name, permissionMode: permissionMode, executable: executable, env: env, disposeGrace: grace}, nil
 }
 
-func (p *ClaudeCodeSubagentProvider) Name() string { return "claude-code" }
+func resolveClaudeCodePermissionMode(mode ClaudeCodePermissionMode) (ClaudeCodePermissionMode, error) {
+	switch ClaudeCodePermissionMode(strings.TrimSpace(string(mode))) {
+	case "", ClaudeCodePermissionDontAsk:
+		return ClaudeCodePermissionDontAsk, nil
+	case ClaudeCodePermissionAcceptEdits:
+		return ClaudeCodePermissionAcceptEdits, nil
+	case ClaudeCodePermissionAuto:
+		return ClaudeCodePermissionAuto, nil
+	case ClaudeCodePermissionPlan:
+		return ClaudeCodePermissionPlan, nil
+	case ClaudeCodePermissionBypassPermissions:
+		return ClaudeCodePermissionBypassPermissions, nil
+	default:
+		return "", errors.New("subagent-claude-code: permissionMode must be dontAsk, acceptEdits, auto, plan, or bypassPermissions")
+	}
+}
+
+func (p *ClaudeCodeSubagentProvider) Name() string { return p.name }
 func (p *ClaudeCodeSubagentProvider) Capabilities() SubagentCapabilities {
 	return NoSubagentStartCapabilities()
 }
@@ -71,7 +112,10 @@ func (p *ClaudeCodeSubagentProvider) Start(ctx context.Context, request Subagent
 	}
 	args := []string{
 		"--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
-		"--disallowedTools", "AskUserQuestion", "--permission-mode", "default", "--no-session-persistence",
+		"--disallowedTools", "AskUserQuestion", "--permission-mode", string(p.permissionMode), "--no-session-persistence",
+	}
+	if p.permissionMode == ClaudeCodePermissionBypassPermissions {
+		args = append(args, "--dangerously-skip-permissions")
 	}
 	process, err := startSubagentProcess(p.executable, args, cwd, p.env)
 	if err != nil {

@@ -24,14 +24,21 @@ const (
 	TerminalSignalStop      = "SIGTSTP"
 	TerminalSignalHangup    = "SIGHUP"
 
+	TerminalShellDialectBash = "bash"
+	TerminalShellDialectPwsh = "pwsh"
+
 	defaultTerminalMaxResultBytes = 256 * 1024
 	minimumTerminalResultBytes    = 64
+
+	terminalPowerShellEncodingPreamble = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+	terminalPowerShellPrompt           = "function prompt { [Console]::Write([char]27 + ']133;D;' + [int]$LASTEXITCODE + [char]7); '" + terminalPrompt + "' }"
 )
 
-// TerminalConfig configures the built-in interactive Bash PTY backend.
+// TerminalConfig configures the built-in interactive shell PTY backend.
 type TerminalConfig struct {
 	Disabled              bool          `json:"disabled,omitempty" yaml:"disabled,omitempty"`
 	BackendType           string        `json:"backendType,omitempty" yaml:"backendType,omitempty"`
+	ShellDialect          string        `json:"shellDialect,omitempty" yaml:"shellDialect,omitempty"`
 	ShellPath             string        `json:"shellPath,omitempty" yaml:"shellPath,omitempty"`
 	ShellArgs             []string      `json:"shellArgs,omitempty" yaml:"shellArgs,omitempty"`
 	Rows                  int           `json:"rows,omitempty" yaml:"rows,omitempty"`
@@ -61,9 +68,9 @@ type TerminalToolConfig struct {
 }
 
 func defaultTerminalConfig() TerminalConfig {
-	shellPath, shellArgs := platformTerminalShellDefaults()
+	shellDialect, shellPath, shellArgs := platformTerminalShellDefaults()
 	return TerminalConfig{
-		BackendType: "shell", ShellPath: shellPath, ShellArgs: shellArgs,
+		BackendType: "shell", ShellDialect: shellDialect, ShellPath: shellPath, ShellArgs: shellArgs,
 		Rows: 40, Cols: 160, ScrollbackLines: 10_000, ScrollbackMaxBytes: 4 * 1024 * 1024,
 		MaxReadBytes: 256 * 1024, PollInterval: 50 * time.Millisecond,
 		ExactProbeAfter: 150 * time.Millisecond, IdleSilence: 3 * time.Second,
@@ -76,11 +83,15 @@ func normalizeTerminalConfig(config TerminalConfig) TerminalConfig {
 	if config.BackendType == "" {
 		config.BackendType = defaults.BackendType
 	}
-	if config.ShellPath == "" {
-		config.ShellPath = defaults.ShellPath
+	if config.ShellDialect == "" {
+		config.ShellDialect = defaults.ShellDialect
 	}
-	if config.ShellArgs == nil {
-		config.ShellArgs = append([]string(nil), defaults.ShellArgs...)
+	shellPath, shellArgs := terminalShellDefaults(config.ShellDialect)
+	if config.ShellPath == "" {
+		config.ShellPath = shellPath
+	}
+	if len(config.ShellArgs) == 0 {
+		config.ShellArgs = append([]string(nil), shellArgs...)
 	} else {
 		config.ShellArgs = append([]string(nil), config.ShellArgs...)
 	}
@@ -121,6 +132,9 @@ func terminalDuration(value time.Duration, milliseconds int, fallback time.Durat
 func validateTerminalConfig(config TerminalConfig) error {
 	if strings.TrimSpace(config.BackendType) == "" {
 		return errors.New("terminal-bash: backendType must be non-empty")
+	}
+	if config.ShellDialect != TerminalShellDialectBash && config.ShellDialect != TerminalShellDialectPwsh {
+		return fmt.Errorf("terminal-bash: unsupported shellDialect %q", config.ShellDialect)
 	}
 	if strings.TrimSpace(config.ShellPath) == "" {
 		return errors.New("terminal-bash: shellPath must be non-empty")
@@ -226,6 +240,21 @@ type TerminalBackendSpawnSpec struct {
 	SandboxMode string
 }
 
+func terminalShellEnvironment(config TerminalConfig, spec TerminalBackendSpawnSpec) map[string]string {
+	env := map[string]string{
+		"TERM": "dumb", "PAGER": "cat", "GIT_PAGER": "cat", "DSH_SHELL": "1",
+		"DSH_SESSION_ID": spec.OwnerID, "DSH_PTY_SESSION_ID": spec.SessionID,
+	}
+	if config.ShellDialect == TerminalShellDialectPwsh {
+		env["NO_COLOR"] = "1"
+		return env
+	}
+	env["PS1"] = terminalPrompt
+	env["PROMPT_COMMAND"] = `printf "\033]133;D;%s\007" "$?"; PS1='` + terminalPrompt + `'`
+	env["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
+	return env
+}
+
 type TerminalSendRequest struct {
 	Text   string `json:"text"`
 	Submit bool   `json:"submit"`
@@ -297,6 +326,56 @@ type TerminalBackendSession interface {
 type TerminalBackend interface {
 	Type() string
 	Spawn(context.Context, TerminalBackendSpawnSpec) (TerminalBackendSession, error)
+}
+
+func initializeTerminalShell(ctx context.Context, session TerminalBackendSession, config TerminalConfig) (string, error) {
+	startupCtx := ctx
+	cancel := func() {}
+	if config.ShellDialect == TerminalShellDialectPwsh {
+		startupCtx, cancel = context.WithTimeout(ctx, config.Timeout)
+	}
+	defer cancel()
+	first := true
+	for {
+		if err := startupCtx.Err(); err != nil {
+			return "", err
+		}
+		request := TerminalSendRequest{}
+		if first && config.ShellDialect == TerminalShellDialectPwsh {
+			request.Text = terminalPowerShellEncodingPreamble + terminalPowerShellPrompt
+			request.Submit = true
+		}
+		operation, err := session.StartSend(startupCtx, request)
+		if err != nil {
+			return "", err
+		}
+		select {
+		case <-operation.Done():
+		case <-startupCtx.Done():
+			return "", startupCtx.Err()
+		}
+		result, err := operation.Result()
+		if err != nil {
+			return "", err
+		}
+		if result.WaitReason == TerminalWaitSessionExit {
+			return "", errors.New("PTY shell exited during startup")
+		}
+		if result.WaitReason == TerminalWaitTimeout {
+			return "", errors.New("PTY shell did not reach readiness before startup timeout")
+		}
+		if config.ShellDialect != TerminalShellDialectPwsh {
+			return result.Viewport, nil
+		}
+		scrollback, err := session.Read(TerminalReadRequest{Count: 20})
+		if err != nil {
+			return "", err
+		}
+		if strings.Contains(result.Viewport, terminalPrompt) || strings.Contains(scrollback.Text, terminalPrompt) {
+			return result.Viewport, nil
+		}
+		first = false
+	}
 }
 
 type TerminalBackendCleanupError struct {

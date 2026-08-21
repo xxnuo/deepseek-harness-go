@@ -422,6 +422,66 @@ func TestTerminalCloseOwnerClosesPublishedSessions(t *testing.T) {
 	}
 }
 
+type startupTerminalSession struct {
+	requests []TerminalSendRequest
+}
+
+func (session *startupTerminalSession) MOTD() string { return "" }
+func (session *startupTerminalSession) PID() int     { return 1 }
+func (session *startupTerminalSession) StartSend(_ context.Context, request TerminalSendRequest) (TerminalSendOperation, error) {
+	session.requests = append(session.requests, request)
+	operation := newTestTerminalOperation()
+	viewport := "PowerShell banner"
+	if len(session.requests) > 1 {
+		viewport = terminalPrompt
+	}
+	operation.finish(TerminalSendResult{Viewport: viewport, WaitReason: TerminalWaitInferredIdle, SessionStatus: runningTerminalStatus()}, nil)
+	return operation, nil
+}
+func (session *startupTerminalSession) Read(TerminalReadRequest) (TerminalReadResult, error) {
+	text := "PowerShell banner"
+	if len(session.requests) > 1 {
+		text += "\n" + terminalPrompt
+	}
+	return TerminalReadResult{Text: text}, nil
+}
+func (session *startupTerminalSession) Signal(string) (TerminalSignalResult, error) {
+	return TerminalSignalResult{}, nil
+}
+func (session *startupTerminalSession) Status() TerminalSessionStatus { return runningTerminalStatus() }
+func (session *startupTerminalSession) Close(string) error            { return nil }
+
+func TestTerminalPwshDialectDefaultsAndStartup(t *testing.T) {
+	config := normalizeTerminalConfig(TerminalConfig{ShellDialect: TerminalShellDialectPwsh})
+	if config.ShellPath == "" || len(config.ShellArgs) != 2 || config.ShellArgs[0] != "-NoLogo" || config.ShellArgs[1] != "-NoProfile" {
+		t.Fatalf("pwsh defaults = path %q args %#v", config.ShellPath, config.ShellArgs)
+	}
+	if err := validateTerminalConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	invalid := config
+	invalid.ShellDialect = "fish"
+	if err := validateTerminalConfig(invalid); err == nil || !strings.Contains(err.Error(), "shellDialect") {
+		t.Fatalf("invalid dialect error = %v", err)
+	}
+
+	session := &startupTerminalSession{}
+	motd, err := initializeTerminalShell(context.Background(), session, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if motd != terminalPrompt || len(session.requests) != 2 {
+		t.Fatalf("pwsh startup = motd %q requests %#v", motd, session.requests)
+	}
+	first := session.requests[0]
+	if !first.Submit || !strings.Contains(first.Text, terminalPowerShellEncodingPreamble) || !strings.Contains(first.Text, "function prompt") {
+		t.Fatalf("pwsh bootstrap = %#v", first)
+	}
+	if second := session.requests[1]; second.Text != "" || second.Submit {
+		t.Fatalf("pwsh readiness poll = %#v", second)
+	}
+}
+
 func waitTerminalOperation(t *testing.T, channel <-chan *testTerminalOperation) *testTerminalOperation {
 	t.Helper()
 	select {

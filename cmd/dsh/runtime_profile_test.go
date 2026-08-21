@@ -112,9 +112,52 @@ func TestClientHMRProfileConfigMapsPollInterval(t *testing.T) {
 	}
 }
 
+func TestFileReferenceProfileConfigPreservesExplicitLimits(t *testing.T) {
+	composed := testComposition(t, `
+- id: file-reference-local
+  name: '@deepseek-ai/dsh-file-reference-local'
+  config:
+    maxResults: 7
+    maxEntries: 321
+    excludedDirectories: [.git, vendor]
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	config := engineConfig(&profileLoader{home: t.TempDir()}, composed).FileReference
+	if config.MaxResults != 7 || config.MaxEntries != 321 || strings.Join(config.ExcludedDirectories, ",") != ".git,vendor" {
+		t.Fatalf("file-reference-local config = %#v", config)
+	}
+}
+
+func TestAgentTeamProfileConfigMapsLimitsAndProviders(t *testing.T) {
+	composed := testComposition(t, `
+- id: agent-team
+  name: '@deepseek-ai/dsh-experimental-agent-team'
+  config:
+    maxMembers: 3
+    maxTasks: 21
+    maxPendingMessagesPerMember: 5
+    maxMessageBytes: 4096
+    disposalTimeoutMs: 2500
+- id: tool-agent-team
+  name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+  config:
+    freshProvider: custom-spawn
+    forkProvider: custom-fork
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	config := engineConfig(&profileLoader{home: t.TempDir()}, composed).AgentTeams
+	if config == nil || config.MaxMembers != 3 || config.MaxTasks != 21 || config.MaxPendingMessagesPerMember != 5 || config.MaxMessageBytes != 4096 || config.DisposalTimeout != 2500*time.Millisecond || config.FreshProvider != "custom-spawn" || config.ForkProvider != "custom-fork" {
+		t.Fatalf("Agent Teams config = %#v", config)
+	}
+}
+
 func TestSQLiteSessionProfilePersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.sqlite")
-	source := fmt.Sprintf("- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: %q, journalMode: delete, preparedSessionCacheSize: 9, writeBatchMaxDelayMs: 123}\n", path)
+	source := fmt.Sprintf("- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: %q, journalMode: delete, busyTimeoutMs: 77, preparedSessionCacheSize: 9, writeBatchMaxDelayMs: 123}\n", path)
 	newConfig := func() harness.Config {
 		composed := testComposition(t, source)
 		if err := composed.validate(); err != nil {
@@ -122,7 +165,7 @@ func TestSQLiteSessionProfilePersistsAcrossRestart(t *testing.T) {
 		}
 		cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
 		store, ok := cfg.SessionStore.(*harness.SQLiteSessionStore)
-		if !ok || store.Options().PreparedSessionCacheSize != 9 || store.Options().WriteBatchMaxDelay != 123*time.Millisecond {
+		if !ok || store.Options().BusyTimeout != 77*time.Millisecond || !store.Options().BusyTimeoutSet || store.Options().PreparedSessionCacheSize != 9 || store.Options().WriteBatchMaxDelay != 123*time.Millisecond {
 			t.Fatalf("SQLite coordinator options = %#v", cfg.SessionStore)
 		}
 		cfg.Provider, cfg.Model = "echo", "echo"
@@ -258,10 +301,18 @@ func TestRuntimeProfileRejectsUnsupportedOrIncompleteConfig(t *testing.T) {
 		{"hook path", "- id: hooks\n  name: '@deepseek-ai/dsh-hooks-codex'\n", "configPath is required"},
 		{"title route pair", "- id: title\n  name: '@deepseek-ai/dsh-session-title-all-prompts-llm'\n  config: {targetWords: 5, targetCjkCharacters: 10, maxInputBytes: 1024, maxOutputTokens: 32, timeoutMs: 1000, provider: only-provider}\n", "supplied together"},
 		{"SQLite tuning", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', preparedSessionCacheSize: 0}\n", "must be a positive integer"},
+		{"SQLite busy timeout", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', busyTimeoutMs: -1}\n", "must be between 0 and 2147483647"},
 		{"SQLite batch delay", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', writeBatchMaxDelayMs: 0}\n", "must be between 1 and 2147483647"},
 		{"storage service", "- id: sqlite\n  name: '@deepseek-ai/dsh-storage-sqlite'\n  config: {path: ':memory:'}\n", "require an enabled"},
 		{"storage route", "- id: storage\n  name: '@deepseek-ai/dsh-storage'\n- id: domain\n  name: '@deepseek-ai/dsh-storage-domain'\n  config: {backend: sqlite}\n", "is not mounted"},
 		{"HTTP limits", "- id: fetch\n  name: '@deepseek-ai/dsh-web-fetch-http'\n  config: {timeoutMs: 0}\n", "must be positive"},
+		{"file reference max results", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {maxResults: 0}\n", "maxResults must be a positive safe integer"},
+		{"file reference max entries", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {maxEntries: 0}\n", "maxEntries must be a positive safe integer"},
+		{"file reference excluded directory", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {excludedDirectories: ['bad/path']}\n", "must be non-empty directory basenames"},
+		{"Agent Teams member limit", "- id: teams\n  name: '@deepseek-ai/dsh-experimental-agent-team'\n  config: {maxMembers: 0}\n", "maxMembers must be a positive safe integer"},
+		{"Agent Teams fractional task limit", "- id: teams\n  name: '@deepseek-ai/dsh-experimental-agent-team'\n  config: {maxTasks: 1.5}\n", "invalid config"},
+		{"Agent Teams tool owner", "- id: tools\n  name: '@deepseek-ai/dsh-experimental-tool-agent-team'\n", "requires an enabled"},
+		{"Agent Teams provider", "- id: teams\n  name: '@deepseek-ai/dsh-experimental-agent-team'\n- id: tools\n  name: '@deepseek-ai/dsh-experimental-tool-agent-team'\n  config: {freshProvider: ''}\n", "freshProvider must be non-empty"},
 		{"missing selected provider", "- id: web\n  name: '@deepseek-ai/dsh-web'\n  config: {searchProvider: exa}\n", "is not mounted"},
 	}
 	for _, test := range tests {

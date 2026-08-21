@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -22,6 +23,7 @@ type OpenAIResponsesProvider struct {
 	modelSpec                  piAIModel
 	websockets                 *openAIResponsesWebSocketPool
 	streamIdleTimeout          time.Duration
+	strictDefault              bool
 }
 
 func NewOpenAIResponsesProvider(id, baseURL, apiKey, model string) *OpenAIResponsesProvider {
@@ -48,23 +50,28 @@ func (p *OpenAIResponsesProvider) Models(ctx context.Context) ([]ModelInfo, erro
 	return provider.Models(ctx)
 }
 
-func openAIResponsesInput(req ChatRequest) []any {
+func openAIResponsesInput(req ChatRequest, model piAIModel) []any {
 	input := make([]any, 0, len(req.Messages)+1)
 	if req.System != "" {
-		input = append(input, map[string]any{"role": "system", "content": req.System})
+		role := "system"
+		if model.Reasoning && (model.Compat.SupportsDeveloperRole == nil || *model.Compat.SupportsDeveloperRole) {
+			role = "developer"
+		}
+		input = append(input, map[string]any{"role": role, "content": req.System})
 	}
 	for _, message := range req.Messages {
 		switch message.Role {
 		case "user":
-			content := make([]any, 0, len(message.Images)+1)
-			if message.Content != "" {
-				content = append(content, map[string]any{"type": "input_text", "text": message.Content})
-			}
-			for _, image := range message.Images {
-				content = append(content, map[string]any{
-					"type": "input_image", "detail": "auto",
-					"image_url": "data:" + image.MediaType + ";base64," + image.Data,
-				})
+			content := make([]any, 0, len(chatContentParts(message)))
+			for _, part := range chatContentParts(message) {
+				if part.Type == "text" {
+					content = append(content, map[string]any{"type": "input_text", "text": part.Text})
+				} else if part.Type == "image" {
+					content = append(content, map[string]any{
+						"type": "input_image", "detail": "auto",
+						"image_url": "data:" + part.MediaType + ";base64," + part.Data,
+					})
+				}
 			}
 			if len(content) > 0 {
 				input = append(input, map[string]any{"role": "user", "content": content})
@@ -86,9 +93,23 @@ func openAIResponsesInput(req ChatRequest) []any {
 				})
 			}
 		case "tool":
-			output := message.Content
-			if output == "" {
-				output = "(no output)"
+			var output any = message.Content
+			if chatMessageHasImage(message) && (len(model.Input) == 0 || slices.Contains(model.Input, "image")) {
+				parts := make([]any, 0, len(chatContentParts(message)))
+				for _, part := range chatContentParts(message) {
+					if part.Type == "text" {
+						parts = append(parts, map[string]any{"type": "input_text", "text": part.Text})
+					} else if part.Type == "image" {
+						parts = append(parts, map[string]any{"type": "input_image", "detail": "auto", "image_url": "data:" + part.MediaType + ";base64," + part.Data})
+					}
+				}
+				output = parts
+			} else if output == "" {
+				if chatMessageHasImage(message) {
+					output = "(see attached image)"
+				} else {
+					output = "(no output)"
+				}
 			}
 			input = append(input, map[string]any{
 				"type": "function_call_output", "call_id": message.ToolCallID, "output": output,
@@ -102,19 +123,36 @@ func openAIResponsesInput(req ChatRequest) []any {
 	return input
 }
 
+func openAIResponsesTools(schemas []ToolSchema, supportsStrict bool, strict any) []any {
+	tools := make([]any, 0, len(schemas))
+	for _, schema := range schemas {
+		tool := map[string]any{
+			"type": "function", "name": schema.Name, "description": schema.Description, "parameters": schema.Parameters,
+		}
+		if supportsStrict {
+			if constrained, requested, _ := resolveJSONSchemaStrictSampling(schema, supportsStrict); requested {
+				tool["strict"] = constrained
+			} else {
+				tool["strict"] = strict
+			}
+		}
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
 func (p *OpenAIResponsesProvider) requestBody(req ChatRequest) map[string]any {
 	model := req.Model
 	if model == "" {
 		model = p.model
 	}
-	tools := make([]any, 0, len(req.Tools))
-	for _, schema := range req.Tools {
-		tools = append(tools, map[string]any{
-			"type": "function", "name": schema.Name, "description": schema.Description, "parameters": schema.Parameters,
-		})
+	supportsStrict := p.strictDefault
+	if p.modelSpec.Compat.SupportsStrictMode != nil {
+		supportsStrict = *p.modelSpec.Compat.SupportsStrictMode
 	}
+	tools := openAIResponsesTools(req.Tools, supportsStrict, false)
 	body := map[string]any{
-		"model": model, "input": openAIResponsesInput(req), "stream": true, "store": false,
+		"model": model, "input": openAIResponsesInput(req, p.modelSpec), "stream": true, "store": false,
 	}
 	if len(tools) > 0 {
 		body["tools"] = tools
@@ -162,6 +200,13 @@ func (p *OpenAIResponsesProvider) requestBody(req ChatRequest) map[string]any {
 }
 
 func (p *OpenAIResponsesProvider) Complete(ctx context.Context, req ChatRequest, onDelta func(Delta) error) (Completion, error) {
+	supportsStrict := p.strictDefault
+	if p.modelSpec.Compat.SupportsStrictMode != nil {
+		supportsStrict = *p.modelSpec.Compat.SupportsStrictMode
+	}
+	if err := validateToolSampling(req.Tools, supportsStrict); err != nil {
+		return Completion{}, err
+	}
 	body := p.requestBody(req)
 	if p.transport != "" && p.transport != "sse" {
 		completion, started, err := p.completeWebSocket(ctx, req, body, onDelta)
@@ -362,7 +407,7 @@ func (s *openAIResponsesState) completion() (Completion, error) {
 	if s.finish == "" {
 		s.finish = "stop"
 	}
-	if err := s.onDelta(Delta{Finish: s.finish}); err != nil {
+	if err := s.onDelta(Delta{Usage: cloneStringMap(s.usage), Finish: s.finish}); err != nil {
 		return Completion{}, err
 	}
 	if s.text == "" && s.reasoning == "" && len(toolCalls) == 0 {

@@ -48,6 +48,10 @@ func (p *bedrockProvider) Complete(ctx context.Context, req ChatRequest, onDelta
 	if err != nil {
 		return Completion{}, err
 	}
+	supportsStrict := p.modelSpec.Compat.SupportsStrictMode != nil && *p.modelSpec.Compat.SupportsStrictMode
+	if err := validateToolSampling(req.Tools, supportsStrict); err != nil {
+		return Completion{}, err
+	}
 	body := p.requestBody(req)
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -128,12 +132,17 @@ func (p *bedrockProvider) requestBody(req ChatRequest) map[string]any {
 		body["inferenceConfig"] = inference
 	}
 	if len(req.Tools) > 0 {
+		supportsStrict := p.modelSpec.Compat.SupportsStrictMode != nil && *p.modelSpec.Compat.SupportsStrictMode
 		tools := make([]any, 0, len(req.Tools))
 		for _, tool := range req.Tools {
-			tools = append(tools, map[string]any{"toolSpec": map[string]any{
+			spec := map[string]any{
 				"name": tool.Name, "description": tool.Description,
 				"inputSchema": map[string]any{"json": tool.Parameters},
-			}})
+			}
+			if _, requested, _ := resolveJSONSchemaStrictSampling(tool, supportsStrict); requested {
+				spec["strict"] = true
+			}
+			tools = append(tools, map[string]any{"toolSpec": spec})
 		}
 		body["toolConfig"] = map[string]any{"tools": tools}
 	}
@@ -185,7 +194,15 @@ func bedrockMessages(messages []ChatMessage, model piAIModel, retention string) 
 				content = append(content, map[string]any{"text": message.Content})
 			}
 			if reasoning := strings.TrimSpace(message.Reasoning); reasoning != "" {
-				content = append(content, map[string]any{"reasoningContent": map[string]any{"reasoningText": map[string]any{"text": message.Reasoning}}})
+				if bedrockClaude(model) {
+					if strings.TrimSpace(message.ReasoningSignature) == "" {
+						content = append(content, map[string]any{"text": message.Reasoning})
+					} else {
+						content = append(content, map[string]any{"reasoningContent": map[string]any{"reasoningText": map[string]any{"text": message.Reasoning, "signature": message.ReasoningSignature}}})
+					}
+				} else {
+					content = append(content, map[string]any{"reasoningContent": map[string]any{"reasoningText": map[string]any{"text": message.Reasoning}}})
+				}
 			}
 			for _, call := range message.ToolCalls {
 				arguments := map[string]any{}
@@ -227,16 +244,17 @@ func bedrockMessages(messages []ChatMessage, model piAIModel, retention string) 
 }
 
 func bedrockTextAndImages(message ChatMessage) []any {
-	content := make([]any, 0, len(message.Images)+1)
-	if strings.TrimSpace(message.Content) != "" {
-		content = append(content, map[string]any{"text": message.Content})
-	}
-	for _, image := range message.Images {
-		format := strings.TrimPrefix(strings.ToLower(image.MediaType), "image/")
-		if format == "jpg" {
-			format = "jpeg"
+	content := make([]any, 0, len(chatContentParts(message)))
+	for _, part := range chatContentParts(message) {
+		if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
+			content = append(content, map[string]any{"text": part.Text})
+		} else if part.Type == "image" {
+			format := strings.TrimPrefix(strings.ToLower(part.MediaType), "image/")
+			if format == "jpg" {
+				format = "jpeg"
+			}
+			content = append(content, map[string]any{"image": map[string]any{"format": format, "source": map[string]any{"bytes": part.Data}}})
 		}
-		content = append(content, map[string]any{"image": map[string]any{"format": format, "source": map[string]any{"bytes": image.Data}}})
 	}
 	if len(content) == 0 {
 		content = append(content, map[string]any{"text": bedrockEmptyText})
@@ -567,17 +585,19 @@ type bedrockStreamBlock struct {
 	id        string
 	name      string
 	arguments string
+	signature string
 }
 
 type bedrockStreamState struct {
-	onDelta   func(Delta) error
-	blocks    map[int]*bedrockStreamBlock
-	text      string
-	reasoning string
-	calls     []ToolCall
-	finish    string
-	usage     map[string]any
-	terminal  bool
+	onDelta            func(Delta) error
+	blocks             map[int]*bedrockStreamBlock
+	text               string
+	reasoning          string
+	reasoningSignature string
+	calls              []ToolCall
+	finish             string
+	usage              map[string]any
+	terminal           bool
 }
 
 func (s *bedrockStreamState) handleEvent(event bedrockEvent) error {
@@ -628,6 +648,9 @@ func (s *bedrockStreamState) handleEvent(event bedrockEvent) error {
 				"cache_read_tokens": jsonInt(usage["cacheReadInputTokens"]), "cache_write_tokens": jsonInt(usage["cacheWriteInputTokens"]),
 				"total_tokens": jsonInt(usage["totalTokens"]),
 			}
+			if err := s.onDelta(Delta{Usage: cloneStringMap(s.usage)}); err != nil {
+				return err
+			}
 		}
 	case "internalServerException", "modelStreamErrorException", "validationException", "throttlingException", "serviceUnavailableException":
 		return &ProviderError{Code: "PROVIDER", Message: event.Type + ": " + string(event.Payload)}
@@ -660,14 +683,22 @@ func (s *bedrockStreamState) handleDelta(payload map[string]any) error {
 	}
 	if reasoning, ok := delta["reasoningContent"].(map[string]any); ok {
 		text := stringSetting(reasoning["text"])
+		signature := stringSetting(reasoning["signature"])
 		if text == "" {
 			if nested, ok := reasoning["reasoningText"].(map[string]any); ok {
 				text = stringSetting(nested["text"])
+				signature = stringSetting(nested["signature"])
 			}
 		}
 		if text != "" {
 			s.reasoning += text
-			return s.onDelta(Delta{Reasoning: text})
+			if err := s.onDelta(Delta{Reasoning: text}); err != nil {
+				return err
+			}
+		}
+		if signature != "" {
+			s.reasoningSignature += signature
+			return s.onDelta(Delta{ReasoningSignature: signature})
 		}
 	}
 	return nil
@@ -689,5 +720,5 @@ func (s *bedrockStreamState) completion() (Completion, error) {
 	if s.text == "" && s.reasoning == "" && len(s.calls) == 0 {
 		return Completion{}, &ProviderError{Code: "EMPTY_RESPONSE", Message: "model returned a completed response with no content"}
 	}
-	return Completion{Text: s.text, Reasoning: s.reasoning, ToolCalls: s.calls, Usage: s.usage, Finish: s.finish}, nil
+	return Completion{Text: s.text, Reasoning: s.reasoning, ReasoningSignature: s.reasoningSignature, ToolCalls: s.calls, Usage: s.usage, Finish: s.finish}, nil
 }

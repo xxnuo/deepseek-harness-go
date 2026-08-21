@@ -12,6 +12,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+)
+
+const (
+	maxSubagentDiagnosticBytes = 4096
+	diagnosticTruncationSuffix = "\n[diagnostic truncated]"
 )
 
 // SubagentStopReason is the provider-independent terminal state of one
@@ -69,6 +75,7 @@ type SubagentToolFilter struct {
 // SubagentResult is the terminal output of one published run.
 type SubagentResult struct {
 	Output     []ContentBlock     `json:"output"`
+	Diagnostic string             `json:"diagnostic,omitempty"`
 	StopReason SubagentStopReason `json:"stopReason"`
 }
 
@@ -167,7 +174,20 @@ func (r *SubagentRun) Close() error { return r.Dispose() }
 
 func cloneSubagentResult(result SubagentResult) SubagentResult {
 	result.Output = append([]ContentBlock(nil), result.Output...)
+	result.Diagnostic = limitSubagentDiagnostic(result.Diagnostic)
 	return result
+}
+
+func limitSubagentDiagnostic(diagnostic string) string {
+	diagnostic = strings.ToValidUTF8(diagnostic, "\uFFFD")
+	if len(diagnostic) <= maxSubagentDiagnosticBytes {
+		return diagnostic
+	}
+	limit := maxSubagentDiagnosticBytes - len(diagnosticTruncationSuffix)
+	for limit > 0 && !utf8.RuneStart(diagnostic[limit]) {
+		limit--
+	}
+	return diagnostic[:limit] + diagnosticTruncationSuffix
 }
 
 // RegisterSubagentProvider installs a provider for programmatic consumers.

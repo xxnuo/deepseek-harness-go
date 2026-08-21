@@ -399,6 +399,7 @@ func (e *Engine) dynamicCordisDetachPrepared(run *dynamicCordisRun, prepared *dy
 		if cancel != nil {
 			cancel()
 		}
+		e.releaseFileReferenceSearch(id)
 		prepared.entered = false
 		e.discardDynamicCordisPreparedSession(run, id)
 		e.mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -97,6 +98,9 @@ func TestHTTPRPCSessionLifecycle(t *testing.T) {
 	}
 	if value["provider"] != "echo" || value["model"] != "echo" {
 		t.Fatalf("host.describe provider/model = %v/%v, want echo/echo", value["provider"], value["model"])
+	}
+	if home, _ := os.UserHomeDir(); value["home"] != home {
+		t.Fatalf("host.describe home = %v, want %q", value["home"], home)
 	}
 
 	status, envelope = postRPC(t, server.Client(), server.URL, "", "session.create", map[string]any{"cwd": e.Config().Workspace})

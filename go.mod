@@ -8,6 +8,7 @@ require (
 	github.com/dlclark/regexp2/v2 v2.5.2
 	github.com/dop251/goja v0.0.0-20260806115107-493f22071ef6
 	github.com/evanw/esbuild v0.28.2
+	github.com/klauspost/compress v1.18.3
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.21.0

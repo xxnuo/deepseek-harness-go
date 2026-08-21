@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -156,6 +159,56 @@ func TestJSONRPCSDKRoundTrip(t *testing.T) {
 	}
 	if !receipt {
 		t.Fatalf("no durable inbox receipt for %q in %s", messageID, output.String())
+	}
+}
+
+func TestStandaloneSDKBinaryJSONRPCRoundTrip(t *testing.T) {
+	repository, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "dsh-sdk")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/dsh-sdk")
+	build.Dir = repository
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build dsh-sdk: %v\n%s", err, output)
+	}
+
+	input := strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"cwd":".","provider":"echo","model":"echo"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"sdk-process-session","contentBlocks":[{"type":"text","text":"SDK process works"}]}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"shutdown"}`,
+	}, "\n") + "\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary)
+	command.Dir = t.TempDir()
+	command.Env = append(os.Environ(), "DSH_HOME="+t.TempDir())
+	command.Stdin = input
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("run dsh-sdk: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	responses := map[int]bool{}
+	receipt := false
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			t.Fatalf("decode dsh-sdk frame %q: %v", line, err)
+		}
+		if id, ok := frame["id"].(float64); ok {
+			responses[int(id)] = frame["error"] == nil
+		}
+		if frame["method"] == "session.event" {
+			params, _ := frame["params"].(map[string]any)
+			event, _ := params["event"].(map[string]any)
+			receipt = receipt || event["type"] == "agent/inbox/spliced"
+		}
+	}
+	if !responses[1] || !responses[2] || !responses[3] || !receipt {
+		t.Fatalf("dsh-sdk round trip incomplete: %s", stdout.String())
 	}
 }
 

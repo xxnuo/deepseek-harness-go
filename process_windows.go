@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	shellToolName        = "pwsh"
-	shellToolDescription = "Execute a PowerShell command in a fresh process under the current sandbox policy. Set run_in_background for long-running commands, then use job_output or job_kill with the returned job id."
-	shellToolPersistent  = true
+	shellToolName           = "pwsh"
+	shellToolDescription    = "Execute a PowerShell command in a fresh process under the current sandbox policy. Set run_in_background for long-running commands, then use job_output or job_kill with the returned job id."
+	shellCommandDescription = "The PowerShell command to run. Relative path is preferred in the command."
+	shellToolPersistent     = true
 )
 
 const powershellEncodingPreamble = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); "

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -361,21 +363,31 @@ func (p *OpenAIResponsesProvider) completeWebSocketPrepared(ctx context.Context,
 		}
 		return Completion{}, false, &ProviderError{Code: "TRANSPORT", Message: "OpenAI Responses WebSocket write failed: " + err.Error(), Err: err}
 	}
+	// A successful response.create write means the request is already in flight.
+	// Do not retry it over SSE if the server later goes idle or closes the stream.
+	started = true
 
 	state := newOpenAIResponsesState(onDelta)
 	for !state.terminal {
-		deadline := time.Time{}
+		idleDeadline := time.Time{}
 		if p.streamIdleTimeout > 0 {
-			deadline = time.Now().Add(p.streamIdleTimeout)
+			idleDeadline = time.Now().Add(p.streamIdleTimeout)
 		}
+		deadline := idleDeadline
+		idleDeadlineSelected := !idleDeadline.IsZero()
 		if contextDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || contextDeadline.Before(deadline)) {
 			deadline = contextDeadline
+			idleDeadlineSelected = false
 		}
 		_ = lease.conn.SetReadDeadline(deadline)
 		var message string
 		if receiveErr := websocket.Message.Receive(lease.conn, &message); receiveErr != nil {
 			if ctx.Err() != nil {
 				return Completion{}, started, ctx.Err()
+			}
+			var netErr net.Error
+			if idleDeadlineSelected && errors.As(receiveErr, &netErr) && netErr.Timeout() {
+				return Completion{}, started, &ProviderError{Code: "TIMEOUT", Message: fmt.Sprintf("provider stream idle timeout after %s", p.streamIdleTimeout), Err: receiveErr}
 			}
 			return Completion{}, started, &ProviderError{Code: "TRANSPORT", Message: "OpenAI Responses WebSocket read failed: " + receiveErr.Error(), Err: receiveErr}
 		}

@@ -35,6 +35,9 @@ func transcriptMessages(events []Event, turn int) []ChatMessage {
 					message.Content += block.Text
 				case "reasoning":
 					message.Reasoning += block.Text
+					if block.Signature != "" {
+						message.ReasoningSignature = block.Signature
+					}
 				case "tool-call":
 					message.ToolCalls = append(message.ToolCalls, ToolCall{ID: block.ID, Name: block.Name, Arguments: json.RawMessage(block.Arguments)})
 				}
@@ -82,7 +85,7 @@ func contentBlocks(value any) []ContentBlock {
 			if !ok {
 				continue
 			}
-			block := ContentBlock{Type: stringValue(data["type"]), Text: stringValue(data["text"]), ID: stringValue(data["id"]), Name: stringValue(data["name"]), Arguments: stringValue(data["arguments"]), ToolCallID: stringValue(data["toolCallId"])}
+			block := ContentBlock{Type: stringValue(data["type"]), Text: stringValue(data["text"]), Signature: stringValue(data["signature"]), ID: stringValue(data["id"]), Name: stringValue(data["name"]), Arguments: stringValue(data["arguments"]), ToolCallID: stringValue(data["toolCallId"])}
 			if raw, ok := data["attachment"].(map[string]any); ok {
 				var attachment ImageAttachmentRef
 				if encoded, err := json.Marshal(raw); err == nil && json.Unmarshal(encoded, &attachment) == nil {
@@ -100,24 +103,123 @@ func contentBlocks(value any) []ContentBlock {
 }
 
 func (e *Engine) hydrateChatMessages(messages []ChatMessage) []ChatMessage {
+	return e.hydrateChatMessagesWithLimit(messages, 0)
+}
+
+func base64PayloadBytes(bytes int) int {
+	if bytes <= 0 {
+		return 0
+	}
+	return ((bytes + 2) / 3) * 4
+}
+
+func replaceOldestBlockImages(blocks []ContentBlock, remaining *int) []ContentBlock {
+	cloned := cloneContentBlocks(blocks)
+	for index := range cloned {
+		if *remaining == 0 {
+			break
+		}
+		if cloned[index].Type == "image" && cloned[index].Attachment != nil {
+			cloned[index] = ContentBlock{Type: "text", Text: OffloadedImageText}
+			*remaining = *remaining - 1
+			continue
+		}
+		cloned[index].Content = replaceOldestBlockImages(cloned[index].Content, remaining)
+	}
+	return cloned
+}
+
+func offloadDurableMessageImages(messages []ChatMessage, maxBytes int) []ChatMessage {
+	if maxBytes <= 0 {
+		return messages
+	}
+	lengths := make([]int, 0)
+	var collect func([]ContentBlock)
+	collect = func(blocks []ContentBlock) {
+		for _, block := range blocks {
+			if block.Type == "image" && block.Attachment != nil {
+				lengths = append(lengths, base64PayloadBytes(block.Attachment.Bytes))
+			}
+			collect(block.Content)
+		}
+	}
+	for _, message := range messages {
+		collect(message.Blocks)
+	}
+	total, count := 0, 0
+	for _, bytes := range lengths {
+		total += bytes
+	}
+	for _, bytes := range lengths {
+		if total <= maxBytes {
+			break
+		}
+		total -= bytes
+		count++
+	}
+	if count == 0 {
+		return messages
+	}
+	out := append([]ChatMessage(nil), messages...)
+	remaining := count
+	for index := range out {
+		before := remaining
+		blocks := replaceOldestBlockImages(out[index].Blocks, &remaining)
+		if remaining != before {
+			out[index].Blocks = blocks
+			out[index].Content = contentValueText(blocks)
+			out[index].HadImages = true
+		}
+	}
+	return out
+}
+
+func (e *Engine) hydrateChatMessagesWithLimit(messages []ChatMessage, maxBytes int) []ChatMessage {
+	messages = offloadDurableMessageImages(messages, maxBytes)
 	out := make([]ChatMessage, len(messages))
 	copy(out, messages)
 	for i := range out {
 		if len(out[i].Blocks) == 0 {
 			continue
 		}
-		for _, block := range out[i].Blocks {
-			if block.Type != "image" || block.Attachment == nil {
-				continue
+		var hydrate func([]ContentBlock)
+		hydrate = func(blocks []ContentBlock) {
+			for _, block := range blocks {
+				switch {
+				case block.Type == "text":
+					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "text", Text: block.Text})
+				case block.Type == "image" && block.Attachment != nil:
+					data, err := e.readImage(*block.Attachment)
+					if err != nil {
+						continue
+					}
+					encoded := base64.StdEncoding.EncodeToString(data)
+					out[i].Images = append(out[i].Images, ChatImage{MediaType: block.Attachment.MediaType, Data: encoded})
+					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "image", MediaType: block.Attachment.MediaType, Data: encoded})
+				default:
+					hydrate(block.Content)
+				}
 			}
-			data, err := e.readImage(*block.Attachment)
-			if err != nil {
-				continue
-			}
-			out[i].Images = append(out[i].Images, ChatImage{MediaType: block.Attachment.MediaType, Data: base64.StdEncoding.EncodeToString(data)})
 		}
+		hydrate(out[i].Blocks)
 	}
 	return out
+}
+
+func (e *Engine) requestImageLimit(provider string) int {
+	if provider == "" {
+		provider = e.cfg.Provider
+	}
+	if provider == "deepseek-official" {
+		return positiveIntSetting(deepSeekEffectiveSettings(e)["maxRequestImageBytes"], deepSeekDefaultImageBytes)
+	}
+	e.mu.RLock()
+	configured := e.piAIProviders[provider]
+	e.mu.RUnlock()
+	if configured != nil {
+		return configured.profile.maxRequestImageBytes
+	}
+	return 0
 }
 
 func stringValue(value any) string {

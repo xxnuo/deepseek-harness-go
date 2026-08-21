@@ -33,11 +33,20 @@ type ImageAttachmentRef struct {
 }
 
 const (
-	maxImageBytes        = 5 << 20
+	maxImageBytes        = 7 << 19
 	maxImagesPerMessage  = 20
 	maxMessageImageBytes = 100 << 20
 	maxImagePixels       = 40_000_000
+	maxImageDimension    = 2000
 )
+
+// EncodedImageAttachment is the public wire shape used by slash commands.
+// Admission validates and stores the bytes before a handler receives refs.
+type EncodedImageAttachment struct {
+	MediaType string `json:"mediaType"`
+	Data      string `json:"data"`
+	Name      string `json:"name,omitempty"`
+}
 
 var attachmentIDPattern = regexp.MustCompile(`^sha256:([a-f0-9]{64})$`)
 
@@ -81,6 +90,9 @@ func imageDimensions(mediaType string, data []byte) (int, int, error) {
 	}
 	if config.Width > maxImagePixels/config.Height {
 		return 0, 0, errors.New("image exceeds the decoded pixel limit")
+	}
+	if config.Width > maxImageDimension || config.Height > maxImageDimension {
+		return 0, 0, errors.New("image exceeds the configured per-side pixel limit")
 	}
 	if _, _, err := image.Decode(bytes.NewReader(data)); err != nil {
 		return 0, 0, errors.New("image data is malformed")

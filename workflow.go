@@ -1206,6 +1206,7 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 	}
 	session.mu.Lock()
 	sessionID, restriction := session.Header.ID, session.toolRestriction
+	reportVisible := session.Header.Origin == "subagent" && session.Header.Mode == "continuable" && session.attached
 	session.mu.Unlock()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -1218,17 +1219,20 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 		if owner != "" && owner != sessionID {
 			continue
 		}
+		if name == "report" && (!reportVisible || owner != "") {
+			continue
+		}
 		if owner == "" && !restriction.allows(name) {
 			continue
 		}
 		if !shippedToolNames[name] || runtimeConfig.toolNames == nil || runtimeConfig.toolNames[name] {
-			if name == "bash" && runtimeConfig.persistentBash {
+			if name == shellToolName && runtimeConfig.persistentBash {
 				tool.Schema.Output = map[string]any{"type": "string"}
 				tool.Schema.Description = runtimeConfig.persistentBashDesc
 				if tool.Schema.Description == "" {
 					tool.Schema.Description = persistentShellDefaultDescription
 				}
-				tool.Schema.Parameters = objectSchema(map[string]any{"command": map[string]any{"type": "string", "description": "The bash command to run. Relative path is preferred in the command."}}, "command")
+				tool.Schema.Parameters = objectSchema(map[string]any{"command": map[string]any{"type": "string", "description": shellCommandDescription}}, "command")
 			}
 			tools[name] = tool
 		}

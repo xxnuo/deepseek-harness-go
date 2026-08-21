@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,11 +26,15 @@ func TestProfileSubagentProvidersReachEngine(t *testing.T) {
 - id: subagent-codex
   name: '@deepseek-ai/dsh-subagent-codex'
   config:
+    providerName: codex-safe
+    permissionMode: approve-for-me
     env: {CODEX_FLAG: enabled}
     disposeGraceMs: 13
 - id: subagent-claude-code
   name: '@deepseek-ai/dsh-subagent-claude-code'
   config:
+    providerName: claude-safe
+    permissionMode: acceptEdits
     env: {CLAUDE_FLAG: enabled}
     disposeGraceMs: 14
 - id: subagent-dsh-sdk
@@ -48,6 +54,17 @@ func TestProfileSubagentProvidersReachEngine(t *testing.T) {
 	if err := composed.validate(); err != nil {
 		t.Fatal(err)
 	}
+	profileDir := t.TempDir()
+	bin := filepath.Join(profileDir, "node_modules", ".bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"codex", "claude"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	composed.profileDir = profileDir
 	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
 	cfg.DataDir = t.TempDir()
 	cfg.Persist = false
@@ -64,9 +81,21 @@ func TestProfileSubagentProvidersReachEngine(t *testing.T) {
 	for index, row := range rows {
 		names[index] = row.Name
 	}
-	want := []string{"acp-profile", "claude-code", "codex", "sdk-profile"}
+	want := []string{"acp-profile", "claude-safe", "codex-safe", "sdk-profile"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("registered providers = %q, want %q", names, want)
+	}
+}
+
+func TestProfileProductExecutableRequiresProfileLauncher(t *testing.T) {
+	composed := testComposition(t, `
+- id: codex
+  name: '@deepseek-ai/dsh-subagent-codex'
+`)
+	composed.profileDir = t.TempDir()
+	_, err := composed.resolveSubagentProviders()
+	if err == nil || !strings.Contains(err.Error(), "package-local codex launcher") {
+		t.Fatalf("resolveSubagentProviders() = %v", err)
 	}
 }
 

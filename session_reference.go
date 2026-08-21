@@ -205,6 +205,11 @@ type SessionReferenceCandidate struct {
 	CreatedAt int64  `json:"createdAt"`
 }
 
+type SessionReferenceMentionCandidate struct {
+	SessionReferenceCandidate
+	Mention string `json:"mention"`
+}
+
 type SessionReferenceContext struct {
 	Content []ContentBlock `json:"content"`
 	Source  map[string]any `json:"source"`
@@ -314,6 +319,26 @@ func (e *Engine) ListSessionReferenceCandidates(ctx context.Context, targetID, q
 		return nil, sessionReferenceCancelledError(ctx)
 	}
 	return rows, nil
+}
+
+// ListSessionReferenceMentionCandidates is the UI-facing discovery API. It
+// carries the canonical prompt mention alongside each reusable candidate.
+func (e *Engine) ListSessionReferenceMentionCandidates(ctx context.Context, targetID, query string) ([]SessionReferenceMentionCandidate, error) {
+	candidates, err := e.ListSessionReferenceCandidates(ctx, targetID, query, 0, e.cfg.SessionReference)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SessionReferenceMentionCandidate, len(candidates))
+	for index, candidate := range candidates {
+		result[index] = SessionReferenceMentionCandidate{
+			SessionReferenceCandidate: candidate,
+			Mention: FormatSessionReferenceMention(SessionReferenceInput{
+				SessionID: candidate.SessionID,
+				Label:     candidate.Label,
+			}),
+		}
+	}
+	return result, nil
 }
 
 func sessionReferenceCandidateRank(candidate, target string) int {

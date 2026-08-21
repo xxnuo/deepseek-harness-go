@@ -38,15 +38,19 @@ type SkillDefinition struct {
 }
 
 func registerModelTools(e *Engine) error {
-	for _, tool := range []Tool{
+	tools := []Tool{
 		builtinAskUserTool(e),
 		builtinGetGoalTool(e),
 		builtinCreateGoalTool(e),
 		builtinUpdateGoalTool(e),
-		builtinSendMessageTool(e),
-		builtinInterruptAgentTool(e),
-		builtinListAgentsTool(e),
-	} {
+		subagentReportTool(e),
+	}
+	if e.agentTeams == nil {
+		tools = append(tools, builtinSendMessageTool(e), builtinInterruptAgentTool(e), builtinListAgentsTool(e))
+	} else {
+		tools = append(tools, builtinAgentTeamTools(e)...)
+	}
+	for _, tool := range tools {
 		if err := e.RegisterTool(tool); err != nil {
 			return err
 		}
@@ -544,6 +548,10 @@ func (e *Engine) resolveSessionToolRestriction(filter *SubagentToolFilter) (*ses
 }
 
 func (e *Engine) createModelSubagent(ctx context.Context, parentID, label string, fork bool, mode string, config SubagentToolConfig) (string, error) {
+	return e.createModelSubagentWithID(ctx, parentID, "", label, fork, mode, config)
+}
+
+func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childID, label string, fork bool, mode string, config SubagentToolConfig) (string, error) {
 	if config.MaxDepth != nil {
 		depth, err := e.sessionDepth(parentID)
 		if err != nil {
@@ -559,11 +567,15 @@ func (e *Engine) createModelSubagent(ctx context.Context, parentID, label string
 	}
 	parent.mu.Lock()
 	cwd, preset, depth, selection := parent.Header.CWD, sessionAgentPreset(parent.Header, parent.Events), parent.Header.DelegationDepth, parent.Model
+	available := parent.attached && !parent.draining
 	var events []Event
 	if fork {
 		events = append([]Event(nil), parent.Events...)
 	}
 	parent.mu.Unlock()
+	if !available {
+		return "", errors.New("subagent-parent-unavailable: parent session is not resident")
+	}
 	if fork {
 		cut := completedTurnCut(events, nil)
 		if cut >= 0 {
@@ -591,8 +603,8 @@ func (e *Engine) createModelSubagent(ctx context.Context, parentID, label string
 	if fork {
 		pinPermission = len(events) == 0
 	}
-	childID, err := e.createSession(ctx, SessionHeader{
-		CWD: cwd, ParentSession: parentID, SeedLength: len(events), Origin: "subagent",
+	childID, err = e.createSession(ctx, SessionHeader{
+		ID: childID, CWD: cwd, ParentSession: parentID, SeedLength: len(events), Origin: "subagent",
 		DelegationDepth: depth + 1, AgentPreset: preset, Mode: mode,
 	}, pinPermission)
 	if err != nil {

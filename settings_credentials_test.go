@@ -3,10 +3,12 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -546,6 +548,266 @@ func TestCredentialsRejectInvalidWirePayload(t *testing.T) {
 	result := rpcResult(t, envelope)
 	if result["ok"] != false || result["error"].(map[string]any)["code"] != "bad-request" {
 		t.Fatalf("invalid credentials response = %#v", result)
+	}
+}
+
+func newSharedPersistenceEngine(t *testing.T, dir string) *Engine {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.SessionTitleLLM.Enabled = false
+	cfg.DataDir = dir
+	cfg.Workspace = dir
+	cfg.Provider = "echo"
+	cfg.Model = "echo"
+	cfg.Persist = true
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	return e
+}
+
+func holdOwnerWriterLock(t *testing.T, path string) func() {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := path + ".lock"
+	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func requireWriterBlocked(t *testing.T, done <-chan *RPCError) {
+	t.Helper()
+	select {
+	case result := <-done:
+		t.Fatalf("writer completed while its lock was held: %#v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestSettingsWritersMergeAcrossIndependentEngines(t *testing.T) {
+	dir := t.TempDir()
+	first := newSharedPersistenceEngine(t, dir)
+	second := newSharedPersistenceEngine(t, dir)
+	release := holdOwnerWriterLock(t, settingsYAMLPathFor(first))
+	start := make(chan struct{})
+	firstReady := make(chan struct{})
+	secondReady := make(chan struct{})
+	firstDone := make(chan *RPCError, 1)
+	secondDone := make(chan *RPCError, 1)
+	go func() {
+		close(firstReady)
+		<-start
+		_, rpcErr := first.settingsUpdate("ui-onboarding", map[string]any{"welcomeNoticeVersion": "first"}, nil, false)
+		firstDone <- rpcErr
+	}()
+	go func() {
+		close(secondReady)
+		<-start
+		_, rpcErr := second.settingsUpdate("ui-theme", map[string]any{"preference": "dark"}, nil, false)
+		secondDone <- rpcErr
+	}()
+	<-firstReady
+	<-secondReady
+	close(start)
+	requireWriterBlocked(t, firstDone)
+	requireWriterBlocked(t, secondDone)
+	release()
+	if rpcErr := <-firstDone; rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if rpcErr := <-secondDone; rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	reloaded := newSharedPersistenceEngine(t, dir)
+	if got := reloaded.settings["ui-onboarding"]["welcomeNoticeVersion"]; got != "first" {
+		t.Fatalf("ui-onboarding after independent writes = %#v", reloaded.settings)
+	}
+	if got := reloaded.settings["ui-theme"]["preference"]; got != "dark" {
+		t.Fatalf("ui-theme after independent writes = %#v", reloaded.settings)
+	}
+}
+
+func TestCredentialWritersMergeAcrossIndependentEngines(t *testing.T) {
+	const firstRef = "DSH_WRITER_LOCK_FIRST"
+	const secondRef = "DSH_WRITER_LOCK_SECOND"
+	t.Setenv(firstRef, "")
+	t.Setenv(secondRef, "")
+	dir := t.TempDir()
+	first := newSharedPersistenceEngine(t, dir)
+	second := newSharedPersistenceEngine(t, dir)
+	release := holdOwnerWriterLock(t, credentialsYAMLPathFor(first))
+	start := make(chan struct{})
+	firstReady := make(chan struct{})
+	secondReady := make(chan struct{})
+	firstDone := make(chan *RPCError, 1)
+	secondDone := make(chan *RPCError, 1)
+	go func() {
+		close(firstReady)
+		<-start
+		firstDone <- first.setCredential(firstRef, "first-value")
+	}()
+	go func() {
+		close(secondReady)
+		<-start
+		secondDone <- second.setCredential(secondRef, "second-value")
+	}()
+	<-firstReady
+	<-secondReady
+	close(start)
+	requireWriterBlocked(t, firstDone)
+	requireWriterBlocked(t, secondDone)
+	release()
+	if rpcErr := <-firstDone; rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if rpcErr := <-secondDone; rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	reloaded := newSharedPersistenceEngine(t, dir)
+	if got := reloaded.credentials[firstRef]; got != "first-value" {
+		t.Fatalf("first credential after independent writes = %#v", reloaded.credentials)
+	}
+	if got := reloaded.credentials[secondRef]; got != "second-value" {
+		t.Fatalf("second credential after independent writes = %#v", reloaded.credentials)
+	}
+}
+
+func TestOwnerWriterLockTimeoutAndCleanup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private.yaml")
+	release := holdOwnerWriterLock(t, path)
+	err := withOwnerFileLock(path, func() error {
+		t.Fatal("timed-out writer acquired lock")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for the writer lock") {
+		t.Fatalf("writer lock timeout = %v", err)
+	}
+	release()
+	want := fmt.Errorf("operation failed")
+	if err := withOwnerFileLock(path, func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("writer operation error = %v", err)
+	}
+	if _, err := os.Stat(path + ".lock"); !os.IsNotExist(err) {
+		t.Fatalf("writer lock remained after operation failure: %v", err)
+	}
+	called := false
+	if err := withOwnerFileLock(path, func() error {
+		called = true
+		return nil
+	}); err != nil || !called {
+		t.Fatalf("writer lock was not reusable: called=%v err=%v", called, err)
+	}
+}
+
+func TestCrossProcessSettingsAndCredentialsWriters(t *testing.T) {
+	if role := os.Getenv("DSH_TEST_WRITER_ROLE"); role != "" {
+		crossProcessWriter(t, role)
+		return
+	}
+	dir := t.TempDir()
+	start := make(chan struct{})
+	type process struct {
+		role string
+		done chan error
+	}
+	processes := []process{
+		{role: "first", done: make(chan error, 1)},
+		{role: "second", done: make(chan error, 1)},
+	}
+	for index := range processes {
+		proc := &processes[index]
+		go func() {
+			<-start
+			cmd := exec.Command(os.Args[0], "-test.run=^TestCrossProcessSettingsAndCredentialsWriters$", "-test.count=1")
+			cmd.Env = append(os.Environ(), "DSH_TEST_WRITER_ROLE="+proc.role, "DSH_TEST_WRITER_DIR="+dir)
+			proc.done <- cmd.Run()
+		}()
+	}
+	close(start)
+	for _, proc := range processes {
+		if err := <-proc.done; err != nil {
+			t.Fatalf("%s writer process: %v", proc.role, err)
+		}
+	}
+	reloaded := newSharedPersistenceEngine(t, dir)
+	if got := reloaded.settings["ui-onboarding"]["welcomeNoticeVersion"]; got != "first" {
+		t.Fatalf("settings after cross-process writes = %#v", reloaded.settings)
+	}
+	if got := reloaded.settings["ui-theme"]["preference"]; got != "dark" {
+		t.Fatalf("settings after cross-process writes = %#v", reloaded.settings)
+	}
+	if got := reloaded.credentials["DSH_PROCESS_LOCK_FIRST"]; got != "first-value" {
+		t.Fatalf("credentials after cross-process writes = %#v", reloaded.credentials)
+	}
+	if got := reloaded.credentials["DSH_PROCESS_LOCK_SECOND"]; got != "second-value" {
+		t.Fatalf("credentials after cross-process writes = %#v", reloaded.credentials)
+	}
+}
+
+func TestUnsetCredentialReloadsCurrentDiskValue(t *testing.T) {
+	const ref = "DSH_UNSET_CURRENT_DISK_VALUE"
+	t.Setenv(ref, "")
+	dir := t.TempDir()
+	stale := newSharedPersistenceEngine(t, dir)
+	writer := newSharedPersistenceEngine(t, dir)
+	if rpcErr := writer.setCredential(ref, "current-value"); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if _, found := stale.credentials[ref]; found {
+		t.Fatalf("stale engine unexpectedly observed new credential: %#v", stale.credentials)
+	}
+	if rpcErr := stale.unsetCredential(ref); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	reloaded := newSharedPersistenceEngine(t, dir)
+	if _, found := reloaded.credentials[ref]; found {
+		t.Fatalf("unset left current disk credential: %#v", reloaded.credentials)
+	}
+}
+
+func crossProcessWriter(t *testing.T, role string) {
+	t.Helper()
+	dir := os.Getenv("DSH_TEST_WRITER_DIR")
+	if dir == "" {
+		t.Fatal("missing writer data directory")
+	}
+	var ns string
+	var patch map[string]any
+	var ref, value string
+	switch role {
+	case "first":
+		ns, patch, ref, value = "ui-onboarding", map[string]any{"welcomeNoticeVersion": "first"}, "DSH_PROCESS_LOCK_FIRST", "first-value"
+	case "second":
+		ns, patch, ref, value = "ui-theme", map[string]any{"preference": "dark"}, "DSH_PROCESS_LOCK_SECOND", "second-value"
+	default:
+		t.Fatalf("unknown writer role %q", role)
+	}
+	e := newSharedPersistenceEngine(t, dir)
+	if _, rpcErr := e.settingsUpdate(ns, patch, nil, false); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if rpcErr := e.setCredential(ref, value); rpcErr != nil {
+		t.Fatal(rpcErr)
 	}
 }
 

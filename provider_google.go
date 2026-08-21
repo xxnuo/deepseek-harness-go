@@ -138,7 +138,7 @@ func (p *googleProvider) endpointAndAuth(ctx context.Context, model string) (str
 }
 
 func (p *googleProvider) requestBody(req ChatRequest) map[string]any {
-	body := map[string]any{"contents": googleContents(req.Messages)}
+	body := map[string]any{"contents": googleContents(req.Messages, p.modelSpec)}
 	if req.System != "" {
 		body["systemInstruction"] = map[string]any{"parts": []any{map[string]any{"text": req.System}}}
 	}
@@ -167,7 +167,7 @@ func (p *googleProvider) requestBody(req ChatRequest) map[string]any {
 	return body
 }
 
-func googleContents(messages []ChatMessage) []any {
+func googleContents(messages []ChatMessage, model piAIModel) []any {
 	contents := make([]any, 0, len(messages))
 	toolNames := map[string]string{}
 	for _, message := range messages {
@@ -178,14 +178,15 @@ func googleContents(messages []ChatMessage) []any {
 		}
 	}
 	for _, message := range messages {
-		parts := make([]any, 0, len(message.Images)+len(message.ToolCalls)+1)
+		parts := make([]any, 0, len(chatContentParts(message))+len(message.ToolCalls))
 		switch message.Role {
 		case "user", "system":
-			if message.Content != "" {
-				parts = append(parts, map[string]any{"text": message.Content})
-			}
-			for _, image := range message.Images {
-				parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": image.MediaType, "data": image.Data}})
+			for _, part := range chatContentParts(message) {
+				if part.Type == "text" {
+					parts = append(parts, map[string]any{"text": part.Text})
+				} else if part.Type == "image" {
+					parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": part.MediaType, "data": part.Data}})
+				}
 			}
 			if len(parts) > 0 {
 				contents = append(contents, map[string]any{"role": "user", "parts": parts})
@@ -209,19 +210,42 @@ func googleContents(messages []ChatMessage) []any {
 			}
 		case "tool":
 			output := message.Content
-			if output == "" {
+			if output == "" && chatMessageHasImage(message) {
+				output = "(see attached image)"
+			} else if output == "" {
 				output = "(no output)"
 			}
 			name := toolNames[message.ToolCallID]
 			if name == "" {
 				name = "tool"
 			}
-			contents = append(contents, map[string]any{"role": "user", "parts": []any{map[string]any{
-				"functionResponse": map[string]any{"id": message.ToolCallID, "name": name, "response": map[string]any{"output": output}},
-			}}})
+			response := map[string]any{"id": message.ToolCallID, "name": name, "response": map[string]any{"output": output}}
+			imageParts := make([]any, 0)
+			for _, part := range chatContentParts(message) {
+				if part.Type == "image" {
+					imageParts = append(imageParts, map[string]any{"inlineData": map[string]any{"mimeType": part.MediaType, "data": part.Data}})
+				}
+			}
+			if len(imageParts) > 0 && googleSupportsMultimodalFunctionResponse(model.ID) {
+				response["parts"] = imageParts
+			}
+			contents = append(contents, map[string]any{"role": "user", "parts": []any{map[string]any{"functionResponse": response}}})
+			if len(imageParts) > 0 && !googleSupportsMultimodalFunctionResponse(model.ID) {
+				contents = append(contents, map[string]any{"role": "user", "parts": append([]any{map[string]any{"text": "Tool result image:"}}, imageParts...)})
+			}
 		}
 	}
 	return contents
+}
+
+func googleSupportsMultimodalFunctionResponse(model string) bool {
+	model = strings.ToLower(model)
+	if !strings.HasPrefix(model, "gemini-") && !strings.HasPrefix(model, "gemini-live-") {
+		return true
+	}
+	var major int
+	_, _ = fmt.Sscanf(strings.TrimPrefix(strings.TrimPrefix(model, "gemini-live-"), "gemini-"), "%d", &major)
+	return major >= 3
 }
 
 func googleThinkingConfig(model piAIModel, effort string, budgets map[string]int) map[string]any {
@@ -343,6 +367,9 @@ func (s *googleStreamState) handle(payload []byte) error {
 			"input_tokens": max(0, prompt-cached), "output_tokens": output + reasoning,
 			"cache_read_tokens": cached, "reasoning_tokens": reasoning,
 			"total_tokens": jsonInt(usage["totalTokenCount"]),
+		}
+		if err := s.onDelta(Delta{Usage: cloneStringMap(s.usage)}); err != nil {
+			return err
 		}
 	}
 	return nil

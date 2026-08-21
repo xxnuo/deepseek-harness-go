@@ -2,9 +2,12 @@ package harness
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -90,12 +93,40 @@ func embeddedAssetRevision() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	commit := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		if revision := strings.TrimPrefix(line, "commit="); revision != line && revision != "" {
-			return revision, nil
+			commit = revision
+			break
 		}
 	}
-	return "", errors.New("embedded upstream commit is missing")
+	if commit == "" {
+		return "", errors.New("embedded upstream commit is missing")
+	}
+	digest := sha256.New()
+	if err := fs.WalkDir(embeddedAssets, "runtime-assets/deepseek-harness", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		_, _ = io.WriteString(digest, path+"\x00")
+		file, err := embeddedAssets.Open(path)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(digest, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		_, _ = io.WriteString(digest, "\x00")
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("hash embedded assets: %w", err)
+	}
+	return commit + "-" + hex.EncodeToString(digest.Sum(nil))[:12], nil
 }
 
 func assetPaths(root string) AssetPaths {

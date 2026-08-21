@@ -35,6 +35,9 @@ func (p *mistralProvider) Complete(ctx context.Context, req ChatRequest, onDelta
 	if key == "" {
 		return Completion{}, &ProviderError{Code: "MISSING_CREDENTIAL", Message: "Mistral requires MISTRAL_API_KEY or apiKeyEnv"}
 	}
+	if err := validateToolSampling(req.Tools, true); err != nil {
+		return Completion{}, err
+	}
 	body := p.requestBody(req)
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -112,8 +115,12 @@ func (p *mistralProvider) requestBody(req ChatRequest) map[string]any {
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
 		for _, tool := range req.Tools {
+			strict, requested, _ := resolveJSONSchemaStrictSampling(tool, true)
+			if !requested {
+				strict = false
+			}
 			tools = append(tools, map[string]any{"type": "function", "function": map[string]any{
-				"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "strict": false,
+				"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "strict": strict,
 			}})
 		}
 		body["tools"] = tools
@@ -145,16 +152,17 @@ func mistralMessages(req ChatRequest) []any {
 	for _, message := range req.Messages {
 		switch message.Role {
 		case "user", "system":
-			if len(message.Images) == 0 {
+			if !chatMessageHasImage(message) {
 				messages = append(messages, map[string]any{"role": message.Role, "content": message.Content})
 				continue
 			}
-			content := make([]any, 0, len(message.Images)+1)
-			if message.Content != "" {
-				content = append(content, map[string]any{"type": "text", "text": message.Content})
-			}
-			for _, image := range message.Images {
-				content = append(content, map[string]any{"type": "image_url", "image_url": "data:" + image.MediaType + ";base64," + image.Data})
+			content := make([]any, 0, len(chatContentParts(message)))
+			for _, part := range chatContentParts(message) {
+				if part.Type == "text" {
+					content = append(content, map[string]any{"type": "text", "text": part.Text})
+				} else if part.Type == "image" {
+					content = append(content, map[string]any{"type": "image_url", "image_url": "data:" + part.MediaType + ";base64," + part.Data})
+				}
 			}
 			messages = append(messages, map[string]any{"role": message.Role, "content": content})
 		case "assistant":
@@ -192,11 +200,20 @@ func mistralMessages(req ChatRequest) []any {
 			if id == "" {
 				id = mistralToolCallID(message.ToolCallID)
 			}
+			content := make([]any, 0, len(chatContentParts(message))+1)
 			output := message.Content
-			if output == "" {
+			if output == "" && chatMessageHasImage(message) {
+				output = "(see attached image)"
+			} else if output == "" {
 				output = "(no output)"
 			}
-			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": id, "content": output})
+			content = append(content, map[string]any{"type": "text", "text": output})
+			for _, part := range chatContentParts(message) {
+				if part.Type == "image" {
+					content = append(content, map[string]any{"type": "image_url", "image_url": "data:" + part.MediaType + ";base64," + part.Data})
+				}
+			}
+			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": id, "content": content})
 		}
 	}
 	return messages
@@ -250,6 +267,9 @@ func (s *mistralStreamState) handle(payload []byte) error {
 			total = prompt + output
 		}
 		s.usage = map[string]any{"input_tokens": max(0, prompt-cached), "output_tokens": output, "cache_read_tokens": cached, "total_tokens": total}
+		if err := s.onDelta(Delta{Usage: cloneStringMap(s.usage)}); err != nil {
+			return err
+		}
 	}
 	choices, _ := chunk["choices"].([]any)
 	if len(choices) == 0 {

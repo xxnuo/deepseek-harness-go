@@ -471,7 +471,11 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 	cwd := parent.Header.CWD
 	depth := parent.Header.DelegationDepth
 	model := parent.Model
+	available := parent.attached && !parent.draining
 	parent.mu.Unlock()
+	if !available {
+		return "", errors.New("subagent-parent-unavailable: parent session is not resident")
+	}
 	child, err := e.createSession(ctx, SessionHeader{
 		ID: id, CWD: cwd, ParentSession: parentID, Origin: "subagent",
 		DelegationDepth: depth + 1, AgentPreset: preset, Mode: "continuable",

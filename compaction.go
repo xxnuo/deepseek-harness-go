@@ -54,16 +54,16 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 		shadowedSeqs[index] = event.Seq
 		shadowedTokens += estimateProjectionEvent(event)
 	}
-	messages := e.hydrateChatMessages(transcriptMessages(selected, int(^uint(0)>>1)))
-	if len(messages) == 0 || !toolMessagesBalanced(messages) {
-		return result, errNoCompactableHistory
-	}
 	selection := request.selection
 	if selection.Provider == "" {
 		selection.Provider = e.cfg.Provider
 	}
 	if selection.Model == "" {
 		selection.Model = e.cfg.Model
+	}
+	messages := e.hydrateChatMessagesWithLimit(transcriptMessages(selected, int(^uint(0)>>1)), e.requestImageLimit(selection.Provider))
+	if len(messages) == 0 || !toolMessagesBalanced(messages) {
+		return result, errNoCompactableHistory
 	}
 	e.mu.RLock()
 	provider := e.providers[selection.Provider]
@@ -231,8 +231,9 @@ func estimatedRequestTokens(system string, tools []ToolSchema, messages []ChatMe
 func (e *Engine) durableMessages(s *Session, turn int) []ChatMessage {
 	s.mu.Lock()
 	events := append([]Event(nil), s.Events...)
+	provider := s.Model.Provider
 	s.mu.Unlock()
-	return e.hydrateChatMessages(transcriptMessages(events, turn))
+	return e.hydrateChatMessagesWithLimit(transcriptMessages(events, turn), e.requestImageLimit(provider))
 }
 
 func (e *Engine) contextWindowFor(selection ModelSelection) int {

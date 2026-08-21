@@ -131,6 +131,17 @@ func TestValidateWebCLIHostRejectsWildcardOnlyWhenExplicit(t *testing.T) {
 	}
 }
 
+func TestParseWebOptionsOpensByDefaultAndSupportsNoOpen(t *testing.T) {
+	options, err := parseWebOptions(nil)
+	if err != nil || !options.openBrowser {
+		t.Fatalf("default browser option = %#v, %v", options, err)
+	}
+	options, err = parseWebOptions([]string{"--no-open", "--port", "0"})
+	if err != nil || options.openBrowser || !options.portSet || options.port != 0 {
+		t.Fatalf("--no-open browser option = %#v, %v", options, err)
+	}
+}
+
 func TestParseArgsRejectsContradictions(t *testing.T) {
 	for _, args := range [][]string{
 		{},
@@ -642,7 +653,7 @@ func TestStandaloneBinaryServesEmbeddedRuntime(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, binary, "web", "--port", "0", "--trusted-host", "lab.internal")
+	command := exec.CommandContext(ctx, binary, "web", "--no-open", "--port", "0", "--trusted-host", "lab.internal")
 	command.Dir = outside
 	command.Env = environment
 	stdout, err := command.StdoutPipe()
@@ -701,8 +712,8 @@ func TestStandaloneBinaryServesEmbeddedRuntime(t *testing.T) {
 	if err := json.Unmarshal(html[start:start+end], &graph); err != nil {
 		t.Fatalf("decode standalone boot graph: %v", err)
 	}
-	if len(graph.Entries) != 38 {
-		t.Fatalf("standalone boot graph has %d entries, want 38", len(graph.Entries))
+	if len(graph.Entries) != 42 {
+		t.Fatalf("standalone boot graph has %d entries, want 42", len(graph.Entries))
 	}
 	plugin, err := http.Get(endpoint + graph.Entries[0].URL)
 	if err != nil {

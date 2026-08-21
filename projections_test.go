@@ -25,7 +25,8 @@ func TestSessionProjectionBaselineIncludesUIUnits(t *testing.T) {
 		t.Fatalf("empty token usage = %#v", values["tokenUsage"])
 	}
 	limits := values["imageLimits"].(map[string]any)
-	if limits["maxImageBytes"] != maxImageBytes || !reflect.DeepEqual(limits["mediaTypes"], []string{"image/png", "image/jpeg", "image/webp", "image/gif"}) {
+	if limits["maxImageBytes"] != maxImageBytes || limits["maxImageDimension"] != maxImageDimension ||
+		!reflect.DeepEqual(limits["mediaTypes"], []string{"image/png", "image/jpeg", "image/webp", "image/gif"}) {
 		t.Fatalf("image limits = %#v", limits)
 	}
 }
@@ -74,12 +75,13 @@ func TestPermissionPlanAndStatsProjections(t *testing.T) {
 		projectionEvent("permission/preset", 1, map[string]any{"preset": "danger-full-access"}),
 		projectionEvent("sandbox/mode", 2, map[string]any{"mode": "danger-full-access"}),
 		projectionEvent("approval/policy", 3, map[string]any{"policy": "never"}),
-		projectionEvent("command/run", 4, map[string]any{"name": "plan", "args": " draft "}),
-		projectionEvent("plan/mode", 5, map[string]any{"active": true}),
-		projectionEvent("step/start", 6, map[string]any{"turn": 1, "step": 1}),
-		projectionEvent("assistant/chunk", 7, map[string]any{"turn": 1, "step": 1, "chunk": map[string]any{"type": "text-delta", "text": "x"}}),
-		projectionEvent("assistant/message", 8, map[string]any{"turn": 1, "step": 1, "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "x"}}}, "usage": map[string]any{"inputTokens": 1, "outputTokens": 2}}),
-		projectionEvent("step/end", 9, map[string]any{"turn": 1, "step": 1}),
+		projectionEvent("command/run", 4, map[string]any{"commandId": "plan-1", "name": "plan", "args": " draft "}),
+		projectionEvent("command/done", 5, map[string]any{"commandId": "plan-1", "kind": "success"}),
+		projectionEvent("plan/mode", 6, map[string]any{"active": true}),
+		projectionEvent("step/start", 7, map[string]any{"turn": 1, "step": 1}),
+		projectionEvent("assistant/chunk", 8, map[string]any{"turn": 1, "step": 1, "chunk": map[string]any{"type": "text-delta", "text": "x"}}),
+		projectionEvent("assistant/message", 9, map[string]any{"turn": 1, "step": 1, "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "x"}}}, "usage": map[string]any{"inputTokens": 1, "outputTokens": 2}}),
+		projectionEvent("step/end", 10, map[string]any{"turn": 1, "step": 1}),
 	}
 	values := sessionProjectionValues(events, "")
 	permissions := values["permissions"].(map[string]any)
@@ -93,5 +95,24 @@ func TestPermissionPlanAndStatsProjections(t *testing.T) {
 	stats := values["sessionStats"].(map[string]any)
 	if stats["turns"] != 1 || stats["steps"] != 1 || stats["ttftSteps"] != 1 || stats["decodeTokens"] != 2 {
 		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func TestPlanProjectionPairsCommandSettlement(t *testing.T) {
+	events := []Event{
+		projectionEvent("command/run", 10, map[string]any{"commandId": "plan-fail", "name": "plan", "args": "draft"}),
+	}
+	if pending := currentPlan(events)["pending"]; pending != true {
+		t.Fatalf("running plan projection pending = %#v", pending)
+	}
+	events = append(events,
+		projectionEvent("command/done", 20, map[string]any{"commandId": "other", "kind": "success"}),
+		projectionEvent("command/done", 30, map[string]any{"commandId": "plan-fail", "kind": "error"}),
+	)
+	if pending := currentPlan(events)["pending"]; pending != false {
+		t.Fatalf("failed plan projection pending = %#v", pending)
+	}
+	if changed := projectionKeysChanged(events[len(events)-1]); !reflect.DeepEqual(changed, []string{"plan"}) {
+		t.Fatalf("command/done changed keys = %#v", changed)
 	}
 }

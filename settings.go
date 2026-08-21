@@ -196,6 +196,8 @@ func validateSettingsValue(ns string, value map[string]any) error {
 		if _, known := commandPermissionPresets[preset]; !ok || !known {
 			return fmt.Errorf("permission.defaultPreset must be one of %s", strings.Join(permissionPresetNames(), ", "))
 		}
+	case "llm-deepseek":
+		return validateDeepSeekSettings(value)
 	}
 	return nil
 }
@@ -287,36 +289,32 @@ func (e *Engine) settingsUpdateFrom(origin *dynamicCordisRun, ns string, patch m
 		return nil, err
 	}
 	previousResolved, _ := e.resolvedSettingsValueLocked(ns)
-	previous, existed := e.settings[ns]
 	previousRevision := e.settingsRev[ns]
-	var next map[string]any
-	if replace {
-		next = cloneSettingsValue(patch)
-	} else {
-		next = mergeSettings(e.settings[ns], patch)
-	}
-	piAIProviders, validationErr := e.validateSettingsValueLocked(ns, next)
-	if validationErr != nil {
-		e.mu.Unlock()
-		return nil, rpcError("settings-rejected", validationErr.Error(), map[string]any{"ns": ns})
-	}
-	if reflect.DeepEqual(next, e.settings[ns]) {
-		view := e.settingsViewLocked(ns)
-		e.mu.Unlock()
-		return view, nil
-	}
-	e.settings[ns] = next
-	e.settingsRev[ns]++
-	if err := e.saveSettingsLocked(); err != nil {
-		if existed {
-			e.settings[ns] = previous
-		} else {
-			delete(e.settings, ns)
+	previous := cloneSettingsValue(e.settings[ns])
+	var piAIProviders map[string]*managedPiAIProvider
+	next, err := updateSettingsYAMLLocked(e, ns, func(current map[string]any) (map[string]any, error) {
+		candidate := cloneSettingsValue(patch)
+		if !replace {
+			candidate = mergeSettings(current, patch)
 		}
+		resolved, validationErr := e.validateSettingsValueLocked(ns, candidate)
+		if validationErr != nil {
+			return nil, validationErr
+		}
+		piAIProviders = resolved
+		return candidate, nil
+	})
+	if err != nil {
 		e.settingsRev[ns] = previousRevision
 		e.mu.Unlock()
 		return nil, rpcError("settings-rejected", err.Error(), map[string]any{"ns": ns})
 	}
+	if reflect.DeepEqual(next, previous) {
+		view := e.settingsViewLocked(ns)
+		e.mu.Unlock()
+		return view, nil
+	}
+	e.settingsRev[ns]++
 	if ns == piAISettingsNamespace {
 		e.replacePiAIProvidersLocked(piAIProviders)
 	}
@@ -344,7 +342,6 @@ func (e *Engine) settingsMutate(ns string, rawOps []any, expected *int) (any, *R
 		return nil, err
 	}
 	previousResolved, _ := e.resolvedSettingsValueLocked(ns)
-	value := cloneSettingsValue(e.settings[ns])
 	for _, raw := range rawOps {
 		op, ok := raw.(map[string]any)
 		if !ok {
@@ -352,48 +349,52 @@ func (e *Engine) settingsMutate(ns string, rawOps []any, expected *int) (any, *R
 			return nil, rpcError("bad-request", "settings operation must be an object", nil)
 		}
 		name, _ := op["op"].(string)
-		path, ok := stringPath(op["path"])
+		_, ok = stringPath(op["path"])
 		if !ok {
 			e.mu.Unlock()
 			return nil, rpcError("bad-request", "settings operation path must be string segments", nil)
 		}
 		switch name {
-		case "set":
-			if err := settingsSet(value, path, op["value"]); err != nil {
-				e.mu.Unlock()
-				return nil, rpcError("bad-request", err.Error(), nil)
-			}
-		case "unset":
-			settingsUnset(value, path)
+		case "set", "unset":
 		default:
 			e.mu.Unlock()
 			return nil, rpcError("bad-request", "settings operation must be set or unset", nil)
 		}
 	}
-	piAIProviders, validationErr := e.validateSettingsValueLocked(ns, value)
-	if validationErr != nil {
-		e.mu.Unlock()
-		return nil, rpcError("settings-rejected", validationErr.Error(), map[string]any{"ns": ns})
-	}
-	previous, existed := e.settings[ns]
+	previous := cloneSettingsValue(e.settings[ns])
 	previousRevision := e.settingsRev[ns]
-	if reflect.DeepEqual(value, e.settings[ns]) {
-		view := e.settingsViewLocked(ns)
-		e.mu.Unlock()
-		return view, nil
-	}
-	e.settings[ns] = value
-	e.settingsRev[ns]++
-	if err := e.saveSettingsLocked(); err != nil {
-		if existed {
-			e.settings[ns] = previous
-		} else {
-			delete(e.settings, ns)
+	var piAIProviders map[string]*managedPiAIProvider
+	value, err := updateSettingsYAMLLocked(e, ns, func(current map[string]any) (map[string]any, error) {
+		candidate := cloneSettingsValue(current)
+		for _, raw := range rawOps {
+			op := raw.(map[string]any)
+			path, _ := stringPath(op["path"])
+			if op["op"] == "set" {
+				if err := settingsSet(candidate, path, op["value"]); err != nil {
+					return nil, err
+				}
+			} else {
+				settingsUnset(candidate, path)
+			}
 		}
+		resolved, validationErr := e.validateSettingsValueLocked(ns, candidate)
+		if validationErr != nil {
+			return nil, validationErr
+		}
+		piAIProviders = resolved
+		return candidate, nil
+	})
+	if err != nil {
 		e.settingsRev[ns] = previousRevision
 		e.mu.Unlock()
 		return nil, rpcError("settings-rejected", err.Error(), map[string]any{"ns": ns})
 	}
+	if reflect.DeepEqual(value, previous) {
+		view := e.settingsViewLocked(ns)
+		e.mu.Unlock()
+		return view, nil
+	}
+	e.settingsRev[ns]++
 	if ns == piAISettingsNamespace {
 		e.replacePiAIProvidersLocked(piAIProviders)
 	}

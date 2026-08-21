@@ -21,6 +21,7 @@ type BootEntry struct {
 	Rev         string   `json:"rev"`
 	Inject      []string `json:"inject,omitempty"`
 	Immediately bool     `json:"immediately,omitempty"`
+	External    []string `json:"external,omitempty"`
 }
 
 type BootGraph struct {
@@ -36,6 +37,7 @@ type clientPackageManifest struct {
 			Platform    string   `json:"platform"`
 			Inject      []string `json:"inject"`
 			Immediately bool     `json:"immediately"`
+			External    []string `json:"external"`
 		} `json:"client"`
 	} `json:"dsh"`
 }
@@ -198,7 +200,8 @@ func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
 			}
 			rev := shortRevisionBytes(content)
 			inject := append([]string(nil), pkg.Dsh.Client.Inject...)
-			entries = append(entries, BootEntry{ID: pkg.Name, URL: "/plugins/" + pkg.Name + "/client.js?rev=" + rev, Rev: rev, Inject: inject, Immediately: pkg.Dsh.Client.Immediately})
+			external := append([]string(nil), pkg.Dsh.Client.External...)
+			entries = append(entries, BootEntry{ID: pkg.Name, URL: "/plugins/" + pkg.Name + "/client.js?rev=" + rev, Rev: rev, Inject: inject, Immediately: pkg.Dsh.Client.Immediately, External: external})
 			paths[pkg.Name] = bundle
 			return nil
 		})
@@ -207,11 +210,67 @@ func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	entries, err := orderBootEntries(entries)
+	if err != nil {
+		return BootGraph{}, nil, err
+	}
 	if len(entries) == 0 {
 		return BootGraph{Rev: shortRevision("[]"), Entries: entries}, paths, nil
 	}
 	encoded, _ := json.Marshal(entries)
 	return BootGraph{Rev: shortRevisionBytes(encoded), Entries: entries}, paths, nil
+}
+
+func orderBootEntries(entries []BootEntry) ([]BootEntry, error) {
+	byID := make(map[string]int, len(entries))
+	for index := range entries {
+		byID[entries[index].ID] = index
+	}
+	ordered := make([]BootEntry, 0, len(entries))
+	state := make([]uint8, len(entries))
+	open := make([]string, 0, len(entries))
+	var visit func(int) error
+	visit = func(index int) error {
+		switch state[index] {
+		case 2:
+			return nil
+		case 1:
+			start := 0
+			for start < len(open) && open[start] != entries[index].ID {
+				start++
+			}
+			cycle := append(append([]string(nil), open[start:]...), entries[index].ID)
+			return errors.New("client-modules: module graph cycle " + strings.Join(cycle, " -> ") + " — a requested package row must precede its consumers, and factory-form CJS cannot deliver partial exports")
+		}
+		state[index] = 1
+		open = append(open, entries[index].ID)
+		for _, request := range entries[index].External {
+			dependencyID := strings.TrimSuffix(request, "/client")
+			dependency, ok := byID[request]
+			if !ok {
+				dependency, ok = byID[dependencyID]
+			}
+			if !ok {
+				continue
+			}
+			if dependency == index {
+				return errors.New("client-modules: \"" + entries[index].ID + "\" requests module \"" + request + "\" that it answers itself — a row must not declare its own package in dsh.client.external")
+			}
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+		open = open[:len(open)-1]
+		state[index] = 2
+		ordered = append(ordered, entries[index])
+		return nil
+	}
+	for index := range entries {
+		if err := visit(index); err != nil {
+			return nil, err
+		}
+	}
+	return ordered, nil
 }
 
 func shortRevision(value string) string { return shortRevisionBytes([]byte(value)) }

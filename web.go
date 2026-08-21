@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
@@ -69,6 +70,7 @@ type WebToolConfig struct {
 	SearchEnabled       bool
 	FetchEnabled        bool
 	SearchMaxResults    int
+	SearchMaxQueries    int
 	SearchTimeout       time.Duration
 	FetchTimeout        time.Duration
 	FetchMaxOutputChars int
@@ -85,7 +87,7 @@ type HTTPWebFetchConfig struct {
 
 func defaultWebToolConfig() *WebToolConfig {
 	return &WebToolConfig{
-		SearchEnabled: true, SearchMaxResults: 8,
+		SearchEnabled: true, SearchMaxResults: 8, SearchMaxQueries: 4,
 		SearchTimeout: 30 * time.Second, FetchTimeout: 30 * time.Second,
 		FetchMaxOutputChars: 200_000,
 	}
@@ -101,6 +103,9 @@ func normalizeWebToolConfig(config *WebToolConfig) *WebToolConfig {
 	clone := *config
 	if clone.SearchMaxResults == 0 {
 		clone.SearchMaxResults = defaults.SearchMaxResults
+	}
+	if clone.SearchMaxQueries == 0 {
+		clone.SearchMaxQueries = defaults.SearchMaxQueries
 	}
 	if clone.SearchTimeout == 0 {
 		clone.SearchTimeout = defaults.SearchTimeout
@@ -132,7 +137,7 @@ func normalizeHTTPWebFetchConfig(config HTTPWebFetchConfig) HTTPWebFetchConfig {
 }
 
 func validateWebRuntimeConfig(config Config) error {
-	if config.WebTools == nil || config.WebTools.SearchMaxResults < 1 || config.WebTools.SearchTimeout <= 0 || config.WebTools.FetchTimeout <= 0 || config.WebTools.FetchMaxOutputChars < 1 {
+	if config.WebTools == nil || config.WebTools.SearchMaxResults < 1 || config.WebTools.SearchMaxQueries < 1 || config.WebTools.SearchTimeout <= 0 || config.WebTools.FetchTimeout <= 0 || config.WebTools.FetchMaxOutputChars < 1 {
 		return errors.New("tool-web limits must be positive")
 	}
 	fetch := config.HTTPWebFetch
@@ -303,16 +308,23 @@ func chooseWebProvider[P interface {
 func registerWebTools(e *Engine) error {
 	config := e.cfg.WebTools
 	if config.SearchEnabled {
-		if err := e.RegisterTool(Tool{Schema: ToolSchema{Name: "web_search", Description: "Search the web for current information.", Parameters: objectSchema(map[string]any{"query": map[string]any{"type": "string"}}, "query"), Output: objectSchema(map[string]any{
+		description := fmt.Sprintf("Search the web for current information. Provide 1-%d queries in the required queries array.", config.SearchMaxQueries)
+		if err := e.RegisterTool(Tool{Schema: ToolSchema{Name: "web_search", Description: description, Parameters: objectSchema(map[string]any{
+			"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("Required search queries; accepts 1-%d items and merges their results.", config.SearchMaxQueries)},
+		}, "queries"), Output: objectSchema(map[string]any{
 			"content": map[string]any{"type": "string"}, "sources": map[string]any{"type": "array", "items": objectSchema(map[string]any{"url": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"}, "snippet": map[string]any{"type": "string"}, "publishedAt": map[string]any{"type": "string"}}, "url")}, "truncated": map[string]any{"type": "boolean"},
 		}, "sources", "truncated")}, Timeout: config.SearchTimeout, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in struct {
-				Query string `json:"query"`
+				Queries []string `json:"queries"`
 			}
 			if err := decodeToolArguments(call, &in); err != nil {
 				return ToolResult{}, err
 			}
-			result, err := e.webSearch(withWebSession(ctx, call.SessionID), WebSearchRequest{Query: in.Query, MaxResults: config.SearchMaxResults})
+			queries, err := parseWebSearchQueries(in.Queries, config.SearchMaxQueries)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			result, err := e.runWebSearchQueries(ctx, call.SessionID, queries, config.SearchMaxResults)
 			if err != nil {
 				return ToolResult{}, err
 			}
@@ -344,6 +356,105 @@ func registerWebTools(e *Engine) error {
 		text, truncated := renderWebFetch(result, config.FetchMaxOutputChars)
 		return ToolResult{Content: []ContentBlock{{Type: "text", Text: text}}, Value: result, Meta: map[string]any{"url": result.URL, "statusCode": result.StatusCode, "truncated": truncated}}, nil
 	}})
+}
+
+func parseWebSearchQueries(queries []string, maxQueries int) ([]string, error) {
+	if len(queries) == 0 {
+		return nil, errors.New("queries must contain at least one query")
+	}
+	if len(queries) > maxQueries {
+		noun := "queries"
+		if maxQueries == 1 {
+			noun = "query"
+		}
+		return nil, fmt.Errorf("queries must contain at most %d %s", maxQueries, noun)
+	}
+	seen := make(map[string]struct{}, len(queries))
+	unique := make([]string, 0, len(queries))
+	for _, query := range queries {
+		if strings.TrimSpace(query) == "" {
+			return nil, errors.New("each query must be a non-empty string")
+		}
+		if _, exists := seen[query]; exists {
+			continue
+		}
+		seen[query] = struct{}{}
+		unique = append(unique, query)
+	}
+	return unique, nil
+}
+
+func (e *Engine) runWebSearchQueries(ctx context.Context, sessionID string, queries []string, maxResults int) (WebSearchResult, error) {
+	if len(queries) == 1 {
+		return e.webSearch(withWebSession(ctx, sessionID), WebSearchRequest{Query: queries[0], MaxResults: maxResults})
+	}
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make([]WebSearchResult, len(queries))
+	var wg sync.WaitGroup
+	var failureMu sync.Mutex
+	var firstFailure error
+	for index, query := range queries {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := e.webSearch(withWebSession(batchCtx, sessionID), WebSearchRequest{Query: query, MaxResults: maxResults})
+			if err != nil {
+				failureMu.Lock()
+				if firstFailure == nil {
+					firstFailure = err
+					cancel()
+				}
+				failureMu.Unlock()
+				return
+			}
+			results[index] = result
+		}()
+	}
+	wg.Wait()
+	if firstFailure != nil {
+		return WebSearchResult{}, firstFailure
+	}
+	return mergeWebSearchResults(queries, results, maxResults), nil
+}
+
+func mergeWebSearchResults(queries []string, results []WebSearchResult, maxResults int) WebSearchResult {
+	maxRank := 0
+	truncated := false
+	for _, result := range results {
+		if len(result.Sources) > maxRank {
+			maxRank = len(result.Sources)
+		}
+		truncated = truncated || result.Truncated
+	}
+	seen := make(map[string]struct{})
+	sources := make([]WebSearchSource, 0, maxResults)
+	mergeDone := false
+	for rank := 0; rank < maxRank && !mergeDone; rank++ {
+		for _, result := range results {
+			if rank >= len(result.Sources) {
+				continue
+			}
+			source := result.Sources[rank]
+			if _, exists := seen[source.URL]; exists {
+				continue
+			}
+			seen[source.URL] = struct{}{}
+			if len(sources) == maxResults {
+				truncated = true
+				mergeDone = true
+				break
+			}
+			sources = append(sources, source)
+		}
+	}
+	contents := make([]string, 0, len(results))
+	for index, result := range results {
+		if result.Content != "" {
+			contents = append(contents, "### "+queries[index]+"\n\n"+result.Content)
+		}
+	}
+	return WebSearchResult{Content: strings.Join(contents, "\n\n"), Sources: sources, Truncated: truncated}
 }
 
 func formatWebSearch(result WebSearchResult) string {

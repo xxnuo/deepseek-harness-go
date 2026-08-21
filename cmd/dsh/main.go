@@ -436,6 +436,9 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	cfg.SessionTelemetry = composed.sessionTelemetry
 	cfg.SubagentProviders = append([]harness.SubagentProvider(nil), composed.subagentProviders...)
 	cfg.SubagentTools = append([]harness.SubagentToolConfig(nil), composed.subagentTools...)
+	if composed.subagentReportDelivery != "" {
+		cfg.SubagentReportDelivery = composed.subagentReportDelivery
+	}
 	if composed.e2b != nil {
 		config := *composed.e2b
 		cfg.E2B = &config
@@ -469,6 +472,13 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	cfg.Persist = composed.persist || composed.enabled("session-persistence-jsonl")
 	cfg.SessionStore = composed.sessionStore
 	cfg.Storage = composed.storage
+	if composed.fileReference != nil {
+		cfg.FileReference = *composed.fileReference
+	}
+	if composed.agentTeams != nil {
+		config := *composed.agentTeams
+		cfg.AgentTeams = &config
+	}
 	if composed.sessionTitleLLM != nil {
 		cfg.SessionTitleLLM = *composed.sessionTitleLLM
 	} else {
@@ -775,6 +785,7 @@ Serve the DeepSeek Harness browser UI.
 
 Options:
   --host <host>                     bind host
+  --no-open                         do not open the Web UI in the default browser
   --port <port>                     listen port; pass 0 to pick a free one
   --trusted-host <authority...>     extra accepted browser authority
   -h, --help                        show this help

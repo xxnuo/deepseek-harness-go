@@ -64,10 +64,31 @@ func TestIndexHTMLGetsBootGraphAndCurrentTheme(t *testing.T) {
 	}
 	body := readAll(t, response)
 	_ = response.Body.Close()
-	for _, want := range []string{"window.__DSH_BOOT__", `const preference = "dark"`, `<body><script>`} {
+	for _, want := range []string{"window.__ModuleLoader__", "window.__DSH_BOOT__", `const preference = "dark"`, `<body><script>`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("transformed index missing %q: %s", want, body)
 		}
+	}
+}
+
+func TestBootGraphOrdersExternalDependenciesAndRejectsCycles(t *testing.T) {
+	entries := []BootEntry{
+		{ID: "@example/a", External: []string{"@example/c/client"}},
+		{ID: "@example/b"},
+		{ID: "@example/c", External: []string{"react"}},
+	}
+	ordered, err := orderBootEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{ordered[0].ID, ordered[1].ID, ordered[2].ID}; strings.Join(got, ",") != "@example/c,@example/a,@example/b" {
+		t.Fatalf("ordered graph = %v", got)
+	}
+	if _, err := orderBootEntries([]BootEntry{{ID: "@example/self", External: []string{"@example/self/client"}}}); err == nil || !strings.Contains(err.Error(), "answers itself") {
+		t.Fatalf("self dependency error = %v", err)
+	}
+	if _, err := orderBootEntries([]BootEntry{{ID: "@example/a", External: []string{"@example/b"}}, {ID: "@example/b", External: []string{"@example/a"}}}); err == nil || !strings.Contains(err.Error(), "@example/a -> @example/b -> @example/a") {
+		t.Fatalf("cycle error = %v", err)
 	}
 }
 
@@ -163,8 +184,8 @@ func TestOriginalFrontendBootsEveryPluginAsset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Entries) != 38 {
-		t.Fatalf("boot graph has %d entries, want 38", len(graph.Entries))
+	if len(graph.Entries) != 42 {
+		t.Fatalf("boot graph has %d entries, want 42", len(graph.Entries))
 	}
 	if presets := scanPresets(e); len(presets) != 4 {
 		t.Fatalf("embedded preset roster has %d entries, want 4", len(presets))
@@ -185,6 +206,12 @@ func TestOriginalFrontendBootsEveryPluginAsset(t *testing.T) {
 	if !strings.Contains(html, `window.__DSH_BOOT__ = {"rev":"`+graph.Rev+`"`) {
 		t.Fatal("index does not contain the current boot graph")
 	}
+	modules := strings.Index(html, `<script src="/plugins/@deepseek-ai/dsh-client-modules/client.js?rev=`)
+	runtime := strings.Index(html, `<script src="/plugins/@deepseek-ai/dsh-client-runtime/client.js?rev=`)
+	boot := strings.Index(html, "window.__DSH_BOOT__ = ")
+	if queue := strings.Index(html, "window.__ModuleLoader__"); queue < 0 || modules < queue || runtime < modules || boot < runtime {
+		t.Fatalf("bootstrap ordering queue=%d modules=%d runtime=%d boot=%d", queue, modules, runtime, boot)
+	}
 
 	for _, entry := range graph.Entries {
 		for _, suffix := range []string{"", ".map"} {
@@ -199,6 +226,44 @@ func TestOriginalFrontendBootsEveryPluginAsset(t *testing.T) {
 				t.Fatalf("GET %s status = %d", entry.ID+suffix, resp.StatusCode)
 			}
 		}
+	}
+}
+
+func TestMaterializeAssetsInvalidatesLegacyCommitOnlyCache(t *testing.T) {
+	revision, err := embeddedAssetRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.SplitN(revision, "-", 2)[0]
+	dataDir := t.TempDir()
+	legacyRoot := filepath.Join(dataDir, "runtime-assets", commit)
+	legacy := assetPaths(legacyRoot)
+	for _, path := range []string{
+		filepath.Join(legacy.FrontendDir, "index.html"),
+		filepath.Join(legacy.PluginDir, "client", "runtime", "lib", "client.js"),
+		filepath.Join(legacy.PluginDir, "bundle", "base", "cordis.patch.yml"),
+		filepath.Join(legacy.PresetDir, "standard", "agent.cordis.yml"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, ".complete"), []byte(commit+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	materialized, err := MaterializeAssets(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if materialized.UpstreamDir == legacy.UpstreamDir {
+		t.Fatal("legacy commit-only cache was reused")
+	}
+	if _, err := os.Stat(filepath.Join(materialized.PluginDir, "client", "ui-brand-official", "lib", "client.js")); err != nil {
+		t.Fatalf("current rc.8 client assets were not materialized: %v", err)
 	}
 }
 
@@ -220,8 +285,8 @@ func TestNewUsesEmbeddedRuntimeAssetsByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Entries) != 38 {
-		t.Fatalf("default embedded boot graph has %d entries, want 38", len(graph.Entries))
+	if len(graph.Entries) != 42 {
+		t.Fatalf("default embedded boot graph has %d entries, want 42", len(graph.Entries))
 	}
 }
 

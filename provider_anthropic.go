@@ -59,7 +59,7 @@ func anthropicCacheControl(retention string, model piAIModel) map[string]any {
 	return cache
 }
 
-func anthropicMessages(messages []ChatMessage, cacheControl map[string]any) []map[string]any {
+func anthropicMessages(messages []ChatMessage, cacheControl map[string]any, allowEmptySignature bool) []map[string]any {
 	out := make([]map[string]any, 0, len(messages))
 	appendMessage := func(role string, blocks []any) {
 		if len(blocks) == 0 {
@@ -74,22 +74,29 @@ func anthropicMessages(messages []ChatMessage, cacheControl map[string]any) []ma
 	for _, message := range messages {
 		switch message.Role {
 		case "user":
-			blocks := make([]any, 0, len(message.Images)+1)
-			if strings.TrimSpace(message.Content) != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": message.Content})
-			}
-			for _, image := range message.Images {
-				blocks = append(blocks, map[string]any{
-					"type": "image", "source": map[string]any{
-						"type": "base64", "media_type": image.MediaType, "data": image.Data,
-					},
-				})
+			blocks := make([]any, 0, len(chatContentParts(message)))
+			for _, part := range chatContentParts(message) {
+				if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
+					blocks = append(blocks, map[string]any{"type": "text", "text": part.Text})
+				} else if part.Type == "image" {
+					blocks = append(blocks, map[string]any{
+						"type": "image", "source": map[string]any{
+							"type": "base64", "media_type": part.MediaType, "data": part.Data,
+						},
+					})
+				}
 			}
 			appendMessage("user", blocks)
 		case "assistant":
 			blocks := make([]any, 0, len(message.ToolCalls)+2)
 			if message.Reasoning != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": message.Reasoning})
+				if strings.TrimSpace(message.ReasoningSignature) != "" {
+					blocks = append(blocks, map[string]any{"type": "thinking", "thinking": message.Reasoning, "signature": message.ReasoningSignature})
+				} else if allowEmptySignature {
+					blocks = append(blocks, map[string]any{"type": "thinking", "thinking": message.Reasoning, "signature": ""})
+				} else {
+					blocks = append(blocks, map[string]any{"type": "text", "text": message.Reasoning})
+				}
 			}
 			if strings.TrimSpace(message.Content) != "" {
 				blocks = append(blocks, map[string]any{"type": "text", "text": message.Content})
@@ -103,8 +110,23 @@ func anthropicMessages(messages []ChatMessage, cacheControl map[string]any) []ma
 			}
 			appendMessage("assistant", blocks)
 		case "tool":
-			content := message.Content
-			if content == "" {
+			var content any = message.Content
+			if chatMessageHasImage(message) {
+				blocks := make([]any, 0, len(chatContentParts(message))+1)
+				hasText := false
+				for _, part := range chatContentParts(message) {
+					if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
+						hasText = true
+						blocks = append(blocks, map[string]any{"type": "text", "text": part.Text})
+					} else if part.Type == "image" {
+						blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": part.MediaType, "data": part.Data}})
+					}
+				}
+				if !hasText {
+					blocks = append([]any{map[string]any{"type": "text", "text": "(see attached image)"}}, blocks...)
+				}
+				content = blocks
+			} else if content == "" {
 				content = "(no output)"
 			}
 			appendMessage("user", []any{map[string]any{
@@ -121,6 +143,27 @@ func anthropicMessages(messages []ChatMessage, cacheControl map[string]any) []ma
 		}
 	}
 	return out
+}
+
+func anthropicInputSchema(tool ToolSchema, strict bool) map[string]any {
+	legacy := map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}}
+	if value, ok := tool.Parameters["properties"]; ok {
+		legacy["properties"] = value
+	}
+	if value, ok := tool.Parameters["required"]; ok {
+		legacy["required"] = value
+	}
+	if !strict {
+		return legacy
+	}
+	result := make(map[string]any, len(tool.Parameters)+3)
+	for key, value := range tool.Parameters {
+		result[key] = value
+	}
+	for key, value := range legacy {
+		result[key] = value
+	}
+	return result
 }
 
 func anthropicAdaptiveEffort(model piAIModel, level string) string {
@@ -149,8 +192,14 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 		maxTokens = 4096
 	}
 	cacheControl := anthropicCacheControl(p.cacheRetention, p.modelSpec)
+	allowEmptySignature := p.modelSpec.Compat.AllowEmptySignature != nil && *p.modelSpec.Compat.AllowEmptySignature
+	supportsEagerToolInput := p.modelSpec.Compat.SupportsEagerToolInputStreaming == nil || *p.modelSpec.Compat.SupportsEagerToolInputStreaming
+	supportsStrictTools := p.modelSpec.Compat.SupportsStrictTools != nil && *p.modelSpec.Compat.SupportsStrictTools
+	if err := validateToolSampling(req.Tools, supportsStrictTools); err != nil {
+		return Completion{}, err
+	}
 	body := map[string]any{
-		"model": model, "messages": anthropicMessages(req.Messages, cacheControl),
+		"model": model, "messages": anthropicMessages(req.Messages, cacheControl, allowEmptySignature),
 		"max_tokens": maxTokens, "stream": true,
 	}
 	if req.System != "" {
@@ -163,9 +212,17 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
 		for _, schema := range req.Tools {
-			tools = append(tools, map[string]any{
-				"name": schema.Name, "description": schema.Description, "input_schema": schema.Parameters,
-			})
+			strict, requested, _ := resolveJSONSchemaStrictSampling(schema, supportsStrictTools)
+			tool := map[string]any{
+				"name": schema.Name, "description": schema.Description, "input_schema": anthropicInputSchema(schema, strict),
+			}
+			if requested {
+				tool["strict"] = true
+			}
+			if supportsEagerToolInput {
+				tool["eager_input_streaming"] = true
+			}
+			tools = append(tools, tool)
 		}
 		supportsToolCache := p.modelSpec.Compat.SupportsCacheControlOnTools == nil || *p.modelSpec.Compat.SupportsCacheControlOnTools
 		if cacheControl != nil && supportsToolCache {
@@ -219,6 +276,16 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	if req.SessionID != "" && resolvedPiAICacheRetention(p.cacheRetention) != "none" && p.modelSpec.Compat.SendSessionAffinityHeaders != nil && *p.modelSpec.Compat.SendSessionAffinityHeaders {
 		hreq.Header.Set("X-Session-Affinity", req.SessionID)
 	}
+	betas := make([]string, 0, 2)
+	if len(req.Tools) > 0 && !supportsEagerToolInput {
+		betas = append(betas, "fine-grained-tool-streaming-2025-05-14")
+	}
+	if p.modelSpec.Compat.ForceAdaptiveThinking == nil || !*p.modelSpec.Compat.ForceAdaptiveThinking {
+		betas = append(betas, "interleaved-thinking-2025-05-14")
+	}
+	if len(betas) > 0 {
+		hreq.Header.Set("Anthropic-Beta", strings.Join(betas, ","))
+	}
 	for name, value := range p.headers {
 		hreq.Header.Set(name, value)
 	}
@@ -240,7 +307,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 		return Completion{}, providerHTTPFailure(resp, string(payload))
 	}
 
-	var text, reasoning, finish string
+	var text, reasoning, reasoningSignature, finish string
 	usage := map[string]any{}
 	calls := map[int]*ToolCall{}
 	order := make([]int, 0)
@@ -266,6 +333,9 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 					for key, raw := range value {
 						usage[key] = raw
 					}
+					if err := onDelta(Delta{Usage: cloneStringMap(usage)}); err != nil {
+						return err
+					}
 				}
 			}
 		case "content_block_start":
@@ -289,6 +359,12 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 				reasoning += piece
 				if piece != "" {
 					return onDelta(Delta{Reasoning: piece})
+				}
+			case "signature_delta":
+				piece := stringSetting(delta["signature"])
+				reasoningSignature += piece
+				if piece != "" {
+					return onDelta(Delta{ReasoningSignature: piece})
 				}
 			case "input_json_delta":
 				call := calls[index]
@@ -316,6 +392,9 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 			if value, ok := event["usage"].(map[string]any); ok {
 				for key, raw := range value {
 					usage[key] = raw
+				}
+				if err := onDelta(Delta{Usage: cloneStringMap(usage)}); err != nil {
+					return err
 				}
 			}
 		case "message_stop":
@@ -354,7 +433,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	if text == "" && reasoning == "" && len(toolCalls) == 0 {
 		return Completion{}, &ProviderError{Code: "EMPTY_RESPONSE", Message: "model returned a completed response with no content"}
 	}
-	return Completion{Text: text, Reasoning: reasoning, ToolCalls: toolCalls, Usage: usage, Finish: finish}, nil
+	return Completion{Text: text, Reasoning: reasoning, ReasoningSignature: reasoningSignature, ToolCalls: toolCalls, Usage: usage, Finish: finish}, nil
 }
 
 func jsonInt(value any) int {

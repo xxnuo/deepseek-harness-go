@@ -124,6 +124,27 @@ func blockText(blocks []ContentBlock) string {
 	return b.String()
 }
 
+func promptCommandInput(parts []PromptContentPart) (string, []EncodedImageAttachment, bool) {
+	line := ""
+	images := make([]EncodedImageAttachment, 0)
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			if line != "" {
+				return "", nil, false
+			}
+			line = strings.TrimSpace(part.Text)
+		case "image":
+			images = append(images, EncodedImageAttachment{
+				MediaType: part.MediaType, Data: part.Data, Name: part.Name,
+			})
+		default:
+			return "", nil, false
+		}
+	}
+	return line, images, strings.HasPrefix(line, "/")
+}
+
 func (e *Engine) Prompt(ctx context.Context, id string, req PromptRequest) (PromptResult, error) {
 	job, command, err := e.enqueuePrompt(ctx, id, req, false)
 	if err != nil {
@@ -148,6 +169,12 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 	if err != nil {
 		return nil, nil, err
 	}
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return nil, nil, fmt.Errorf("session-draining: session %q is being released", id)
+	}
 	if req.SessionID != "" && req.SessionID != id {
 		return nil, nil, errors.New("bad-request: sessionId does not match target session")
 	}
@@ -161,14 +188,16 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 	if req.Mode != "queue" && req.Mode != "steer" {
 		return nil, nil, errors.New("bad-request: mode must be queue or steer")
 	}
-	// Slash commands remain host-side and never enter the model history.
-	if !req.Literal && len(req.Content) == 1 && strings.HasPrefix(text, "/") {
-		execution, admitted, err := e.executeCommand(ctx, s, text)
+	// Slash commands remain host-side and never enter the model history. A
+	// command may carry images when its descriptor explicitly admits them.
+	commandLine, commandImages, commandCandidate := promptCommandInput(req.Content)
+	if !req.Literal && commandCandidate {
+		execution, admitted, err := e.executeCommand(ctx, s, commandLine, commandImages)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !admitted {
-			return nil, nil, fmt.Errorf("unknown-command: %s", text)
+			return nil, nil, fmt.Errorf("unknown-command: %s", commandLine)
 		}
 		return nil, execution.Result, nil
 	}
@@ -206,6 +235,10 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		job.done = make(chan promptOutcome, 1)
 	}
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return nil, nil, fmt.Errorf("session-draining: session %q is being released", id)
+	}
 	target := "next-turn"
 	start := len(s.pending)
 	if req.Mode == "steer" {
@@ -252,6 +285,7 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 	e.emitQueue(s)
 	if startWorker {
 		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
+		e.notifyAgentTeamStatus(id)
 		e.launchSessionWorker(s)
 	}
 	return job, nil, nil
@@ -259,6 +293,10 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 
 func (e *Engine) startSessionWorker(s *Session) {
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return
+	}
 	if s.maintenance {
 		s.maintenanceWake = true
 	}
@@ -270,8 +308,60 @@ func (e *Engine) startSessionWorker(s *Session) {
 	s.mu.Unlock()
 	if start {
 		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
+		e.notifyAgentTeamStatus(id)
 		e.launchSessionWorker(s)
 	}
+}
+
+func (e *Engine) notifyAgentTeamStatus(id string) {
+	if e.agentTeams != nil {
+		e.agentTeams.notifyStatus(id)
+	}
+}
+
+func (e *Engine) enqueueTeamPrompt(s *Session, content []ContentBlock, source map[string]any, target string, wakeup bool) (string, error) {
+	if target != "next-turn" && target != "next-step" {
+		return "", errors.New("Agent Teams inbox target must be next-turn or next-step")
+	}
+	job := &queuedPrompt{
+		id: newID("msg"), text: strings.TrimSpace(blockText(content)),
+		content: cloneContentBlocks(content), source: cloneJSON(source).(map[string]any),
+	}
+	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return "", fmt.Errorf("session-draining: session %q is being released", s.Header.ID)
+	}
+	queue := &s.pending
+	if target == "next-step" {
+		queue = &s.steering
+	}
+	event, err := appendEventLocked(s, "agent/inbox/spliced", map[string]any{
+		"target": target, "start": len(*queue), "inserted": []any{job.message()},
+	}, nil, nil, false)
+	if err != nil {
+		s.mu.Unlock()
+		return "", err
+	}
+	*queue = append(*queue, job)
+	if s.maintenance && wakeup {
+		s.maintenanceWake = true
+	}
+	startWorker := wakeup && !s.Running && !s.maintenance
+	if startWorker {
+		s.Running = true
+	}
+	id := s.Header.ID
+	s.mu.Unlock()
+	e.publishEvent(id, event)
+	e.emitQueue(s)
+	if startWorker {
+		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
+		e.notifyAgentTeamStatus(id)
+		e.launchSessionWorker(s)
+	}
+	e.notifyAgentTeamStatus(id)
+	return job.id, nil
 }
 
 func (e *Engine) launchSessionWorker(s *Session) {
@@ -385,6 +475,7 @@ func (e *Engine) runSessionWorker(s *Session) {
 			id := s.Header.ID
 			s.mu.Unlock()
 			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
+			e.notifyAgentTeamStatus(id)
 			e.scheduleWake(id)
 			return
 		}
@@ -406,6 +497,7 @@ func (e *Engine) runSessionWorker(s *Session) {
 			id := s.Header.ID
 			s.mu.Unlock()
 			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
+			e.notifyAgentTeamStatus(id)
 			e.scheduleWake(id)
 			return
 		}
@@ -413,6 +505,20 @@ func (e *Engine) runSessionWorker(s *Session) {
 		turn := e.nextTurn(s)
 		turnCtx, cancel := context.WithCancel(context.Background())
 		s.mu.Lock()
+		if s.draining {
+			s.Running = false
+			s.Cancel = nil
+			id := s.Header.ID
+			s.mu.Unlock()
+			cancel()
+			if item.done != nil {
+				item.done <- promptOutcome{err: errors.New("subagent session is being released")}
+			}
+			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
+			e.notifyAgentTeamStatus(id)
+			e.scheduleWake(id)
+			return
+		}
 		s.Cancel = cancel
 		s.mu.Unlock()
 		_, _ = e.appendEvent(s, "turn/start", map[string]any{"turn": turn})
@@ -548,6 +654,47 @@ func (e *Engine) closeOpenTurn(s *Session, turn int, reason map[string]any) {
 	_, _ = e.appendEvent(s, "turn/end", map[string]any{"turn": turn, "reason": reason})
 }
 
+func interruptedAssistantContent(deltas []Delta) ([]ContentBlock, map[string]any) {
+	var text, reasoning strings.Builder
+	var reasoningSignature string
+	var usage map[string]any
+	for _, delta := range deltas {
+		text.WriteString(delta.Text)
+		reasoning.WriteString(delta.Reasoning)
+		if delta.ReasoningSignature != "" {
+			reasoningSignature += delta.ReasoningSignature
+		}
+		if len(delta.Usage) > 0 {
+			usage = cloneStringMap(delta.Usage)
+		}
+	}
+	content := make([]ContentBlock, 0, 2)
+	if reasoning.Len() > 0 {
+		content = append(content, ContentBlock{Type: "reasoning", Text: reasoning.String(), Signature: reasoningSignature})
+	}
+	if text.Len() > 0 {
+		content = append(content, ContentBlock{Type: "text", Text: text.String()})
+	}
+	return content, usage
+}
+
+func (e *Engine) appendInterruptedAssistantMessage(s *Session, turn, step, stepStartSeq int, selection ModelSelection, deltas []Delta) error {
+	content, usage := interruptedAssistantContent(deltas)
+	if len(content) == 0 {
+		return nil
+	}
+	assistant := map[string]any{
+		"id": newID("msg"), "role": "assistant", "content": content,
+		"source": map[string]any{"kind": "model", "provider": selection.Provider, "model": selection.Model},
+	}
+	message := map[string]any{"turn": turn, "step": step, "message": assistant, "interrupted": true}
+	if len(usage) > 0 {
+		message["usage"] = usage
+	}
+	_, err := e.appendEvent(s, "assistant/message", message, successfulAttemptChunkSeqs(s, turn, step, stepStartSeq)...)
+	return err
+}
+
 func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output string, resultErr error) {
 	defer func() {
 		if resultErr == nil {
@@ -658,13 +805,14 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		}
 		e.startPendingSessionTitle(s, SessionTitleModelProvenance{Provider: routeProvider, Model: selection.Model})
 		var completion Completion
+		var streamed []Delta
 		overflowRetries := 0
 		for {
 			request := ChatRequest{
 				SessionID: s.Header.ID, Model: selection.Model, System: system, Messages: messages, Tools: tools,
 				Thinking: thinking, ReasoningEffort: effort, Temperature: selection.Temperature, MaxTokens: maxTokens,
 			}
-			completion, _, err = e.completeWithRetrySink(ctx, provider, request, s, turn, step, func(delta Delta) error {
+			completion, streamed, err = e.completeWithRetrySink(ctx, provider, request, s, turn, step, func(delta Delta) error {
 				if delta.Text != "" {
 					_, err := e.appendEvent(s, "assistant/chunk", map[string]any{"turn": turn, "step": step, "chunk": map[string]any{"type": "text-delta", "index": 0, "text": delta.Text}})
 					if err != nil {
@@ -680,6 +828,13 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 				for _, call := range delta.ToolCalls {
 					_, err := e.appendEvent(s, "assistant/chunk", map[string]any{"turn": turn, "step": step, "chunk": map[string]any{"type": "tool-call-delta", "index": call.Index, "id": call.ID, "name": call.Name, "argumentsDelta": call.ArgumentsDelta}})
 					if err != nil {
+						return err
+					}
+				}
+				if len(delta.Usage) > 0 {
+					if _, err := e.appendEvent(s, "assistant/chunk", map[string]any{
+						"turn": turn, "step": step, "chunk": map[string]any{"type": "usage", "usage": delta.Usage},
+					}); err != nil {
 						return err
 					}
 				}
@@ -699,6 +854,9 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 			}
 			reason := map[string]any{"kind": "error", "error": retryFailurePayload(failure)}
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, ErrEngineClosed) {
+				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, stepStart.Seq, selection, streamed); appendErr != nil {
+					return "", appendErr
+				}
 				reason = map[string]any{"kind": "aborted"}
 			}
 			e.closeOpenTurn(s, turn, reason)
@@ -718,7 +876,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		}
 		content := make([]ContentBlock, 0, 2+len(toolCalls))
 		if reasoning != "" {
-			content = append(content, ContentBlock{Type: "reasoning", Text: reasoning})
+			content = append(content, ContentBlock{Type: "reasoning", Text: reasoning, Signature: completion.ReasoningSignature})
 		}
 		if text != "" || len(toolCalls) == 0 {
 			content = append(content, ContentBlock{Type: "text", Text: text})

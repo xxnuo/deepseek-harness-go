@@ -2,6 +2,14 @@ package harness
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sort"
+)
+
+const (
+	SubagentReportQuiet    = "quiet"
+	SubagentReportNextStep = "next-step"
 )
 
 func (e *Engine) childFor(parentID, childID string) (*Session, *RPCError) {
@@ -85,6 +93,222 @@ func (e *Engine) subagentList(p map[string]any) (any, *RPCError) {
 // the regular Engine APIs subject to the child-session ownership fence.
 func (e *Engine) CreateSubagent(ctx context.Context, parentID, id, preset string) (string, error) {
 	return e.createSubagent(ctx, parentID, id, preset)
+}
+
+// DrainSubagentChildren releases selected resident direct children and their
+// resident descendants without touching their siblings.
+func (e *Engine) DrainSubagentChildren(ctx context.Context, parentID string, childIDs []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	parent, err := e.getSession(parentID)
+	if err != nil {
+		return errors.New("subagent-unauthorized: selected child teardown requires a live parent session")
+	}
+	parent.mu.Lock()
+	parentAvailable := parent.attached && !parent.draining
+	parent.mu.Unlock()
+	if !parentAvailable {
+		return errors.New("subagent-unauthorized: selected child teardown requires a live parent session")
+	}
+
+	selected := make([]*Session, 0, len(childIDs))
+	seen := map[string]bool{}
+	for _, childID := range childIDs {
+		if childID == "" || seen[childID] {
+			continue
+		}
+		seen[childID] = true
+		child, childErr := e.getSession(childID)
+		if childErr != nil {
+			continue
+		}
+		child.mu.Lock()
+		attached, origin, mode, directParent := child.attached, child.Header.Origin, child.Header.Mode, child.Header.ParentSession
+		child.mu.Unlock()
+		if !attached {
+			continue
+		}
+		if origin != "subagent" || mode != "continuable" || directParent != parentID {
+			return fmt.Errorf("subagent-unauthorized: subagent %q is not a direct child of session %q", childID, parentID)
+		}
+		selected = append(selected, child)
+	}
+
+	branches := make([]*Session, 0, len(selected))
+	defer func() {
+		for _, child := range branches {
+			child.mu.Lock()
+			child.draining = false
+			child.mu.Unlock()
+		}
+	}()
+	for _, child := range selected {
+		if err := e.beginSubagentDrain(child); err != nil {
+			return err
+		}
+		branches = append(branches, child)
+	}
+	for index := 0; index < len(branches); index++ {
+		parent := branches[index]
+		parent.mu.Lock()
+		id := parent.Header.ID
+		parent.mu.Unlock()
+		for _, child := range e.residentDirectSubagentChildren(id) {
+			child.mu.Lock()
+			childID := child.Header.ID
+			child.mu.Unlock()
+			if seen[childID] {
+				continue
+			}
+			seen[childID] = true
+			if err := e.beginSubagentDrain(child); err != nil {
+				return err
+			}
+			branches = append(branches, child)
+		}
+	}
+	for _, child := range branches {
+		child.mu.Lock()
+		id := child.Header.ID
+		child.mu.Unlock()
+		if err := e.WaitForIdle(ctx, id); err != nil {
+			return err
+		}
+	}
+	var failures []error
+	for index := len(branches) - 1; index >= 0; index-- {
+		branches[index].mu.Lock()
+		id := branches[index].Header.ID
+		branches[index].mu.Unlock()
+		if err := detachSDKSession(e, id); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (e *Engine) residentDirectSubagentChildren(parentID string) []*Session {
+	e.mu.RLock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
+	}
+	e.mu.RUnlock()
+	children := make([]*Session, 0)
+	for _, session := range sessions {
+		session.mu.Lock()
+		match := session.attached && session.Header.Origin == "subagent" && session.Header.Mode == "continuable" && session.Header.ParentSession == parentID
+		session.mu.Unlock()
+		if match {
+			children = append(children, session)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool {
+		children[i].mu.Lock()
+		left := children[i].Header.ID
+		children[i].mu.Unlock()
+		children[j].mu.Lock()
+		right := children[j].Header.ID
+		children[j].mu.Unlock()
+		return left < right
+	})
+	return children
+}
+
+func (e *Engine) beginSubagentDrain(session *Session) error {
+	session.mu.Lock()
+	if !session.attached || session.draining {
+		session.mu.Unlock()
+		return nil
+	}
+	session.draining = true
+	var events []Event
+	if len(session.pending) > 0 {
+		event, err := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
+			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{},
+		}, nil, nil, false)
+		if err != nil {
+			session.draining = false
+			session.mu.Unlock()
+			return err
+		}
+		events = append(events, event)
+	}
+	if len(session.steering) > 0 {
+		event, err := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
+			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{},
+		}, nil, nil, false)
+		if err != nil {
+			session.draining = false
+			session.mu.Unlock()
+			return err
+		}
+		events = append(events, event)
+	}
+	pending := append(append([]*queuedPrompt(nil), session.pending...), session.steering...)
+	session.pending, session.steering = nil, nil
+	id, cancel, maintenanceCancel := session.Header.ID, session.Cancel, session.maintenanceCancel
+	session.mu.Unlock()
+	for _, event := range events {
+		e.publishEvent(id, event)
+	}
+	if len(events) > 0 {
+		e.emitQueue(session)
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if maintenanceCancel != nil {
+		maintenanceCancel()
+	}
+	for _, item := range pending {
+		if item.done != nil {
+			select {
+			case item.done <- promptOutcome{err: errors.New("subagent session is being released")}:
+			default:
+			}
+		}
+	}
+	return nil
+}
+
+// ReportFromSubagent delivers selected content from one resident continuable
+// child to its direct parent. next-step wakes an idle parent; quiet does not.
+func (e *Engine) ReportFromSubagent(ctx context.Context, childID string, content []ContentBlock, delivery string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if delivery == "" {
+		delivery = e.cfg.SubagentReportDelivery
+	}
+	if delivery != SubagentReportQuiet && delivery != SubagentReportNextStep {
+		return "", fmt.Errorf("subagent report delivery must be quiet or next-step, got %q", delivery)
+	}
+	child, err := e.getSession(childID)
+	if err != nil {
+		return "", err
+	}
+	child.mu.Lock()
+	header, attached, draining := child.Header, child.attached, child.draining
+	child.mu.Unlock()
+	if !attached || draining || header.Origin != "subagent" || header.Mode != "continuable" || header.ParentSession == "" {
+		return "", errors.New("subagent-unauthorized: reporting requires a resident continuable child")
+	}
+	parent, err := e.getSession(header.ParentSession)
+	if err != nil {
+		return "", errors.New("subagent-parent-unavailable: direct parent is not live")
+	}
+	parent.mu.Lock()
+	parentAttached := parent.attached
+	parent.mu.Unlock()
+	if !parentAttached {
+		return "", errors.New("subagent-parent-unavailable: direct parent is not live")
+	}
+	framed := append([]ContentBlock{{Type: "text", Text: "Background subagent " + childID + " reported:"}}, cloneContentBlocks(content)...)
+	return e.enqueueTeamPrompt(parent, framed, map[string]any{
+		"kind": "subagent-report", "form": "relay", "senderSessionId": childID,
+	}, "next-step", delivery == SubagentReportNextStep)
 }
 
 func (e *Engine) subagentHistory(p map[string]any) (any, *RPCError) {

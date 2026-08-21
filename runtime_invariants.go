@@ -798,6 +798,7 @@ func installAgentLoopInvariant(scope *InvariantScope, fail InvariantFailure) err
 		}
 		session.mu.Lock()
 		events := append([]Event(nil), session.Events...)
+		provider := session.Model.Provider
 		session.mu.Unlock()
 		turn := latestRequestTurn(events)
 		stepStarted := false
@@ -813,7 +814,7 @@ func installAgentLoopInvariant(scope *InvariantScope, fail InvariantFailure) err
 		if header == nil {
 			return fail("a loop-built request with no request/header event in its session log")
 		}
-		expectedMessages := engine.hydrateChatMessages(transcriptMessages(events, turn))
+		expectedMessages := engine.hydrateChatMessagesWithLimit(transcriptMessages(events, turn), engine.requestImageLimit(provider))
 		if !jsonEqual(request.Messages, expectedMessages) {
 			return fail(fmt.Sprintf("llm request for session %q diverges from the dispatch-time durable derivation (log-reconstruction desync)", session.Header.ID))
 		}

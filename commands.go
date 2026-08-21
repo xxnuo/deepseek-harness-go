@@ -21,13 +21,15 @@ type commandDescriptor struct {
 }
 
 type commandInputDescriptor struct {
-	Hint string `json:"hint"`
+	Hint   string `json:"hint"`
+	Images bool   `json:"images,omitempty"`
 }
 
 type commandInvocation struct {
-	CommandID string
-	Session   *Session
-	RawInput  string
+	CommandID   string
+	Session     *Session
+	RawInput    string
+	Attachments []ContentBlock
 }
 
 type commandDefinition struct {
@@ -55,9 +57,9 @@ func commandCatalog() []commandDescriptor {
 		{Name: "compact", Description: "Compact older conversation history"},
 		{Name: "export", Description: "Download this Session log as a ZIP archive"},
 		{Name: "feedback", Description: "record feedback about this session", Input: &commandInputDescriptor{Hint: "<text>"}},
-		{Name: "goal", Description: "set or view the goal for a long-running task", Input: &commandInputDescriptor{Hint: "[<objective>|clear|edit <objective>|pause|resume]"}},
+		{Name: "goal", Description: "set or view the goal for a long-running task", Input: &commandInputDescriptor{Hint: "[<objective>|clear|edit <objective>|pause|resume]", Images: true}},
 		{Name: "permission", Description: "Switch the permission preset (sandbox mode + approval policy)", Input: &commandInputDescriptor{Hint: "<preset>"}},
-		{Name: "plan", Description: "Enter or leave plan mode", Input: &commandInputDescriptor{Hint: "[off|message]"}},
+		{Name: "plan", Description: "Enter or leave plan mode", Input: &commandInputDescriptor{Hint: "[off|message]", Images: true}},
 	}
 }
 
@@ -79,7 +81,7 @@ func (e *Engine) commandDefinition(name string) (commandDefinition, bool) {
 	return commandDefinition{}, false
 }
 
-func (e *Engine) executeCommand(ctx context.Context, s *Session, line string) (*commandExecution, bool, error) {
+func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, images []EncodedImageAttachment) (*commandExecution, bool, error) {
 	name, rawInput, ok := parseSlashCommand(line)
 	if !ok {
 		return nil, false, nil
@@ -91,6 +93,12 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string) (*
 	if err := ctx.Err(); err != nil {
 		return nil, true, err
 	}
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return nil, true, fmt.Errorf("session-draining: session %q is being released", s.Header.ID)
+	}
 	commandID := newID("cmd")
 	run := map[string]any{"commandId": commandID, "name": name, "source": map[string]any{"kind": "user"}}
 	if definition.RecordInput {
@@ -99,7 +107,36 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string) (*
 	if _, err := e.appendEvent(s, "command/run", run); err != nil {
 		return nil, true, err
 	}
-	result, handlerErr := definition.Handler(ctx, commandInvocation{CommandID: commandID, Session: s, RawInput: rawInput})
+	attachments := []ContentBlock(nil)
+	if len(images) > 0 {
+		if definition.Input == nil || !definition.Input.Images {
+			result := CommandResult{Kind: "error", Text: fmt.Sprintf("/%s does not accept image attachments", name)}
+			if _, err := e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": result.Kind, "text": result.Text}); err != nil {
+				return nil, true, err
+			}
+			return &commandExecution{CommandID: commandID, Result: &result}, true, nil
+		}
+		parts := make([]PromptContentPart, len(images))
+		for index, image := range images {
+			parts[index] = PromptContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data, Name: image.Name}
+		}
+		var admissionErr error
+		attachments, admissionErr = e.durablePromptContent(parts)
+		if admissionErr != nil {
+			result := CommandResult{Kind: "error", Text: admissionErr.Error()}
+			if _, err := e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": result.Kind, "text": result.Text}); err != nil {
+				return nil, true, err
+			}
+			return &commandExecution{CommandID: commandID, Result: &result}, true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			_, _ = e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": "error", "text": err.Error()})
+			return nil, true, err
+		}
+	}
+	result, handlerErr := definition.Handler(ctx, commandInvocation{
+		CommandID: commandID, Session: s, RawInput: rawInput, Attachments: attachments,
+	})
 	if handlerErr != nil {
 		_, _ = e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": "error", "text": handlerErr.Error()})
 		return nil, true, handlerErr
@@ -123,7 +160,7 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string) (*
 }
 
 func (e *Engine) runCommand(s *Session, raw string) (PromptResult, error) {
-	execution, admitted, err := e.executeCommand(context.Background(), s, raw)
+	execution, admitted, err := e.executeCommand(context.Background(), s, raw, nil)
 	if err != nil {
 		return PromptResult{}, err
 	}
@@ -274,6 +311,15 @@ const goalCommandUsage = "Usage: /goal [<objective>|clear|edit <objective>|pause
 
 func (e *Engine) commandGoal(_ context.Context, invocation commandInvocation) (CommandResult, error) {
 	input := strings.TrimSpace(invocation.RawInput)
+	control := strings.ToLower(input)
+	imageObjective := input != "" && control != "clear" && control != "pause" && control != "resume" &&
+		control != "edit"
+	if len(invocation.Attachments) > 0 && !imageObjective {
+		return CommandResult{
+			Kind: "error",
+			Text: "Image attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.",
+		}, nil
+	}
 	current, err := e.GetGoal(invocation.Session.Header.ID)
 	if err != nil {
 		return CommandResult{}, err
@@ -284,7 +330,6 @@ func (e *Engine) commandGoal(_ context.Context, invocation commandInvocation) (C
 		}
 		return renderGoalCommand("Goal", current), nil
 	}
-	control := strings.ToLower(input)
 	operation, objective := "create", input
 	switch {
 	case control == "clear":
@@ -328,6 +373,13 @@ func (e *Engine) commandGoal(_ context.Context, invocation commandInvocation) (C
 	}
 	if _, err := e.GoalMutation(invocation.Session.Header.ID, operation, objective, revision, 0); err != nil {
 		return goalCommandStateError(), nil
+	}
+	if len(invocation.Attachments) > 0 && (operation == "create" || operation == "edit") {
+		content := append([]ContentBlock(nil), invocation.Attachments...)
+		content = append(content, ContentBlock{Type: "text", Text: "Reference images for the goal objective."})
+		if err := e.queueCommandContent(invocation.Session, content); err != nil {
+			return CommandResult{}, err
+		}
 	}
 	next, err := e.GetGoal(invocation.Session.Header.ID)
 	if err != nil || next == nil {
@@ -462,6 +514,9 @@ func planModeActive(events []Event) bool {
 
 func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (CommandResult, error) {
 	message := strings.TrimSpace(invocation.RawInput)
+	if message == "off" && len(invocation.Attachments) > 0 {
+		return CommandResult{Kind: "error", Text: "Image attachments cannot accompany /plan off."}, nil
+	}
 	invocation.Session.mu.Lock()
 	events := append([]Event(nil), invocation.Session.Events...)
 	invocation.Session.mu.Unlock()
@@ -472,8 +527,12 @@ func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (C
 			return CommandResult{}, err
 		}
 	}
-	if wanted && message != "" {
-		if err := e.queueCommandMessage(invocation.Session, message); err != nil {
+	if wanted && (message != "" || len(invocation.Attachments) > 0) {
+		content := append([]ContentBlock(nil), invocation.Attachments...)
+		if message != "" {
+			content = append(content, ContentBlock{Type: "text", Text: message})
+		}
+		if err := e.queueCommandContent(invocation.Session, content); err != nil {
 			return CommandResult{}, err
 		}
 	}
@@ -490,7 +549,15 @@ func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (C
 }
 
 func (e *Engine) queueCommandMessage(s *Session, text string) error {
-	job := &queuedPrompt{id: newID("msg"), text: text, content: []ContentBlock{{Type: "text", Text: text}}, source: map[string]any{"kind": "user"}}
+	return e.queueCommandContent(s, []ContentBlock{{Type: "text", Text: text}})
+}
+
+func (e *Engine) queueCommandContent(s *Session, content []ContentBlock) error {
+	content = cloneSessionReferenceContent(content)
+	job := &queuedPrompt{
+		id: newID("msg"), text: strings.TrimSpace(blockText(content)), content: content,
+		source: map[string]any{"kind": "user"},
+	}
 	s.mu.Lock()
 	target := "next-turn"
 	queue := &s.pending

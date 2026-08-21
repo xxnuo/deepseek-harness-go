@@ -118,7 +118,7 @@ func (e *ProviderError) Unwrap() error {
 func defaultRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		Mode:           RetryNormal,
-		MaxRetries:     2,
+		MaxRetries:     5,
 		RetryableCodes: []string{"EMPTY_RESPONSE", "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT"},
 		InitialDelay:   500 * time.Millisecond,
 		MaxDelay:       10 * time.Second,
@@ -513,7 +513,7 @@ func (e *Engine) completeWithRetrySink(ctx context.Context, provider Provider, r
 		// A caller cancellation/deadline is authoritative even when the
 		// provider wrapped it in a retry-looking transport error.
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-			return Completion{}, nil, err
+			return Completion{}, deltas, err
 		}
 		e.mu.RLock()
 		closed = e.closed

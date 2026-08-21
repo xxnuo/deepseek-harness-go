@@ -37,7 +37,7 @@ func TestTypertRemoteCommandsAndProtocol(t *testing.T) {
 	}
 
 	status, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/clear"},
+		"args": map[string]any{"agentId": id, "line": "/clear", "images": []any{}},
 	})
 	execution, ok := remoteValue(t, envelope).(map[string]any)
 	if status != http.StatusOK || !ok || execution["commandId"] == "" {
@@ -52,7 +52,7 @@ func TestTypertRemoteCommandsAndProtocol(t *testing.T) {
 	}
 
 	_, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/unknown"},
+		"args": map[string]any{"agentId": id, "line": "/unknown", "images": []any{}},
 	})
 	result := rpcResult(t, envelope)
 	if result["ok"] != true {

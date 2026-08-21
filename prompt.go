@@ -87,7 +87,7 @@ func (e *Engine) runtimeForSession(s *Session) (agentRuntime, error) {
 			if max := yamlNodeInt(yamlMapValue(config, "maxBytes")); max >= 0 {
 				runtimeConfig.instructionMaxBytes = max
 			}
-		case "@deepseek-ai/dsh-tool-bash-persistent":
+		case "@deepseek-ai/dsh-tool-bash-persistent", "@deepseek-ai/dsh-tool-pwsh-persistent":
 			runtimeConfig.persistentBash = true
 			runtimeConfig.persistentBashDesc = yamlScalar(yamlMapValue(config, "description"))
 		case "@deepseek-ai/dsh-agent-tool-presentation":
@@ -111,6 +111,8 @@ func presetToolNames(plugin string, config *yaml.Node) []string {
 	switch plugin {
 	case "@deepseek-ai/dsh-tool-bash", "@deepseek-ai/dsh-tool-bash-persistent":
 		return []string{"bash"}
+	case "@deepseek-ai/dsh-tool-pwsh", "@deepseek-ai/dsh-tool-pwsh-persistent":
+		return []string{"pwsh"}
 	case "@deepseek-ai/dsh-tool-fs":
 		return []string{"read", "read_image", "write", "edit"}
 	case "@deepseek-ai/dsh-tool-fs-search":
@@ -127,6 +129,13 @@ func presetToolNames(plugin string, config *yaml.Node) []string {
 		return []string{"send_message", "interrupt_agent"}
 	case "@deepseek-ai/dsh-tool-subagent-control/list-agents":
 		return []string{"list_agents"}
+	case "@deepseek-ai/dsh-tool-subagent-report":
+		return []string{"report"}
+	case "@deepseek-ai/dsh-experimental-tool-agent-team":
+		return []string{
+			"spawn_teammate", "send_message", "followup_task", "list_agents", "wait_agent", "interrupt_agent",
+			"team_task_create", "team_task_list", "team_task_get", "team_task_update",
+		}
 	case "@deepseek-ai/dsh-tool-subagent":
 		name := yamlScalar(yamlMapValue(config, "toolName"))
 		if name == "" {
@@ -299,6 +308,8 @@ func (e *Engine) resolvedSystemPromptSections(s *Session, selection ModelSelecti
 func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelection, agent agentRuntime, caller *dynamicCordisRun, assemblyContext map[string]any) ([]resolvedPromptSection, map[string]any, error) {
 	s.mu.Lock()
 	cwd, sessionID := s.Header.CWD, s.Header.ID
+	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached &&
+		s.toolRestriction.allows("report")
 	s.mu.Unlock()
 	if assemblyContext == nil {
 		assemblyContext = map[string]any{"provider": selection.Provider, "model": selection.Model, "cwd": cwd}
@@ -321,11 +332,23 @@ func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelecti
 	if e.clientPluginComposed("@deepseek-ai/dsh-client-ui-deliverables") {
 		add("ui:deliverable-file-references", 190, deliverableFilePrompt)
 	}
+	if (e.cfg.ClientPlugins == nil || e.clientPluginActive("@deepseek-ai/dsh-file-reference-local")) &&
+		(agent.toolNames == nil || agent.toolNames["read"]) {
+		add("context:file-reference", 99, FileReferencePrompt)
+	}
+	if e.agentTeams != nil {
+		if policy := teamPolicyPrompt(e.agentTeams, sessionID); policy != "" {
+			add("team:policy", 60, policy)
+		}
+	}
 	if agent.toolNames["workflow"] {
 		add("tool:workflow", 100, "Use the workflow tool ONLY when the user explicitly asks for a workflow or for large multi-agent orchestration. For one or two delegations, prefer plain subagent calls.")
 	}
 	if agent.toolNames["ralph"] {
 		add("tool:ralph", 101, "Use the ralph tool ONLY when the direct human explicitly asks for a Ralph loop or fresh-agent iterative execution. Completion and blockers are worker reports, not independent evaluation.")
+	}
+	if reportVisible && (agent.toolNames == nil || agent.toolNames["report"]) {
+		add("tool:report", 117, "Deliver your result with the report tool before you finish: call it once with a self-contained answer. The agent that started you shares your workspace but does not automatically receive your transcript, tool output, or reasoning. Report earlier as well whenever a partial finding changes what that agent should do next; reporting never ends your turn.")
 	}
 	if agent.toolNames["web_search"] {
 		guidance := "Use the web_search tool to discover current information on the web. It returns an optional answer plus a list of source URLs. Use the returned source snippets when available, and cite the relevant URLs as markdown links."

@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	piAISettingsNamespace = "llm-pi-ai"
-	piAIDefaultContext    = 262144
-	piAIDefaultMaxTokens  = 32768
-	piAIDefaultIdleMillis = 300000
-	piAIMaxTimerMillis    = 2147483647
+	piAISettingsNamespace           = "llm-pi-ai"
+	piAIDefaultContext              = 262144
+	piAIDefaultMaxTokens            = 32768
+	piAIDefaultIdleMillis           = 300000
+	piAIDefaultMaxRequestImageBytes = DefaultMaxRequestImageBytes
+	piAIMaxTimerMillis              = 2147483647
 )
 
 var piAISupportedProfileKeys = map[string]bool{
@@ -25,7 +28,7 @@ var piAISupportedProfileKeys = map[string]bool{
 	"headers": true, "reasoning": true, "thinkingBudgets": true,
 	"cacheRetention": true, "transport": true, "timeoutMs": true,
 	"websocketConnectTimeoutMs": true, "streamIdleTimeoutMs": true,
-	"retryPolicy": true,
+	"maxRequestImageBytes": true, "retryPolicy": true,
 }
 
 var piAISupportedModelKeys = map[string]bool{
@@ -51,23 +54,68 @@ var piAICatalogProtocols = map[string]bool{
 	"openai-responses":        true,
 }
 
+var piAICompatProtocolFields = map[string]map[string]bool{
+	"openai-completions": {
+		"supportsStore": true, "supportsDeveloperRole": true, "supportsReasoningEffort": true,
+		"supportsUsageInStreaming": true, "maxTokensField": true, "requiresToolResultName": true,
+		"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
+		"requiresReasoningContentOnAssistantMessages": true, "thinkingFormat": true,
+		"chatTemplateKwargs": true, "supportsStrictMode": true, "cacheControlFormat": true,
+		"supportsLongCacheRetention": true,
+	},
+	"openai-responses": {
+		"supportsDeveloperRole": true, "supportsStrictMode": true, "supportsLongCacheRetention": true,
+	},
+	"azure-openai-responses": {
+		"supportsDeveloperRole": true, "supportsStrictMode": true, "supportsLongCacheRetention": true,
+	},
+	"openai-codex-responses": {
+		"supportsDeveloperRole": true, "supportsStrictMode": true, "supportsLongCacheRetention": true,
+	},
+	"anthropic-messages": {
+		"supportsEagerToolInputStreaming": true, "supportsLongCacheRetention": true,
+		"supportsCacheControlOnTools": true, "supportsTemperature": true,
+		"forceAdaptiveThinking": true, "allowEmptySignature": true, "supportsStrictTools": true,
+	},
+	"bedrock-converse-stream": {"supportsStrictMode": true},
+}
+
+var piAIWithheldCompatFields = map[string]bool{
+	"openRouterRouting": true, "vercelGatewayRouting": true, "zaiToolStream": true,
+	"supportsOpenAIGrammarTools": true, "sendSessionAffinityHeaders": true,
+	"deferredToolsMode": true, "sessionAffinityFormat": true, "supportsToolSearch": true,
+	"supportsExplicitPromptCacheMode": true, "supportsToolReferences": true,
+}
+
+var piAIBooleanCompatFields = map[string]bool{
+	"supportsStore": true, "supportsDeveloperRole": true, "supportsReasoningEffort": true,
+	"supportsUsageInStreaming": true, "requiresToolResultName": true,
+	"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
+	"requiresReasoningContentOnAssistantMessages": true, "supportsStrictMode": true,
+	"supportsLongCacheRetention": true, "supportsEagerToolInputStreaming": true,
+	"supportsCacheControlOnTools": true, "supportsTemperature": true,
+	"forceAdaptiveThinking": true, "allowEmptySignature": true, "supportsStrictTools": true,
+}
+
 type piAIProviderProfile struct {
-	route               string
-	displayName         string
-	apiKeyEnv           string
-	models              []piAIModel
-	modelByID           map[string]piAIModel
-	headers             map[string]string
-	reasoning           string
-	thinkingBudgets     map[string]int
-	cacheRetention      string
-	transport           string
-	timeout             time.Duration
-	websocketTimeout    time.Duration
-	websocketTimeoutSet bool
-	streamIdleTimeout   time.Duration
-	retryPolicy         RetryPolicy
-	configuredModel     string
+	route                string
+	displayName          string
+	apiKeyEnv            string
+	models               []piAIModel
+	modelByID            map[string]piAIModel
+	headers              map[string]string
+	reasoning            string
+	thinkingBudgets      map[string]int
+	cacheRetention       string
+	transport            string
+	timeout              time.Duration
+	websocketTimeout     time.Duration
+	websocketTimeoutSet  bool
+	streamIdleTimeout    time.Duration
+	maxRequestImageBytes int
+	configuredMaxTokens  map[string]int
+	retryPolicy          RetryPolicy
+	configuredModel      string
 }
 
 type managedPiAIProvider struct {
@@ -107,6 +155,21 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 	if req.ReasoningEffort != "" && !piAIModelSupportsReasoning(model, req.ReasoningEffort) {
 		return Completion{}, &ProviderError{Code: "UNSUPPORTED_REASONING_EFFORT", Message: fmt.Sprintf("pi-ai provider %q model %q does not support reasoning effort %q", p.profile.route, model.ID, req.ReasoningEffort)}
 	}
+	hasImages := false
+	for _, message := range req.Messages {
+		messageHasImages := message.HadImages || chatMessageHasImage(message) || contentBlocksHaveImage(message.Blocks)
+		if messageHasImages && message.Role != "user" && message.Role != "tool" {
+			return Completion{}, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("pi-ai cannot represent an image in an in-history %s message", message.Role)}
+		}
+		hasImages = hasImages || messageHasImages
+	}
+	if hasImages && !slices.Contains(model.Input, "image") {
+		return Completion{}, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("pi-ai model %q does not support image input", model.ID)}
+	}
+	if req.MaxTokens == 0 {
+		req.MaxTokens = p.profile.configuredMaxTokens[model.ID]
+	}
+	req.Messages = offloadRequestImages(req.Messages, p.profile.maxRequestImageBytes)
 	headers := mergePIAIHeaders(model.Headers, p.profile.headers)
 	switch model.API {
 	case "openai-completions":
@@ -290,6 +353,16 @@ func piAISettingsBase() map[string]any {
 }
 
 func piAISettingsSchema() map[string]any {
+	compatFields := map[string]any{
+		"supportsStore": 24, "supportsDeveloperRole": 24, "supportsReasoningEffort": 24,
+		"supportsUsageInStreaming": 24, "maxTokensField": 2, "requiresToolResultName": 24,
+		"requiresAssistantAfterToolResult": 24, "requiresThinkingAsText": 24,
+		"requiresReasoningContentOnAssistantMessages": 24, "thinkingFormat": 2,
+		"chatTemplateKwargs": 27, "supportsStrictMode": 24, "cacheControlFormat": 2,
+		"supportsLongCacheRetention": 24, "supportsEagerToolInputStreaming": 24,
+		"supportsCacheControlOnTools": 24, "supportsTemperature": 24,
+		"forceAdaptiveThinking": 24, "allowEmptySignature": 24, "supportsStrictTools": 24,
+	}
 	return map[string]any{
 		"uid": 16,
 		"refs": map[string]any{
@@ -310,19 +383,25 @@ func piAISettingsSchema() map[string]any {
 				"defaultContextWindow": 5, "defaultMaxTokens": 5, "defaultInput": 10,
 				"headers": 11, "reasoning": 2, "thinkingBudgets": 20,
 				"cacheRetention": 2, "transport": 2, "timeoutMs": 21,
-				"websocketConnectTimeoutMs": 21, "streamIdleTimeoutMs": 5,
+				"websocketConnectTimeoutMs": 21, "streamIdleTimeoutMs": 5, "maxRequestImageBytes": 26,
 			}},
 			"15": map[string]any{"type": "dict", "meta": map[string]any{"default": map[string]any{}}, "inner": 12},
 			"16": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"providers": 15}},
 			"17": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "openai-responses"},
 			"18": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "anthropic-messages"},
-			"19": map[string]any{"type": "object", "meta": map[string]any{}, "dict": map[string]any{"thinkingFormat": 2, "supportsReasoningEffort": 24}},
+			"19": map[string]any{"type": "object", "meta": map[string]any{}, "dict": compatFields},
 			"20": map[string]any{"type": "object", "meta": map[string]any{}, "dict": map[string]any{"minimal": 5, "low": 5, "medium": 5, "high": 5}},
 			"21": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 0}},
 			"22": map[string]any{"type": "dict", "meta": map[string]any{}, "inner": 8},
 			"23": map[string]any{"type": "union", "meta": map[string]any{}, "list": []any{24, 25}},
 			"24": map[string]any{"type": "boolean", "meta": map[string]any{}},
 			"25": map[string]any{"type": "dict", "meta": map[string]any{}, "inner": 2},
+			"26": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": piAIDefaultMaxRequestImageBytes}},
+			"27": map[string]any{"type": "dict", "meta": map[string]any{}, "inner": 28},
+			"28": map[string]any{"type": "union", "meta": map[string]any{}, "list": []any{2, 24, 29, 30, 31}},
+			"29": map[string]any{"type": "number", "meta": map[string]any{}},
+			"30": map[string]any{"type": "const", "meta": map[string]any{}, "value": nil},
+			"31": map[string]any{"type": "object", "meta": map[string]any{}, "dict": map[string]any{"$var": 2, "omitWhenOff": 24}},
 		},
 	}
 }
@@ -373,9 +452,6 @@ func resolvePiAIProfile(route string, raw any) (piAIProviderProfile, error) {
 	}
 	catalog, catalogued := piAICatalog[route]
 	displayName := route
-	if catalogued && catalog.DisplayName != "" {
-		displayName = catalog.DisplayName
-	}
 	if rawName, exists := value["displayName"]; exists {
 		name, ok := rawName.(string)
 		if !ok || name == "" || name != strings.TrimSpace(name) {
@@ -425,21 +501,9 @@ func resolvePiAIProfile(route string, raw any) (piAIProviderProfile, error) {
 	if err := validatePiAICompat(value["compat"], fmt.Sprintf("llm-pi-ai provider %q compat", route)); err != nil {
 		return piAIProviderProfile{}, err
 	}
-	models, err := resolvePiAIModels(route, api, baseURL, value["compat"], value["models"], value["modelOverrides"], catalog, catalogued, defaultContext, defaultMaxTokens, defaultInput)
+	models, configuredMaxTokens, err := resolvePiAIModels(route, api, baseURL, value["compat"], value["models"], value["modelOverrides"], catalog, catalogued, defaultContext, defaultMaxTokens, defaultInput)
 	if err != nil {
 		return piAIProviderProfile{}, err
-	}
-	if value["compat"] != nil {
-		hasCompletions := false
-		for _, model := range models {
-			if model.API == "openai-completions" {
-				hasCompletions = true
-				break
-			}
-		}
-		if !hasCompletions {
-			return piAIProviderProfile{}, fmt.Errorf("llm-pi-ai provider %q sets compat, but no configured model uses openai-completions", route)
-		}
 	}
 	headers, err := piAIHeaders(value["headers"], route)
 	if err != nil {
@@ -489,12 +553,20 @@ func resolvePiAIProfile(route string, raw any) (piAIProviderProfile, error) {
 		}
 		websocketTimeout = time.Duration(milliseconds) * time.Millisecond
 	}
-	idleMillis := piAIDefaultIdleMillis
+	idleMillis := float64(piAIDefaultIdleMillis)
 	if rawTimeout, exists := value["streamIdleTimeoutMs"]; exists {
 		var ok bool
-		idleMillis, ok = piAIPositiveInteger(rawTimeout)
-		if !ok || idleMillis > piAIMaxTimerMillis {
-			return piAIProviderProfile{}, fmt.Errorf("llm-pi-ai provider %q streamIdleTimeoutMs must be a positive integer no greater than %d", route, piAIMaxTimerMillis)
+		idleMillis, ok = positiveFiniteMilliseconds(rawTimeout)
+		if !ok {
+			return piAIProviderProfile{}, fmt.Errorf("llm-pi-ai provider %q streamIdleTimeoutMs must be a positive finite number no greater than %d", route, piAIMaxTimerMillis)
+		}
+	}
+	maxRequestImageBytes := piAIDefaultMaxRequestImageBytes
+	if rawMax, exists := value["maxRequestImageBytes"]; exists {
+		var ok bool
+		maxRequestImageBytes, ok = piAIPositiveInteger(rawMax)
+		if !ok {
+			return piAIProviderProfile{}, fmt.Errorf("llm-pi-ai provider %q maxRequestImageBytes must be a positive integer", route)
 		}
 	}
 	retryPolicy, err := resolvePiAIRetryPolicy(value["retryPolicy"], route)
@@ -509,35 +581,47 @@ func resolvePiAIProfile(route string, raw any) (piAIProviderProfile, error) {
 		route: route, displayName: displayName,
 		apiKeyEnv: apiKeyEnv, models: models, modelByID: modelByID, headers: headers,
 		reasoning: reasoning, thinkingBudgets: thinkingBudgets, cacheRetention: cacheRetention, transport: transport,
-		timeout: timeout, websocketTimeout: websocketTimeout, websocketTimeoutSet: websocketTimeoutSet, streamIdleTimeout: time.Duration(idleMillis) * time.Millisecond,
-		retryPolicy:     retryPolicy,
+		timeout: timeout, websocketTimeout: websocketTimeout, websocketTimeoutSet: websocketTimeoutSet, streamIdleTimeout: millisecondsDuration(idleMillis),
+		maxRequestImageBytes: maxRequestImageBytes, configuredMaxTokens: configuredMaxTokens, retryPolicy: retryPolicy,
 		configuredModel: models[0].ID,
 	}, nil
 }
 
-func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompat, raw, rawOverrides any, catalog piAICatalogRoute, catalogued bool, defaultContext, defaultMaxTokens int, defaultInput []string) ([]piAIModel, error) {
-	if raw != nil && rawOverrides != nil {
-		return nil, fmt.Errorf("llm-pi-ai provider %q cannot set modelOverrides beside models", route)
-	}
-	if rawOverrides != nil {
-		if !catalogued || len(catalog.Models) == 0 {
-			return nil, fmt.Errorf("llm-pi-ai provider %q sets modelOverrides for a route absent from the installed catalog", route)
-		}
-		overrides, ok := rawOverrides.(map[string]any)
+func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompat, raw, rawOverrides any, catalog piAICatalogRoute, catalogued bool, defaultContext, defaultMaxTokens int, defaultInput []string) ([]piAIModel, map[string]int, error) {
+	var rows []any
+	if raw != nil {
+		var ok bool
+		rows, ok = anySlice(raw)
 		if !ok {
-			return nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides must be an object keyed by model id", route)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q models must be an array", route)
 		}
-		rows := make([]any, 0, len(catalog.Models))
+	}
+	overrides := map[string]any{}
+	if rawOverrides != nil {
+		var ok bool
+		overrides, ok = rawOverrides.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides must be an object keyed by model id", route)
+		}
+	}
+	if len(rows) > 0 && len(overrides) > 0 {
+		return nil, nil, fmt.Errorf("llm-pi-ai provider %q cannot set modelOverrides beside models", route)
+	}
+	if len(overrides) > 0 {
+		if !catalogued || len(catalog.Models) == 0 {
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q sets modelOverrides for a route absent from the installed catalog", route)
+		}
+		rows = make([]any, 0, len(catalog.Models))
 		for _, model := range catalog.Models {
 			row := map[string]any{"id": model.ID}
 			if override, exists := overrides[model.ID]; exists {
 				value, ok := override.(map[string]any)
 				if !ok {
-					return nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides entry %q must be an object", route, model.ID)
+					return nil, nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides entry %q must be an object", route, model.ID)
 				}
 				for key, item := range value {
 					if key == "id" {
-						return nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides entry %q must not set id", route, model.ID)
+						return nil, nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides entry %q must not set id", route, model.ID)
 					}
 					row[key] = item
 				}
@@ -553,49 +637,43 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides names unknown model %q", route, id)
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q modelOverrides names unknown model %q", route, id)
 			}
 		}
-		raw = rows
 	}
-	if raw == nil {
+	if len(rows) == 0 {
 		if !catalogued || len(catalog.Models) == 0 {
-			return nil, fmt.Errorf("llm-pi-ai provider %q resolves no models; a declared route must list every model in models", route)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q resolves no models; a declared route must list every model in models", route)
 		}
-		rows := make([]any, 0, len(catalog.Models))
+		rows = make([]any, 0, len(catalog.Models))
 		for _, model := range catalog.Models {
 			rows = append(rows, map[string]any{"id": model.ID})
 		}
-		raw = rows
-	}
-	rows, ok := anySlice(raw)
-	if !ok || len(rows) == 0 {
-		return nil, fmt.Errorf("llm-pi-ai provider %q models must be a non-empty array", route)
 	}
 	catalogModels := make(map[string]piAIModel, len(catalog.Models))
 	for _, model := range catalog.Models {
 		catalogModels[model.ID] = model
 	}
 	sharedAPI := sharedPiAICatalogAPI(catalog.Models)
-	routeThinkingFormat, routeSupportsEffort := piAICompatValues(rawRouteCompat)
 	models := make([]piAIModel, 0, len(rows))
+	configuredMaxTokens := make(map[string]int)
 	seen := make(map[string]bool, len(rows))
 	for index, rawModel := range rows {
 		row, ok := rawModel.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %d must be an object", route, index+1)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %d must be an object", route, index+1)
 		}
 		for key := range row {
 			if !piAISupportedModelKeys[key] {
-				return nil, fmt.Errorf("llm-pi-ai provider %q model %d uses unsupported field %q", route, index+1, key)
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %d uses unsupported field %q", route, index+1, key)
 			}
 		}
 		id, ok := row["id"].(string)
 		if !ok || id == "" || id != strings.TrimSpace(id) {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %d id must be a non-empty string without surrounding whitespace", route, index+1)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %d id must be a non-empty string without surrounding whitespace", route, index+1)
 		}
 		if seen[id] {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model id %q is duplicated", route, id)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model id %q is duplicated", route, id)
 		}
 		seen[id] = true
 		base, catalogModel := catalogModels[id]
@@ -611,10 +689,10 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 			api = sharedAPI
 		}
 		if api == "" {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %q needs api because the installed catalog has no shared protocol", route, id)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q needs api because the installed catalog has no shared protocol", route, id)
 		}
 		if !piAICatalogProtocols[api] {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %q names unsupported api %q", route, id, api)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q names unsupported api %q", route, id, api)
 		}
 		baseURL := strings.TrimRight(baseURLOverride, "/")
 		if baseURL == "" {
@@ -624,7 +702,7 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 			baseURL = strings.TrimRight(catalog.BaseURL, "/")
 		}
 		if baseURL == "" && api != "azure-openai-responses" {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %q needs baseURL", route, id)
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q needs baseURL", route, id)
 		}
 		name := base.Name
 		if name == "" {
@@ -634,7 +712,7 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 			var valid bool
 			name, valid = rawName.(string)
 			if !valid || name == "" {
-				return nil, fmt.Errorf("llm-pi-ai provider %q model %q name must be a non-empty string", route, id)
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q name must be a non-empty string", route, id)
 			}
 		}
 		contextWindow := base.ContextWindow
@@ -645,7 +723,7 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 			var valid bool
 			contextWindow, valid = piAIPositiveInteger(rawContext)
 			if !valid {
-				return nil, fmt.Errorf("llm-pi-ai provider %q model %q contextWindow must be a positive integer", route, id)
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q contextWindow must be a positive integer", route, id)
 			}
 		}
 		maxTokens := base.MaxTokens
@@ -656,25 +734,32 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 			var valid bool
 			maxTokens, valid = piAIPositiveInteger(rawMaxTokens)
 			if !valid {
-				return nil, fmt.Errorf("llm-pi-ai provider %q model %q maxTokens must be a positive integer", route, id)
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q maxTokens must be a positive integer", route, id)
 			}
+			configuredMaxTokens[id] = maxTokens
 		}
 		inputFallback := base.Input
 		if len(inputFallback) == 0 {
 			inputFallback = defaultInput
 		}
-		input, err := piAIModalities(row["input"], inputFallback, fmt.Sprintf("llm-pi-ai provider %q model %q input", route, id))
+		rawInput := row["input"]
+		if configured, ok := anySlice(rawInput); ok && len(configured) == 0 {
+			rawInput = nil
+		}
+		input, err := piAIModalities(rawInput, inputFallback, fmt.Sprintf("llm-pi-ai provider %q model %q input", route, id))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := validatePiAIReasoningEfforts(row["reasoningEfforts"], fmt.Sprintf("llm-pi-ai provider %q model %q reasoningEfforts", route, id)); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := validatePiAICompat(row["compat"], fmt.Sprintf("llm-pi-ai provider %q model %q compat", route, id)); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if row["compat"] != nil && api != "openai-completions" {
-			return nil, fmt.Errorf("llm-pi-ai provider %q model %q sets compat, but api %q is not openai-completions", route, id, api)
+		for field := range configuredPiAICompat(row["compat"]) {
+			if !piAICompatProtocolFields[api][field] {
+				return nil, nil, fmt.Errorf("llm-pi-ai provider %q model %q sets compat %q, but api %q does not take it", route, id, field, api)
+			}
 		}
 		model.ID, model.Name, model.API, model.BaseURL = id, name, api, baseURL
 		model.Input, model.ContextWindow, model.MaxTokens = input, contextWindow, maxTokens
@@ -684,14 +769,23 @@ func resolvePiAIModels(route, apiOverride, baseURLOverride string, rawRouteCompa
 		if api != base.API {
 			model.Compat = piAIModelCompat{}
 		}
-		if api == "openai-completions" {
-			applyPiAICompat(&model.Compat, routeThinkingFormat, routeSupportsEffort)
-			thinkingFormat, supportsEffort := piAICompatValues(row["compat"])
-			applyPiAICompat(&model.Compat, thinkingFormat, supportsEffort)
-		}
+		applyPiAICompat(&model.Compat, rawRouteCompat, api)
+		applyPiAICompat(&model.Compat, row["compat"], api)
 		models = append(models, model)
 	}
-	return models, nil
+	for field := range configuredPiAICompat(rawRouteCompat) {
+		used := false
+		for _, model := range models {
+			if piAICompatProtocolFields[model.API][field] {
+				used = true
+				break
+			}
+		}
+		if !used {
+			return nil, nil, fmt.Errorf("llm-pi-ai provider %q sets compat %q, but no model on the route speaks a protocol that takes it", route, field)
+		}
+	}
+	return models, configuredMaxTokens, nil
 }
 
 func sharedPiAICatalogAPI(models []piAIModel) string {
@@ -708,24 +802,70 @@ func sharedPiAICatalogAPI(models []piAIModel) string {
 	return api
 }
 
-func piAICompatValues(raw any) (string, *bool) {
+func configuredPiAICompat(raw any) map[string]any {
 	value, _ := raw.(map[string]any)
-	thinkingFormat, _ := value["thinkingFormat"].(string)
-	var supportsEffort *bool
-	if rawValue, exists := value["supportsReasoningEffort"]; exists {
-		parsed := rawValue.(bool)
-		supportsEffort = &parsed
+	out := make(map[string]any, len(value))
+	for field, item := range value {
+		if object, ok := item.(map[string]any); ok && len(object) == 0 {
+			continue
+		}
+		out[field] = item
 	}
-	return thinkingFormat, supportsEffort
+	return out
 }
 
-func applyPiAICompat(compat *piAIModelCompat, thinkingFormat string, supportsEffort *bool) {
-	if thinkingFormat != "" {
-		compat.ThinkingFormat = thinkingFormat
-	}
-	if supportsEffort != nil {
-		value := *supportsEffort
-		compat.SupportsReasoningEffort = &value
+func piAIBool(value any) *bool {
+	parsed := value.(bool)
+	return &parsed
+}
+
+func applyPiAICompat(compat *piAIModelCompat, raw any, api string) {
+	for field, value := range configuredPiAICompat(raw) {
+		if !piAICompatProtocolFields[api][field] {
+			continue
+		}
+		switch field {
+		case "thinkingFormat":
+			compat.ThinkingFormat = value.(string)
+		case "cacheControlFormat":
+			compat.CacheControlFormat = value.(string)
+		case "maxTokensField":
+			compat.MaxTokensField = value.(string)
+		case "chatTemplateKwargs":
+			compat.ChatTemplateKwargs = cloneSettingsValue(value.(map[string]any))
+		case "supportsStore":
+			compat.SupportsStore = piAIBool(value)
+		case "supportsDeveloperRole":
+			compat.SupportsDeveloperRole = piAIBool(value)
+		case "supportsReasoningEffort":
+			compat.SupportsReasoningEffort = piAIBool(value)
+		case "supportsUsageInStreaming":
+			compat.SupportsUsageInStreaming = piAIBool(value)
+		case "requiresToolResultName":
+			compat.RequiresToolResultName = piAIBool(value)
+		case "requiresAssistantAfterToolResult":
+			compat.RequiresAssistantAfterToolResult = piAIBool(value)
+		case "requiresThinkingAsText":
+			compat.RequiresThinkingAsText = piAIBool(value)
+		case "requiresReasoningContentOnAssistantMessages":
+			compat.RequiresReasoningContent = piAIBool(value)
+		case "supportsStrictMode":
+			compat.SupportsStrictMode = piAIBool(value)
+		case "supportsLongCacheRetention":
+			compat.SupportsLongCacheRetention = piAIBool(value)
+		case "supportsEagerToolInputStreaming":
+			compat.SupportsEagerToolInputStreaming = piAIBool(value)
+		case "supportsCacheControlOnTools":
+			compat.SupportsCacheControlOnTools = piAIBool(value)
+		case "supportsTemperature":
+			compat.SupportsTemperature = piAIBool(value)
+		case "forceAdaptiveThinking":
+			compat.ForceAdaptiveThinking = piAIBool(value)
+		case "allowEmptySignature":
+			compat.AllowEmptySignature = piAIBool(value)
+		case "supportsStrictTools":
+			compat.SupportsStrictTools = piAIBool(value)
+		}
 	}
 }
 
@@ -760,24 +900,84 @@ func validatePiAICompat(raw any, path string) error {
 		return fmt.Errorf("%s must be an object", path)
 	}
 	for key, rawValue := range value {
-		switch key {
-		case "thinkingFormat":
+		declared := false
+		for _, fields := range piAICompatProtocolFields {
+			if fields[key] {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			if piAIWithheldCompatFields[key] {
+				return fmt.Errorf("%s sets %q, which is not configurable here", path, key)
+			}
+			return fmt.Errorf("%s uses unsupported field %q", path, key)
+		}
+		if rawValue == nil {
+			return fmt.Errorf("%s sets %q with no value", path, key)
+		}
+		switch {
+		case key == "thinkingFormat":
 			format, ok := rawValue.(string)
 			if !ok || !map[string]bool{
 				"openai": true, "deepseek": true, "openrouter": true, "together": true,
-				"zai": true, "qwen": true, "string-thinking": true, "ant-ling": true,
+				"zai": true, "qwen": true, "chat-template": true, "qwen-chat-template": true,
+				"string-thinking": true, "ant-ling": true,
 			}[format] {
 				return fmt.Errorf("%s thinkingFormat is unsupported", path)
 			}
-		case "supportsReasoningEffort":
-			if _, ok := rawValue.(bool); !ok {
-				return fmt.Errorf("%s supportsReasoningEffort must be boolean", path)
+		case key == "maxTokensField":
+			field, ok := rawValue.(string)
+			if !ok || field != "max_completion_tokens" && field != "max_tokens" {
+				return fmt.Errorf("%s maxTokensField is unsupported", path)
 			}
-		default:
-			return fmt.Errorf("%s uses unsupported field %q", path, key)
+		case key == "cacheControlFormat":
+			field, ok := rawValue.(string)
+			if !ok || field != "anthropic" {
+				return fmt.Errorf("%s cacheControlFormat is unsupported", path)
+			}
+		case key == "chatTemplateKwargs":
+			kwargs, ok := rawValue.(map[string]any)
+			if !ok {
+				return fmt.Errorf("%s chatTemplateKwargs must be an object", path)
+			}
+			for name, item := range kwargs {
+				if err := validatePiAIChatTemplateKwarg(item); err != nil {
+					return fmt.Errorf("%s chatTemplateKwargs.%s %w", path, name, err)
+				}
+			}
+		case piAIBooleanCompatFields[key]:
+			if _, ok := rawValue.(bool); !ok {
+				return fmt.Errorf("%s %s must be boolean", path, key)
+			}
 		}
 	}
 	return nil
+}
+
+func validatePiAIChatTemplateKwarg(value any) error {
+	switch value := value.(type) {
+	case nil, string, bool, float64, int, int64, json.Number:
+		return nil
+	case map[string]any:
+		for key := range value {
+			if key != "$var" && key != "omitWhenOff" {
+				return fmt.Errorf("uses unsupported field %q", key)
+			}
+		}
+		variable, ok := value["$var"].(string)
+		if !ok || variable != "thinking.enabled" && variable != "thinking.effort" {
+			return errors.New("must name $var thinking.enabled or thinking.effort")
+		}
+		if raw, exists := value["omitWhenOff"]; exists {
+			if _, ok := raw.(bool); !ok {
+				return errors.New("omitWhenOff must be boolean")
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("must be a scalar or request variable, got %T", value)
+	}
 }
 
 func validatePiAIReasoningEfforts(raw any, path string) error {
@@ -902,16 +1102,12 @@ func piAIModalities(raw any, fallback []string, path string) ([]string, error) {
 		return nil, fmt.Errorf("%s must be a non-empty array", path)
 	}
 	out := make([]string, 0, len(rows))
-	seen := map[string]bool{}
 	for _, row := range rows {
 		modality, ok := row.(string)
 		if !ok || modality != "text" && modality != "image" {
 			return nil, fmt.Errorf("%s supports only text and image", path)
 		}
-		if !seen[modality] {
-			seen[modality] = true
-			out = append(out, modality)
-		}
+		out = append(out, modality)
 	}
 	return out, nil
 }
@@ -978,11 +1174,7 @@ func resolvePiAIRetryPolicy(raw any, route string) (RetryPolicy, error) {
 	if !ok || mode != RetryNormal && mode != RetryAlways {
 		return RetryPolicy{}, fmt.Errorf("llm-pi-ai provider %q retryPolicy.mode must be normal or always", route)
 	}
-	allowed := map[string]bool{"mode": true, "backoff": true}
-	if mode == RetryNormal {
-		allowed["maxRetries"] = true
-		allowed["retryableCodes"] = true
-	}
+	allowed := map[string]bool{"mode": true, "backoff": true, "maxRetries": true, "retryableCodes": true}
 	for key := range value {
 		if !allowed[key] {
 			return RetryPolicy{}, fmt.Errorf("llm-pi-ai provider %q retryPolicy uses unsupported field %q", route, key)
@@ -993,14 +1185,14 @@ func resolvePiAIRetryPolicy(raw any, route string) (RetryPolicy, error) {
 	if mode == RetryAlways {
 		policy.MaxRetries = 0
 	}
-	if rawMax, exists := value["maxRetries"]; exists {
+	if rawMax, exists := value["maxRetries"]; exists && mode == RetryNormal {
 		maxRetries, valid := nonNegativeInteger(rawMax)
 		if !valid {
 			return RetryPolicy{}, fmt.Errorf("llm-pi-ai provider %q retryPolicy.maxRetries must be a non-negative integer", route)
 		}
 		policy.MaxRetries = maxRetries
 	}
-	if rawCodes, exists := value["retryableCodes"]; exists {
+	if rawCodes, exists := value["retryableCodes"]; exists && mode == RetryNormal {
 		rows, valid := anySlice(rawCodes)
 		if !valid || len(rows) == 0 {
 			return RetryPolicy{}, fmt.Errorf("llm-pi-ai provider %q retryPolicy.retryableCodes must be a non-empty array", route)
@@ -1077,6 +1269,22 @@ func numericSetting(raw any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func positiveFiniteMilliseconds(raw any) (float64, bool) {
+	milliseconds, ok := numericSetting(raw)
+	if !ok || math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) || milliseconds <= 0 || milliseconds > piAIMaxTimerMillis {
+		return 0, false
+	}
+	return milliseconds, true
+}
+
+func millisecondsDuration(milliseconds float64) time.Duration {
+	duration := time.Duration(milliseconds * float64(time.Millisecond))
+	if duration <= 0 {
+		return time.Nanosecond
+	}
+	return duration
 }
 
 func (e *Engine) replacePiAIProvidersLocked(next map[string]*managedPiAIProvider) {

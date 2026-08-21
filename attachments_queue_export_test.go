@@ -126,6 +126,28 @@ func TestAttachmentAdmissionFormatsAndIntegrity(t *testing.T) {
 	}
 }
 
+func TestAttachmentRC8ByteAndDimensionLimits(t *testing.T) {
+	if maxImageBytes != int(3.5*1024*1024) || maxImageDimension != 2000 {
+		t.Fatalf("limits = %d bytes, %d px", maxImageBytes, maxImageDimension)
+	}
+	e := attachmentEngine(t, false)
+	oversizedBytes := append([]byte(nil), attachmentFixtureBytes(t)["image/png"]...)
+	oversizedBytes = append(oversizedBytes, make([]byte, maxImageBytes+1-len(oversizedBytes))...)
+	if _, err := e.StoreImage("image/png", b64(oversizedBytes), "large.png"); err == nil ||
+		!strings.Contains(err.Error(), "byte limit") {
+		t.Fatalf("oversized byte error = %v", err)
+	}
+	wide := image.NewRGBA(image.Rect(0, 0, maxImageDimension+1, 1))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, wide); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.StoreImage("image/png", b64(encoded.Bytes()), "wide.png"); err == nil ||
+		!strings.Contains(err.Error(), "per-side") {
+		t.Fatalf("oversized dimension error = %v", err)
+	}
+}
+
 type imageCaptureProvider struct {
 	mu       sync.Mutex
 	requests []ChatRequest

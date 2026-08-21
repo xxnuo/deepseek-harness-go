@@ -180,3 +180,16 @@ func TestWindowsConPTYTerminateAfterExit(t *testing.T) {
 	_ = pty.output.Close()
 	<-outputDone
 }
+
+func TestWindowsTerminalSignalContract(t *testing.T) {
+	pty := &windowsConPTY{pid: 123}
+	for _, signal := range []string{TerminalSignalStop, TerminalSignalHangup} {
+		if _, err := pty.signal(signal); err == nil || !strings.Contains(err.Error(), "unsupported on Windows") {
+			t.Fatalf("%s error = %v", signal, err)
+		}
+	}
+	session := &windowsPTYSession{pty: pty, status: runningTerminalStatus()}
+	if _, err := session.Signal(TerminalSignalKill); err == nil || !strings.Contains(err.Error(), "refusing to SIGKILL") {
+		t.Fatalf("SIGKILL error = %v", err)
+	}
+}

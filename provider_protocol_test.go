@@ -39,6 +39,9 @@ func TestOpenAIResponsesProviderWireAndStream(t *testing.T) {
 	defer server.Close()
 
 	provider := NewOpenAIResponsesProvider("test", server.URL+"/v1", "test-key", "fallback-model")
+	provider.modelSpec = piAIModel{ID: "test-model", Reasoning: true, Compat: piAIModelCompat{
+		SupportsDeveloperRole: boolPointer(true), SupportsStrictMode: boolPointer(true),
+	}}
 	var deltas []Delta
 	completion, err := provider.Complete(context.Background(), ChatRequest{
 		Model: "test-model", System: "system prompt", ReasoningEffort: "high", Temperature: float64Pointer(0), MaxTokens: 1234,
@@ -66,11 +69,11 @@ func TestOpenAIResponsesProviderWireAndStream(t *testing.T) {
 		t.Fatalf("include = %#v", got)
 	}
 	tools := request["tools"].([]any)
-	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "unit_tool" || tools[0].(map[string]any)["type"] != "function" {
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "unit_tool" || tools[0].(map[string]any)["type"] != "function" || tools[0].(map[string]any)["strict"] != false {
 		t.Fatalf("tools = %#v", tools)
 	}
 	input := request["input"].([]any)
-	if len(input) != 5 || input[0].(map[string]any)["role"] != "system" || input[2].(map[string]any)["type"] != "message" || input[3].(map[string]any)["type"] != "function_call" || input[4].(map[string]any)["type"] != "function_call_output" {
+	if len(input) != 5 || input[0].(map[string]any)["role"] != "developer" || input[2].(map[string]any)["type"] != "message" || input[3].(map[string]any)["type"] != "function_call" || input[4].(map[string]any)["type"] != "function_call_output" {
 		t.Fatalf("input = %#v", input)
 	}
 	userContent := input[1].(map[string]any)["content"].([]any)
@@ -88,13 +91,14 @@ func TestOpenAIResponsesProviderWireAndStream(t *testing.T) {
 	if completion.Usage["input_tokens"] != float64(10) || completion.Usage["output_tokens"] != float64(4) || completion.Usage["total_tokens"] != float64(14) {
 		t.Fatalf("usage = %#v", completion.Usage)
 	}
-	if len(deltas) != 5 || deltas[0].Reasoning != "thinking" || deltas[1].Text != "answer" || deltas[2].ToolCalls[0].ArgumentsDelta != `{"value":` || deltas[3].ToolCalls[0].ArgumentsDelta != `"ok"}` || deltas[4].Finish != "tool_calls" {
+	if len(deltas) != 5 || deltas[0].Reasoning != "thinking" || deltas[1].Text != "answer" || deltas[2].ToolCalls[0].ArgumentsDelta != `{"value":` || deltas[3].ToolCalls[0].ArgumentsDelta != `"ok"}` || deltas[4].Finish != "tool_calls" || deltas[4].Usage["input_tokens"] != float64(10) {
 		t.Fatalf("deltas = %#v", deltas)
 	}
 }
 
 func TestAnthropicProviderWireAndStream(t *testing.T) {
 	var request map[string]any
+	var requestHeader http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
@@ -108,6 +112,7 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Errorf("Content-Type = %q", got)
 		}
+		requestHeader = r.Header.Clone()
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
@@ -124,6 +129,9 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 	defer server.Close()
 
 	provider := NewAnthropicProvider("test", server.URL, "test-key", "fallback-model")
+	provider.modelSpec = piAIModel{ID: "test-model", Reasoning: true, Compat: piAIModelCompat{
+		SupportsEagerToolInputStreaming: boolPointer(false), AllowEmptySignature: boolPointer(true),
+	}}
 	var deltas []Delta
 	completion, err := provider.Complete(context.Background(), ChatRequest{
 		Model: "test-model", System: "system prompt", ReasoningEffort: "high", MaxTokens: 1234,
@@ -144,7 +152,10 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 	if request["model"] != "test-model" || request["stream"] != true || request["max_tokens"] != float64(1234) {
 		t.Fatalf("request = %#v", request)
 	}
-	if got := request["thinking"]; !reflect.DeepEqual(got, map[string]any{"type": "enabled", "budget_tokens": float64(1024)}) {
+	if got := requestHeader.Get("Anthropic-Beta"); got != "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" {
+		t.Fatalf("Anthropic-Beta = %q", got)
+	}
+	if got := request["thinking"]; !reflect.DeepEqual(got, map[string]any{"type": "enabled", "budget_tokens": float64(1024), "display": "summarized"}) {
 		t.Fatalf("thinking = %#v", got)
 	}
 	system := request["system"].([]any)
@@ -152,7 +163,7 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 		t.Fatalf("system = %#v", system)
 	}
 	tools := request["tools"].([]any)
-	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "unit_tool" || !reflect.DeepEqual(tools[0].(map[string]any)["input_schema"], map[string]any{"type": "object"}) {
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "unit_tool" || tools[0].(map[string]any)["eager_input_streaming"] != nil || !reflect.DeepEqual(tools[0].(map[string]any)["input_schema"], map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}}) {
 		t.Fatalf("tools = %#v", tools)
 	}
 	messages := request["messages"].([]any)
@@ -164,7 +175,7 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 		t.Fatalf("user content = %#v", userContent)
 	}
 	assistantContent := messages[1].(map[string]any)["content"].([]any)
-	if len(assistantContent) != 3 || assistantContent[0].(map[string]any)["text"] != "prior thought" || assistantContent[2].(map[string]any)["type"] != "tool_use" {
+	if len(assistantContent) != 3 || assistantContent[0].(map[string]any)["type"] != "thinking" || assistantContent[0].(map[string]any)["thinking"] != "prior thought" || assistantContent[0].(map[string]any)["signature"] != "" || assistantContent[2].(map[string]any)["type"] != "tool_use" {
 		t.Fatalf("assistant content = %#v", assistantContent)
 	}
 
@@ -178,7 +189,7 @@ func TestAnthropicProviderWireAndStream(t *testing.T) {
 	if completion.Usage["input_tokens"] != float64(7) || completion.Usage["cache_read_input_tokens"] != float64(2) || completion.Usage["output_tokens"] != float64(5) {
 		t.Fatalf("usage = %#v", completion.Usage)
 	}
-	if len(deltas) != 5 || deltas[0].Reasoning != "thinking" || deltas[1].Text != "answer" || deltas[2].ToolCalls[0].ArgumentsDelta != `{"value":` || deltas[3].ToolCalls[0].ArgumentsDelta != `"ok"}` || deltas[4].Finish != "tool_calls" {
+	if len(deltas) != 7 || deltas[0].Usage["input_tokens"] != float64(7) || deltas[1].Reasoning != "thinking" || deltas[2].Text != "answer" || deltas[3].ToolCalls[0].ArgumentsDelta != `{"value":` || deltas[4].ToolCalls[0].ArgumentsDelta != `"ok"}` || deltas[5].Usage["output_tokens"] != float64(5) || deltas[6].Finish != "tool_calls" {
 		t.Fatalf("deltas = %#v", deltas)
 	}
 }

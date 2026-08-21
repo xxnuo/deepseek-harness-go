@@ -33,6 +33,28 @@ func maskedWSFrame(opcode byte, payload []byte) []byte {
 	return out
 }
 
+func openTestWebSocket(t *testing.T, server *httptest.Server, path, origin string) (net.Conn, *bufio.Reader, *http.Response) {
+	t.Helper()
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	request := "GET " + path + " HTTP/1.1\r\nHost: " + server.Listener.Addr().String() + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+	if origin != "" {
+		request += "Origin: " + origin + "\r\n"
+	}
+	if _, err := conn.Write([]byte(request + "\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn, reader, response
+}
+
 func TestReadWSFrameUnmasksAndValidates(t *testing.T) {
 	opcode, payload, err := readWSFrame(bytes.NewReader(maskedWSFrame(wsText, []byte("hello"))))
 	if err != nil || opcode != wsText || string(payload) != "hello" {
@@ -153,6 +175,60 @@ func TestWebSocketMuxIncludesSessionCreatedAfterUpgrade(t *testing.T) {
 		if payload["sessionId"] == id {
 			return
 		}
+	}
+}
+
+func TestWebSocketHostReturnsSessionBaseline(t *testing.T) {
+	e := newIntegrationEngine(t)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "host-baseline", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(e.Handler())
+	t.Cleanup(server.Close)
+	conn, reader, response := openTestWebSocket(t, server, "/api/events.host", "")
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %s", response.Status)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	envelope, err := readServerWSEnvelope(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := envelope["payload"].(map[string]any)
+	if envelope["method"] != "host/session-added" || payload["sessionId"] != id {
+		t.Fatalf("host baseline = %#v", envelope)
+	}
+}
+
+func TestHTTPRejectsCrossOriginRequest(t *testing.T) {
+	e := newIntegrationEngine(t)
+	server := httptest.NewServer(e.Handler())
+	t.Cleanup(server.Close)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/host.describe", bytes.NewReader([]byte(`{"type":"client-request","rpcId":"origin","method":"host.describe","payload":{}}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://evil.example")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin HTTP status = %d, want 403", response.StatusCode)
+	}
+}
+
+func TestWebSocketRejectsCrossOriginHandshake(t *testing.T) {
+	e := newIntegrationEngine(t)
+	server := httptest.NewServer(e.Handler())
+	t.Cleanup(server.Close)
+	_, _, response := openTestWebSocket(t, server, "/api/events.host", "http://evil.example")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin WebSocket status = %d, want 403", response.StatusCode)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type subagentToolTestProvider struct {
@@ -32,6 +33,34 @@ func settledSubagentToolRun(id string, result SubagentResult, dispose func() err
 	run := newSubagentRun(id, cancel, dispose)
 	run.settle(result)
 	return run
+}
+
+func TestSubagentDiagnosticFormattingAndUTF8Limit(t *testing.T) {
+	run := settledSubagentToolRun("diagnostic-run", SubagentResult{
+		StopReason: SubagentError,
+		Diagnostic: strings.Repeat("\u754c", 2000),
+		Output:     []ContentBlock{{Type: "text", Text: "partial answer"}},
+	}, nil)
+	result, err := run.Wait(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Diagnostic) > maxSubagentDiagnosticBytes || !utf8.ValidString(result.Diagnostic) {
+		t.Fatalf("limited diagnostic bytes=%d valid=%v", len(result.Diagnostic), utf8.ValidString(result.Diagnostic))
+	}
+	if !strings.HasSuffix(result.Diagnostic, diagnosticTruncationSuffix) {
+		t.Fatalf("limited diagnostic does not end with truncation suffix")
+	}
+
+	result.Diagnostic = "provider detail"
+	want := "subagent run failed\nDiagnostic: provider detail\nPartial output before the run ended:\npartial answer"
+	if got := subagentStopError(result); got == nil || got.Error() != want {
+		t.Fatalf("subagentStopError() = %v, want %q", got, want)
+	}
+	outcome := backgroundSubagentOutcome(result, nil)
+	if outcome.Status != jobFailed || outcome.Detail != "error; diagnostic: provider detail" {
+		t.Fatalf("background outcome = %#v", outcome)
+	}
 }
 
 func TestSubagentProviderToolForegroundStrictSettlement(t *testing.T) {

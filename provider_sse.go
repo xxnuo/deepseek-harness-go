@@ -73,8 +73,11 @@ func scanProviderSSE(ctx context.Context, body io.Reader, idleTimeout time.Durat
 				}
 				return next.err
 			}
-			reset()
-			if err := handle(strings.TrimSpace(next.line)); err != nil {
+			line := strings.TrimSpace(next.line)
+			if line != "" && !strings.HasPrefix(line, ":") {
+				reset()
+			}
+			if err := handle(line); err != nil {
 				return err
 			}
 		}

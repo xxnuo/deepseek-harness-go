@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type asset struct {
@@ -18,6 +20,7 @@ type asset struct {
 
 const assetDestination = "runtime-assets/deepseek-harness"
 const testAssetDestination = "testdata/upstream"
+const clientBuildVerificationProgram = `import { officialClientBuildEnvironment, readClientBuildRecord } from './scripts/client-build-environment.ts'; const root = process.cwd(); readClientBuildRecord(root, officialClientBuildEnvironment(root));`
 
 var testAssetPaths = []string{
 	"examples/jsonrpc-agent/tests/snapshots/text-turn/session.jsonl",
@@ -27,10 +30,18 @@ var testAssetPaths = []string{
 
 func main() {
 	check := flag.Bool("check", false, "verify that the tracked runtime assets match upstream")
+	verifyClientBuildOnly := flag.Bool("verify-client-build-only", false, "verify the official upstream client build without syncing assets")
 	upstream := flag.String("upstream", "deepseek-harness", "upstream checkout")
 	flag.Parse()
 
-	assets, err := collectRuntimeAssets(*upstream)
+	err := verifyOfficialClientBuild(*upstream)
+	if err == nil && *verifyClientBuildOnly {
+		return
+	}
+	var assets []asset
+	if err == nil {
+		assets, err = collectRuntimeAssets(*upstream)
+	}
 	if err == nil {
 		testAssets, testErr := collectFiles(*upstream, testAssetPaths)
 		if testErr != nil {
@@ -51,6 +62,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func verifyOfficialClientBuild(upstream string) error {
+	root, err := filepath.Abs(upstream)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("pnpm", "exec", "tsx", "-e", clientBuildVerificationProgram)
+	cmd.Dir = root
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(string(output))
+	if detail == "" {
+		return fmt.Errorf("official upstream client build verification failed: %w", err)
+	}
+	return fmt.Errorf("official upstream client build verification failed: %w\n%s", err, detail)
 }
 
 func collectRuntimeAssets(upstream string) ([]asset, error) {
@@ -82,6 +111,7 @@ func collectRuntimeAssets(upstream string) ([]asset, error) {
 	for _, tree := range []string{
 		"apps/web/dist",
 		"apps/cli/config/agent-presets",
+		"packages/code-runtime/code-runtime-python/py",
 		"packages/skill/skill-badge/assets",
 	} {
 		if err := addTree(tree); err != nil {
@@ -92,7 +122,7 @@ func collectRuntimeAssets(upstream string) ([]asset, error) {
 		"packages/*/*/package.json",
 		"packages/*/*/lib/client.js",
 		"packages/*/*/lib/client.js.map",
-		"packages/bundle/*/cordis.patch.yml",
+		"packages/*/*/cordis.patch.yml",
 	} {
 		matches, err := filepath.Glob(filepath.Join(upstream, filepath.FromSlash(pattern)))
 		if err != nil {

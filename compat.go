@@ -2,12 +2,17 @@ package harness
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -96,11 +101,16 @@ func writeOwnerOnlyFile(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	randomSuffix := make([]byte, 6)
+	if _, err := rand.Read(randomSuffix); err != nil {
+		return fmt.Errorf("create atomic temporary name: %w", err)
+	}
+	tmp := path + "." + hex.EncodeToString(randomSuffix) + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = os.Remove(tmp) }()
 	_ = f.Chmod(0o600)
 	_, writeErr := f.Write(data)
 	if writeErr == nil {
@@ -113,6 +123,53 @@ func writeOwnerOnlyFile(path string, data []byte) error {
 		return writeErr
 	}
 	return os.Rename(tmp, path)
+}
+
+const (
+	fileLockInitialDelay = 20 * time.Millisecond
+	fileLockMaxDelay     = 200 * time.Millisecond
+	fileLockTimeout      = 2 * time.Second
+)
+
+// withOwnerFileLock serializes cross-process read-modify-write operations.
+// The lock is intentionally never treated as stale: age cannot prove that
+// another process stopped, so recovery remains an explicit operator action.
+func withOwnerFileLock(path string, operation func() error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	lockPath := path + ".lock"
+	deadline := time.Now().Add(fileLockTimeout)
+	delay := fileLockInitialDelay
+	for {
+		lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(lock, "%d\n", os.Getpid())
+			_ = lock.Sync()
+			_ = lock.Close()
+			break
+		}
+		contention := os.IsExist(err)
+		if !contention && runtime.GOOS == "windows" && errors.Is(err, syscall.EPERM) {
+			_, statErr := os.Lstat(lockPath)
+			contention = statErr == nil
+		}
+		if !contention {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("timed out waiting for the writer lock at %s", lockPath)
+		}
+		time.Sleep(delay)
+		if delay < fileLockMaxDelay {
+			delay *= 2
+			if delay > fileLockMaxDelay {
+				delay = fileLockMaxDelay
+			}
+		}
+	}
+	defer func() { _ = os.Remove(lockPath) }()
+	return operation()
 }
 
 func assertOwnerOnlyCompat(path string) error {
@@ -151,15 +208,76 @@ func loadSettingsYAML(e *Engine) (bool, error) {
 	return true, nil
 }
 
-func saveSettingsYAMLLocked(e *Engine) error {
-	data, err := yaml.Marshal(e.settings)
-	if err != nil {
-		return err
+// prepareSettingsYAMLLocked materializes an absent editable document without
+// replacing an existing document that another process may have just updated.
+func prepareSettingsYAMLLocked(e *Engine) error {
+	path := settingsYAMLPathFor(e)
+	return withOwnerFileLock(path, func() error {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return writeOwnerOnlyFile(path, nil)
+	})
+}
+
+// updateSettingsYAMLLocked applies one namespace edit to the latest document
+// while the caller holds e.mu. It returns the committed user section and
+// refreshes e.settings with the complete document observed under the lock.
+func updateSettingsYAMLLocked(e *Engine, ns string, apply func(map[string]any) (map[string]any, error)) (map[string]any, error) {
+	if !e.cfg.Persist {
+		next, err := apply(cloneSettingsValue(e.settings[ns]))
+		if err == nil {
+			e.settings[ns] = cloneSettingsValue(next)
+		}
+		return next, err
 	}
-	if err := writeOwnerOnlyFile(settingsYAMLPathFor(e), data); err != nil {
-		return err
-	}
-	return nil
+	path := settingsYAMLPathFor(e)
+	var next map[string]any
+	err := withOwnerFileLock(path, func() error {
+		doc, err := readYAMLDocument(path)
+		if errors.Is(err, os.ErrNotExist) {
+			doc = map[string]any{}
+		} else if err != nil {
+			return err
+		}
+		for name, raw := range doc {
+			if _, ok := raw.(map[string]any); !ok {
+				return fmt.Errorf("settings namespace %q must be a mapping", name)
+			}
+		}
+		current := cloneSettingsValue(e.settings[ns])
+		if raw, ok := doc[ns]; ok {
+			current, ok = raw.(map[string]any)
+			if !ok {
+				return fmt.Errorf("settings namespace %q must be a mapping", ns)
+			}
+			current = cloneSettingsValue(current)
+		}
+		next, err = apply(current)
+		if err != nil {
+			return err
+		}
+		doc[ns] = cloneSettingsValue(next)
+		if !reflect.DeepEqual(next, current) {
+			data, err := yaml.Marshal(doc)
+			if err != nil {
+				return err
+			}
+			if err := writeOwnerOnlyFile(path, data); err != nil {
+				return err
+			}
+		}
+		settings := make(map[string]map[string]any, len(doc))
+		for name, raw := range doc {
+			section := raw.(map[string]any)
+			settings[name] = cloneSettingsValue(section)
+		}
+		e.settings = settings
+		return nil
+	})
+	return next, err
 }
 
 func loadCredentialsYAML(e *Engine) (bool, error) {
@@ -186,15 +304,58 @@ func loadCredentialsYAML(e *Engine) (bool, error) {
 	return true, nil
 }
 
-func saveCredentialsYAMLLocked(e *Engine) error {
-	data, err := yaml.Marshal(e.credentials)
-	if err != nil {
-		return err
+// updateCredentialsYAMLLocked edits one credential against the latest file
+// while the caller holds e.mu, then refreshes the in-memory snapshot.
+func updateCredentialsYAMLLocked(e *Engine, ref string, value *string) (bool, error) {
+	if !e.cfg.Persist {
+		previous, exists := e.credentials[ref]
+		if value == nil {
+			delete(e.credentials, ref)
+		} else {
+			e.credentials[ref] = *value
+		}
+		return value == nil && exists || value != nil && (!exists || previous != *value), nil
 	}
-	if err := writeOwnerOnlyFile(credentialsYAMLPathFor(e), data); err != nil {
-		return err
-	}
-	return nil
+	path := credentialsYAMLPathFor(e)
+	changed := false
+	err := withOwnerFileLock(path, func() error {
+		if err := assertOwnerOnlyCompat(path); err != nil {
+			return err
+		}
+		doc, err := readYAMLDocument(path)
+		if errors.Is(err, os.ErrNotExist) {
+			doc = map[string]any{}
+		} else if err != nil {
+			return err
+		}
+		values := make(map[string]string, len(doc))
+		for name, raw := range doc {
+			text, ok := raw.(string)
+			if !ok || text == "" || !validCredentialRef(name) {
+				return errors.New("invalid credentials YAML document")
+			}
+			values[name] = text
+		}
+		previous, exists := values[ref]
+		changed = value == nil && exists || value != nil && (!exists || previous != *value)
+		if value == nil {
+			delete(values, ref)
+		} else {
+			values[ref] = *value
+		}
+		if changed {
+			data, err := yaml.Marshal(values)
+			if err != nil {
+				return err
+			}
+			if err := writeOwnerOnlyFile(path, data); err != nil {
+				return err
+			}
+		}
+		e.credentials = values
+		return nil
+	})
+	return changed, err
 }
 
 const (
@@ -202,6 +363,7 @@ const (
 	deepSeekDefaultContext      = 1000000
 	deepSeekDefaultMaxTokens    = 256000
 	deepSeekDefaultStreamIdleMs = 300000
+	deepSeekDefaultImageBytes   = DefaultMaxRequestImageBytes
 )
 
 func deepSeekDefaultModels() []any {
@@ -226,6 +388,7 @@ func deepSeekBaseSettings(e *Engine) map[string]any {
 		"defaultContextWindow": deepSeekDefaultContext,
 		"models":               deepSeekDefaultModels(),
 		"streamIdleTimeoutMs":  deepSeekDefaultStreamIdleMs,
+		"maxRequestImageBytes": deepSeekDefaultImageBytes,
 	}
 }
 
@@ -253,10 +416,15 @@ func deepSeekSettingsSchema() map[string]any {
 			"30": map[string]any{"type": "string", "meta": map[string]any{}},
 			"33": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1}},
 			"36": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1}},
-			"37": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"id": 28, "name": 29, "description": 30, "contextWindow": 33, "maxTokens": 36}},
+			"37": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"id": 28, "name": 29, "description": 30, "contextWindow": 33, "maxTokens": 36, "inputModalities": 47}},
 			"39": map[string]any{"type": "array", "meta": map[string]any{"default": deepSeekDefaultModels()}, "inner": 37},
 			"42": map[string]any{"type": "number", "meta": map[string]any{"min": 1, "default": deepSeekDefaultStreamIdleMs}},
-			"43": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"apiKeyEnv": 2, "baseURL": 3, "thinking": 4, "reasoningEffort": 9, "maxTokens": 22, "defaultContextWindow": 26, "models": 39, "streamIdleTimeoutMs": 42}},
+			"43": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"apiKeyEnv": 2, "baseURL": 3, "thinking": 4, "reasoningEffort": 9, "maxTokens": 22, "defaultContextWindow": 26, "models": 39, "streamIdleTimeoutMs": 42, "maxRequestImageBytes": 48}},
+			"44": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "text"},
+			"45": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "image"},
+			"46": map[string]any{"type": "union", "meta": map[string]any{}, "list": []any{44, 45}},
+			"47": map[string]any{"type": "array", "meta": map[string]any{"default": []any{"text"}, "min": 1}, "inner": 46},
+			"48": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultImageBytes}},
 		},
 	}
 }
@@ -294,10 +462,28 @@ func positiveIntSetting(value any, fallback int) int {
 	return fallback
 }
 
+func deepSeekModalities(value any) []string {
+	rows, ok := anySlice(value)
+	if !ok || len(rows) == 0 {
+		return []string{"text"}
+	}
+	out := make([]string, 0, len(rows))
+	for _, raw := range rows {
+		if modality, ok := raw.(string); ok {
+			out = append(out, modality)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"text"}
+	}
+	return out
+}
+
 func deepSeekCatalog(value any) []ModelInfo {
 	settings, _ := value.(map[string]any)
-	rows, ok := settings["models"].([]any)
-	if !ok || len(rows) == 0 {
+	rawModels, exists := settings["models"]
+	rows, ok := anySlice(rawModels)
+	if !exists || !ok {
 		rows = deepSeekDefaultModels()
 	}
 	defaultContext := positiveIntSetting(settings["defaultContextWindow"], deepSeekDefaultContext)
@@ -319,15 +505,80 @@ func deepSeekCatalog(value any) []ModelInfo {
 			name = id
 		}
 		out = append(out, ModelInfo{
-			ID: id, Name: name, Description: stringSetting(row["description"]), InputModalities: []string{"text"},
+			ID: id, Name: name, Description: stringSetting(row["description"]), InputModalities: deepSeekModalities(row["inputModalities"]),
 			ContextWindow: positiveIntSetting(row["contextWindow"], defaultContext),
 			MaxTokens:     positiveIntSetting(row["maxTokens"], defaultMaxTokens),
 		})
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && !exists {
 		return []ModelInfo{{ID: "deepseek-v4-flash", Name: "DeepSeek-V4-Flash", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens}, {ID: "deepseek-v4-pro", Name: "DeepSeek-V4-Pro", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens}}
 	}
 	return out
+}
+
+func validateDeepSeekSettings(value map[string]any) error {
+	for _, field := range []string{"maxTokens", "defaultContextWindow", "maxRequestImageBytes"} {
+		if raw, exists := value[field]; exists {
+			if parsed, ok := piAIPositiveInteger(raw); !ok || parsed <= 0 {
+				return fmt.Errorf("llm-deepseek.%s must be a positive integer", field)
+			}
+		}
+	}
+	if raw, exists := value["streamIdleTimeoutMs"]; exists {
+		if _, ok := positiveFiniteMilliseconds(raw); !ok {
+			return fmt.Errorf("llm-deepseek.streamIdleTimeoutMs must be a positive finite number no greater than %d", piAIMaxTimerMillis)
+		}
+	}
+	rawModels, exists := value["models"]
+	if !exists {
+		return nil
+	}
+	rows, ok := anySlice(rawModels)
+	if !ok {
+		return errors.New("llm-deepseek.models must be an array")
+	}
+	seen := make(map[string]bool, len(rows))
+	for index, raw := range rows {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("llm-deepseek.models[%d] must be an object", index)
+		}
+		id, ok := model["id"].(string)
+		if !ok || id == "" || id != strings.TrimSpace(id) {
+			return fmt.Errorf("llm-deepseek.models[%d].id must be a non-empty string without surrounding whitespace", index)
+		}
+		if seen[id] {
+			return fmt.Errorf("llm-deepseek model %q is duplicated", id)
+		}
+		seen[id] = true
+		for _, field := range []string{"contextWindow", "maxTokens"} {
+			if raw, exists := model[field]; exists {
+				if parsed, ok := piAIPositiveInteger(raw); !ok || parsed <= 0 {
+					return fmt.Errorf("llm-deepseek model %q %s must be a positive integer", id, field)
+				}
+			}
+		}
+		rawModalities, exists := model["inputModalities"]
+		if !exists {
+			continue
+		}
+		modalities, ok := anySlice(rawModalities)
+		if !ok || len(modalities) == 0 {
+			return fmt.Errorf("llm-deepseek model %q inputModalities must be a non-empty array", id)
+		}
+		seenModalities := map[string]bool{}
+		for _, raw := range modalities {
+			modality, ok := raw.(string)
+			if !ok || modality != "text" && modality != "image" {
+				return fmt.Errorf("llm-deepseek model %q inputModalities must contain only text and image", id)
+			}
+			if seenModalities[modality] {
+				return fmt.Errorf("llm-deepseek model %q inputModalities must not contain duplicates", id)
+			}
+			seenModalities[modality] = true
+		}
+	}
+	return nil
 }
 
 // managedDeepSeekProvider resolves endpoint, model catalog, and credentials
@@ -338,8 +589,10 @@ type managedDeepSeekProvider struct{ engine *Engine }
 func (p *managedDeepSeekProvider) ID() string   { return "deepseek-official" }
 func (p *managedDeepSeekProvider) Name() string { return "DeepSeek" }
 
-func (p *managedDeepSeekProvider) snapshot() (*OpenAIProvider, []ModelInfo) {
-	settings := deepSeekEffectiveSettings(p.engine)
+func (p *managedDeepSeekProvider) snapshot(settings map[string]any) (*OpenAIProvider, []ModelInfo, error) {
+	if err := validateDeepSeekSettings(settings); err != nil {
+		return nil, nil, err
+	}
 	apiKeyRef := stringSetting(settings["apiKeyEnv"])
 	if apiKeyRef == "" {
 		apiKeyRef = "DEEPSEEK_API_KEY"
@@ -362,23 +615,110 @@ func (p *managedDeepSeekProvider) snapshot() (*OpenAIProvider, []ModelInfo) {
 	if model == "" {
 		model = "deepseek-chat"
 	}
-	return NewOpenAIProvider("deepseek-official", baseURL, apiKey, model), deepSeekCatalog(settings)
+	provider := NewOpenAIProvider("deepseek-official", baseURL, apiKey, model)
+	idleMillis, ok := positiveFiniteMilliseconds(settings["streamIdleTimeoutMs"])
+	if !ok {
+		idleMillis = deepSeekDefaultStreamIdleMs
+	}
+	provider.streamIdleTimeout = millisecondsDuration(idleMillis)
+	return provider, deepSeekCatalog(settings), nil
 }
 
 func (p *managedDeepSeekProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_, catalog := p.snapshot()
+	_, catalog, err := p.snapshot(deepSeekEffectiveSettings(p.engine))
+	if err != nil {
+		return nil, err
+	}
 	return catalog, nil
 }
 
+func deepSeekImageMessages(messages []ChatMessage) ([]ChatMessage, error) {
+	out := make([]ChatMessage, 0, len(messages)+1)
+	pendingToolImages := make([]ChatImage, 0)
+	flushToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		out = append(out, ChatMessage{
+			Role: "user", Content: "Attached image(s) from tool result:",
+			Images: append([]ChatImage(nil), pendingToolImages...),
+		})
+		pendingToolImages = pendingToolImages[:0]
+	}
+	for _, message := range messages {
+		if chatMessageHasImage(message) && message.Role != "user" && message.Role != "tool" {
+			return nil, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("DeepSeek cannot represent image content in a %s message", message.Role)}
+		}
+		if message.Role == "tool" {
+			tool := message
+			if chatMessageHasImage(tool) {
+				for _, part := range chatContentParts(tool) {
+					if part.Type == "image" {
+						pendingToolImages = append(pendingToolImages, ChatImage{MediaType: part.MediaType, Data: part.Data})
+					}
+				}
+				tool.Images = nil
+				tool.Parts = nil
+				if tool.Content == "" {
+					tool.Content = "(see attached image)"
+				}
+			}
+			out = append(out, tool)
+			continue
+		}
+		flushToolImages()
+		out = append(out, message)
+	}
+	flushToolImages()
+	return out, nil
+}
+
 func (p *managedDeepSeekProvider) Complete(ctx context.Context, req ChatRequest, onDelta func(Delta) error) (Completion, error) {
-	snapshot, _ := p.snapshot()
+	settings := deepSeekEffectiveSettings(p.engine)
+	snapshot, catalog, err := p.snapshot(settings)
+	if err != nil {
+		return Completion{}, err
+	}
+	hasImages := false
+	for _, message := range req.Messages {
+		messageHasImages := message.HadImages || chatMessageHasImage(message) || contentBlocksHaveImage(message.Blocks)
+		if messageHasImages && message.Role != "user" && message.Role != "tool" {
+			return Completion{}, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("DeepSeek cannot represent image content in a %s message", message.Role)}
+		}
+		if messageHasImages {
+			hasImages = true
+		}
+	}
+	if hasImages {
+		acceptsImages := false
+		for _, model := range catalog {
+			if model.ID != req.Model {
+				continue
+			}
+			for _, modality := range model.InputModalities {
+				if modality == "image" {
+					acceptsImages = true
+					break
+				}
+			}
+			break
+		}
+		if !acceptsImages {
+			return Completion{}, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("DeepSeek model %q does not accept image input", req.Model)}
+		}
+	}
+	req.Messages = offloadRequestImages(req.Messages, positiveIntSetting(settings["maxRequestImageBytes"], deepSeekDefaultImageBytes))
+	messages, err := deepSeekImageMessages(req.Messages)
+	if err != nil {
+		return Completion{}, err
+	}
+	req.Messages = messages
 	if snapshot.apiKey == "" {
 		return Completion{}, &ProviderError{Code: "AUTH", Message: "missing credential: DEEPSEEK_API_KEY"}
 	}
-	settings := deepSeekEffectiveSettings(p.engine)
 	effort := req.ReasoningEffort
 	if effort == "" {
 		effort = stringSetting(settings["reasoningEffort"])

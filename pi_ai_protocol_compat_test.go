@@ -86,8 +86,57 @@ func TestPiAIRouteCompatRequiresCompletionsModel(t *testing.T) {
 	_, err := resolvePiAIProfile("openai", map[string]any{
 		"compat": map[string]any{"thinkingFormat": "openai"},
 	})
-	if err == nil || !containsText(err.Error(), "no configured model uses openai-completions") {
+	if err == nil || !containsText(err.Error(), "no model on the route speaks a protocol that takes it") {
 		t.Fatalf("resolvePiAIProfile() error = %v", err)
+	}
+}
+
+func TestPiAICompatIsMergedPerProtocolAndPerField(t *testing.T) {
+	profile, err := resolvePiAIProfile("custom-responses", map[string]any{
+		"api": "openai-responses", "baseURL": "https://example.test/v1",
+		"compat": map[string]any{"supportsDeveloperRole": false, "supportsStrictMode": false},
+		"models": []any{map[string]any{
+			"id": "model", "compat": map[string]any{"supportsStrictMode": true},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compat := profile.models[0].Compat
+	if compat.SupportsDeveloperRole == nil || *compat.SupportsDeveloperRole || compat.SupportsStrictMode == nil || !*compat.SupportsStrictMode {
+		t.Fatalf("merged compat = %#v", compat)
+	}
+
+	_, err = resolvePiAIProfile("wrong-protocol", map[string]any{
+		"api": "openai-responses", "baseURL": "https://example.test/v1",
+		"models": []any{map[string]any{
+			"id": "model", "compat": map[string]any{"thinkingFormat": "openai"},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not take it") {
+		t.Fatalf("wrong protocol error = %v", err)
+	}
+}
+
+func TestPiAICompatRejectsWithheldEmptyAndInvalidKwargs(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		compat map[string]any
+		want   string
+	}{
+		{name: "withheld", compat: map[string]any{"sessionAffinityFormat": "openai"}, want: "not configurable"},
+		{name: "empty", compat: map[string]any{"supportsStore": nil}, want: "with no value"},
+		{name: "variable", compat: map[string]any{"chatTemplateKwargs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled or thinking.effort"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := resolvePiAIProfile("custom", map[string]any{
+				"api": "openai-completions", "baseURL": "https://example.test/v1",
+				"compat": test.compat, "models": []any{map[string]any{"id": "model"}},
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
@@ -406,13 +455,18 @@ func TestOpenAICompletionsPiAICompatWire(t *testing.T) {
 			ThinkingFormat: "openrouter", CacheControlFormat: "anthropic", MaxTokensField: "max_tokens",
 			SupportsStore: &valueFalse, SupportsUsageInStreaming: &valueFalse,
 			SupportsLongCacheRetention: &valueTrue, SendSessionAffinityHeaders: &valueTrue,
+			RequiresReasoningContent: &valueTrue, SupportsStrictMode: &valueTrue,
 			SessionAffinityFormat: "openrouter",
 		},
 	}
 	completion, err := provider.Complete(context.Background(), ChatRequest{
 		SessionID: "session-1", System: "system", ReasoningEffort: "high", Temperature: float64Pointer(0), MaxTokens: 32,
-		Messages: []ChatMessage{{Role: "user", Content: "hello"}},
-		Tools:    []ToolSchema{{Name: "unit_tool", Parameters: map[string]any{"type": "object"}}},
+		Messages: []ChatMessage{
+			{Role: "user", Content: "before"},
+			{Role: "assistant", Content: "prior"},
+			{Role: "user", Content: "hello"},
+		},
+		Tools: []ToolSchema{{Name: "unit_tool", Parameters: map[string]any{"type": "object"}}},
 	}, func(Delta) error { return nil })
 	if err != nil || completion.Text != "ok" {
 		t.Fatalf("completion = %#v, %v", completion, err)
@@ -425,6 +479,15 @@ func TestOpenAICompletionsPiAICompatWire(t *testing.T) {
 	}
 	if !reflect.DeepEqual(request["reasoning"], map[string]any{"effort": "high"}) {
 		t.Fatalf("reasoning = %#v", request["reasoning"])
+	}
+	messages := request["messages"].([]any)
+	assistant := messages[2].(map[string]any)
+	if value, exists := assistant["reasoning_content"]; !exists || value != "" {
+		t.Fatalf("assistant reasoning_content = %#v", assistant)
+	}
+	tools := request["tools"].([]any)
+	if tools[0].(map[string]any)["function"].(map[string]any)["strict"] != false {
+		t.Fatalf("tool strict = %#v", tools[0])
 	}
 	controls := openAICompletionsRequestCacheControls(request)
 	if len(controls) != 3 {
@@ -502,7 +565,41 @@ func TestAnthropicPiAICacheAndAdaptiveThinkingWire(t *testing.T) {
 					t.Fatalf("cache control = %#v", control)
 				}
 			}
+			tools := request["tools"].([]any)
+			if tools[0].(map[string]any)["eager_input_streaming"] != true {
+				t.Fatalf("tool eager_input_streaming = %#v", tools[0])
+			}
 		})
+	}
+}
+
+func TestResponsesCompatCanDisableDeveloperAndStrict(t *testing.T) {
+	disabled := false
+	model := piAIModel{ID: "reasoning-model", Reasoning: true, Compat: piAIModelCompat{
+		SupportsDeveloperRole: &disabled, SupportsStrictMode: &disabled,
+	}}
+	request := ChatRequest{
+		System: "system", Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+		Tools: []ToolSchema{{Name: "unit_tool", Parameters: map[string]any{"type": "object"}}},
+	}
+	provider := NewOpenAIResponsesProvider("openai", "https://api.openai.com/v1", "", model.ID)
+	provider.modelSpec = model
+	body := provider.requestBody(request)
+	input := body["input"].([]any)
+	if input[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("system role = %#v", input[0])
+	}
+	tools := body["tools"].([]any)
+	if _, exists := tools[0].(map[string]any)["strict"]; exists {
+		t.Fatalf("OpenAI Responses strict was not disabled: %#v", tools[0])
+	}
+
+	codex := newCatalogResponsesProvider("openai-codex", "https://chatgpt.com/backend-api", "token", model.ID, true)
+	codex.modelSpec = model
+	codexBody := codex.codexRequestBody(request)
+	codexTools := codexBody["tools"].([]any)
+	if _, exists := codexTools[0].(map[string]any)["strict"]; exists {
+		t.Fatalf("Codex strict was not disabled: %#v", codexTools[0])
 	}
 }
 

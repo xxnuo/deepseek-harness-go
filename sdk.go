@@ -350,6 +350,7 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	cancel := session.Cancel
 	maintenanceCancel := session.maintenanceCancel
 	session.mu.Unlock()
+	e.releaseFileReferenceSearch(id)
 	e.scheduleWake(id)
 	for _, event := range events {
 		e.publishEvent(id, event)

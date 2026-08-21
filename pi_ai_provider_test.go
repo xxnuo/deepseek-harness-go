@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -26,6 +27,162 @@ func piAITestProfile(baseURL string) map[string]any {
 			"mode": "normal", "maxRetries": 0,
 			"backoff": map[string]any{"initialDelayMs": 1, "maxDelayMs": 1, "jitterRatio": 0},
 		},
+	}
+}
+
+func TestPiAIAlwaysRetryIgnoresInactiveNormalFields(t *testing.T) {
+	policy, err := resolvePiAIRetryPolicy(map[string]any{
+		"mode":           "always",
+		"maxRetries":     "ignored",
+		"retryableCodes": []any{},
+	}, "route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Mode != RetryAlways || policy.MaxRetries != 0 {
+		t.Fatalf("policy = %#v", policy)
+	}
+}
+
+func TestPiAIStreamIdleTimeoutAcceptsPositiveFiniteMilliseconds(t *testing.T) {
+	profile := piAITestProfile("https://example.test/v1")
+	profile["streamIdleTimeoutMs"] = 12.5
+	resolved, err := resolvePiAIProfile("local-gateway", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.streamIdleTimeout != 12*time.Millisecond+500*time.Microsecond {
+		t.Fatalf("stream idle timeout = %s", resolved.streamIdleTimeout)
+	}
+}
+
+func TestPiAIProviderAppliesConfiguredImageBudget(t *testing.T) {
+	t.Setenv("LOCAL_GATEWAY_KEY", "budget-key")
+	var request struct {
+		Messages []openAIWireMessage `json:"messages"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	e := newIntegrationEngine(t)
+	profile := piAITestProfile(server.URL)
+	profile["maxRequestImageBytes"] = 4
+	resolved, err := resolvePiAIProfile("local-gateway", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &managedPiAIProvider{engine: e, profile: resolved, websockets: newOpenAIResponsesWebSocketPool()}
+	completion, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "local-model",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "old", Images: []ChatImage{{MediaType: "image/png", Data: "AAAA"}}},
+			{Role: "user", Content: "new", Images: []ChatImage{{MediaType: "image/png", Data: "BBBB"}}},
+		},
+	}, func(Delta) error { return nil })
+	if err != nil || completion.Text != "ok" {
+		t.Fatalf("Complete = %#v, %v", completion, err)
+	}
+	first, ok := request.Messages[0].Content.(string)
+	if !ok || !strings.Contains(first, OffloadedImageText) {
+		t.Fatalf("old image was not replaced: %#v", request.Messages)
+	}
+	encoded, err := json.Marshal(request.Messages[1].Content)
+	if err != nil || !strings.Contains(string(encoded), "data:image/png;base64,BBBB") {
+		t.Fatalf("new image was not retained: %s, %v", encoded, err)
+	}
+}
+
+func TestPiAIProfileUsesRC8CatalogFallbacksAndConfiguredRequestCap(t *testing.T) {
+	profile, err := resolvePiAIProfile("openai", map[string]any{
+		"models":         []any{},
+		"modelOverrides": map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.displayName != "openai" || len(profile.models) != len(piAICatalog["openai"].Models) {
+		t.Fatalf("catalog profile = name %q, models %d", profile.displayName, len(profile.models))
+	}
+
+	configured, err := resolvePiAIProfile("custom", map[string]any{
+		"api": "openai-completions", "baseURL": "https://example.test/v1",
+		"defaultInput": []any{"text", "image"},
+		"models":       []any{map[string]any{"id": "model", "maxTokens": 77, "input": []any{}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(configured.models[0].Input, []string{"text", "image"}) || configured.configuredMaxTokens["model"] != 77 {
+		t.Fatalf("configured profile = %#v, caps %#v", configured.models[0], configured.configuredMaxTokens)
+	}
+}
+
+func TestPiAIProviderRejectsUnsupportedImageUse(t *testing.T) {
+	t.Setenv("LOCAL_GATEWAY_KEY", "image-key")
+	e := newIntegrationEngine(t)
+	tests := []struct {
+		name    string
+		profile map[string]any
+		message ChatMessage
+		want    string
+	}{
+		{
+			name: "text only model", profile: map[string]any{
+				"apiKeyEnv": "LOCAL_GATEWAY_KEY", "api": "openai-completions", "baseURL": "https://example.test/v1",
+				"models": []any{map[string]any{"id": "text-model", "input": []any{"text"}}},
+			},
+			message: ChatMessage{Role: "user", Images: []ChatImage{{MediaType: "image/png", Data: "AAAA"}}},
+			want:    "does not support image input",
+		},
+		{
+			name: "assistant role", profile: map[string]any{
+				"apiKeyEnv": "LOCAL_GATEWAY_KEY", "api": "openai-completions", "baseURL": "https://example.test/v1",
+				"models": []any{map[string]any{"id": "vision-model", "input": []any{"text", "image"}}},
+			},
+			message: ChatMessage{Role: "assistant", Images: []ChatImage{{MediaType: "image/png", Data: "AAAA"}}},
+			want:    "in-history assistant message",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile, err := resolvePiAIProfile("route", test.profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = (&managedPiAIProvider{engine: e, profile: profile, websockets: newOpenAIResponsesWebSocketPool()}).Complete(
+				context.Background(), ChatRequest{Model: profile.models[0].ID, Messages: []ChatMessage{test.message}}, func(Delta) error { return nil },
+			)
+			var providerErr *ProviderError
+			if !errors.As(err, &providerErr) || providerErr.Code != "UNSUPPORTED_CONTENT" || !strings.Contains(providerErr.Message, test.want) {
+				t.Fatalf("error = %#v", err)
+			}
+		})
+	}
+}
+
+func TestPiAISettingsSchemaExposesRC8CompatAndImageLimit(t *testing.T) {
+	refs := piAISettingsSchema()["refs"].(map[string]any)
+	profile := refs["12"].(map[string]any)["dict"].(map[string]any)
+	compat := refs["19"].(map[string]any)["dict"].(map[string]any)
+	for _, field := range []string{"maxRequestImageBytes", "defaultInput", "compat"} {
+		if profile[field] == nil {
+			t.Fatalf("profile schema is missing %q", field)
+		}
+	}
+	for _, field := range []string{
+		"supportsDeveloperRole", "requiresToolResultName", "requiresAssistantAfterToolResult",
+		"requiresThinkingAsText", "chatTemplateKwargs", "supportsStrictMode",
+		"supportsEagerToolInputStreaming", "supportsStrictTools",
+	} {
+		if compat[field] == nil {
+			t.Fatalf("compat schema is missing %q", field)
+		}
 	}
 }
 

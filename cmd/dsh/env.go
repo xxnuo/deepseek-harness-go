@@ -24,7 +24,7 @@ var bootstrapEnvNames = map[string]bool{
 	"GIT_SSH": true, "GIT_SSH_COMMAND": true, "GIT_EXTERNAL_DIFF": true,
 	"GIT_PAGER": true, "GIT_EDITOR": true, "GIT_ASKPASS": true, "SSH_ASKPASS": true,
 	"GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "GIT_CONFIG_COUNT": true,
-	"EDITOR": true, "VISUAL": true, "PAGER": true,
+	"EDITOR": true, "VISUAL": true, "PAGER": true, "BROWSER": true,
 	"DEEPSEEK_BASE_URL": true, "DEEPSEEK_SEARCH_BASE_URL": true,
 	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true, "HTTP_PROXY": true,
 	"HTTPS_PROXY": true, "ALL_PROXY": true, "NO_PROXY": true,

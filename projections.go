@@ -188,6 +188,8 @@ func currentPermissions(events []Event) map[string]any {
 func currentPlan(events []Event) map[string]any {
 	active := false
 	var wanted *bool
+	var runningID string
+	var runningWanted bool
 	for _, event := range events {
 		data, _ := event.Data.(map[string]any)
 		switch event.Type {
@@ -200,7 +202,25 @@ func currentPlan(events []Event) map[string]any {
 				continue
 			}
 			value := strings.TrimSpace(args) != "off"
-			wanted = &value
+			if commandID, _ := data["commandId"].(string); commandID != "" {
+				runningID, runningWanted = commandID, value
+			} else {
+				// Logs written before command lifecycle pairing treated admission
+				// as success. Keep those sessions replayable after an upgrade.
+				wanted = &value
+			}
+		case "command/done":
+			commandID, _ := data["commandId"].(string)
+			if commandID == "" || commandID != runningID {
+				continue
+			}
+			if data["kind"] == "success" && runningWanted != active {
+				value := runningWanted
+				wanted = &value
+			} else {
+				wanted = nil
+			}
+			runningID = ""
 		case "plan/mode":
 			if value, ok := data["active"].(bool); ok {
 				active = value
@@ -208,7 +228,7 @@ func currentPlan(events []Event) map[string]any {
 			}
 		}
 	}
-	pending := wanted != nil && *wanted != active
+	pending := runningID != "" && runningWanted != active || wanted != nil && *wanted != active
 	return map[string]any{"active": active, "pending": pending}
 }
 
@@ -546,7 +566,8 @@ func imageLimitsProjection() map[string]any {
 	return map[string]any{
 		"maxImageBytes": maxImageBytes, "maxImagesPerMessage": maxImagesPerMessage,
 		"maxMessageImageBytes": maxMessageImageBytes, "maxImagePixels": maxImagePixels,
-		"mediaTypes": []string{"image/png", "image/jpeg", "image/webp", "image/gif"},
+		"maxImageDimension": maxImageDimension,
+		"mediaTypes":        []string{"image/png", "image/jpeg", "image/webp", "image/gif"},
 	}
 }
 
@@ -706,6 +727,9 @@ func projectionKeysChanged(event Event) []string {
 				changed["plan"] = true
 			}
 		}
+	}
+	if event.Type == "command/done" {
+		changed["plan"] = true
 	}
 	if _, ok := eventUsageSample(event); ok {
 		changed["tokenUsage"] = true

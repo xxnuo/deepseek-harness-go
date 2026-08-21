@@ -93,6 +93,12 @@ func retryPolicyForTest(max int) RetryPolicy {
 	}
 }
 
+func TestDefaultRetryPolicyUsesRC8Budget(t *testing.T) {
+	if got := defaultRetryPolicy().MaxRetries; got != 5 {
+		t.Fatalf("MaxRetries = %d, want 5", got)
+	}
+}
+
 func TestRetryProtectsCanonicalRequestFromProviderMutation(t *testing.T) {
 	engine := newIntegrationEngine(t)
 	provider := &mutatingRetryProvider{}
@@ -287,5 +293,55 @@ func TestRetryCancellationDuringBackoff(t *testing.T) {
 	provider.mu.Unlock()
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestSessionCancelDuringRetryBackoffDoesNotFinalizeFailedAttempt(t *testing.T) {
+	provider := &retryScriptProvider{steps: []func(func(Delta) error) (Completion, error){
+		func(delta func(Delta) error) (Completion, error) {
+			if err := delta(Delta{Text: "doomed partial"}); err != nil {
+				return Completion{}, err
+			}
+			return Completion{}, retryError("SERVER", "temporary")
+		},
+	}}
+	engine, id := retryTestEngine(t, provider, RetryPolicy{
+		Mode: RetryNormal, MaxRetries: 2, RetryableCodes: []string{"SERVER"},
+		InitialDelay: time.Hour, MaxDelay: time.Hour,
+	})
+	watchCtx, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+	cancelled := make(chan struct{})
+	events := engine.Subscribe(watchCtx, id)
+	go func() {
+		for event := range events {
+			if event.Type == "llm/retry" {
+				_ = engine.CancelSession(id)
+				close(cancelled)
+				return
+			}
+		}
+	}()
+	if _, err := engine.Prompt(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "go"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cancelled:
+	case <-watchCtx.Done():
+		t.Fatal("retry backoff was not cancelled")
+	}
+	if err := engine.WaitForIdle(watchCtx, id); err != nil {
+		t.Fatal(err)
+	}
+	session, err := engine.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for _, event := range session.Events {
+		if event.Type == "assistant/message" {
+			t.Fatalf("failed attempt was finalized: %#v", event)
+		}
 	}
 }

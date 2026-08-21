@@ -56,13 +56,14 @@ type webOptions struct {
 	help         bool
 	host         string
 	hostSet      bool
+	openBrowser  bool
 	port         int
 	portSet      bool
 	trustedHosts []string
 }
 
 func parseWebOptions(args []string) (webOptions, error) {
-	var options webOptions
+	options := webOptions{openBrowser: true}
 	for index := 0; index < len(args); {
 		argument := args[index]
 		switch {
@@ -77,6 +78,9 @@ func parseWebOptions(args []string) (webOptions, error) {
 			index += 2
 		case strings.HasPrefix(argument, "--host="):
 			options.host, options.hostSet = strings.TrimPrefix(argument, "--host="), true
+			index++
+		case argument == "--no-open":
+			options.openBrowser = false
 			index++
 		case argument == "--port":
 			if index+1 >= len(args) {
@@ -358,6 +362,9 @@ func runWeb(args []string, composed *composition, cfg harness.Config, stdout, st
 	if err != nil {
 		_ = engine.Close()
 		return err
+	}
+	if options.openBrowser && !webLaunchedThroughSSH(cfg.LaunchEnvironment) {
+		runtime.openBrowser()
 	}
 	signals := newProcessSignals()
 	watchContext, stopWatcher := context.WithCancel(signals)

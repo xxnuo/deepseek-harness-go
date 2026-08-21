@@ -39,7 +39,7 @@ func TestUpstreamCLIContract(t *testing.T) {
 			arguments: []string{"[task...]"},
 		},
 		"packages/bundle/web-app/src/startup.ts": {
-			options: []string{"--host <host>", "--port <port>", "--trusted-host <authority...>"},
+			options: []string{"--host <host>", "--no-open", "--port <port>", "--trusted-host <authority...>"},
 		},
 	}
 	for path, want := range tests {

@@ -53,6 +53,14 @@ func (p *catalogResponsesProvider) completeAzure(ctx context.Context, req ChatRe
 	provider := NewOpenAIResponsesProvider(p.id, "", key, p.model)
 	provider.modelSpec = p.modelSpec
 	provider.cacheRetention = p.cacheRetention
+	provider.strictDefault = true
+	supportsStrict := true
+	if p.modelSpec.Compat.SupportsStrictMode != nil {
+		supportsStrict = *p.modelSpec.Compat.SupportsStrictMode
+	}
+	if err := validateToolSampling(req.Tools, supportsStrict); err != nil {
+		return Completion{}, err
+	}
 	body := provider.requestBody(req)
 	body["model"] = azureDeploymentName(firstNonBlank(req.Model, p.model))
 	headers := make(http.Header)
@@ -111,6 +119,13 @@ func (p *catalogResponsesProvider) completeCodex(ctx context.Context, req ChatRe
 	if token == "" {
 		return Completion{}, &ProviderError{Code: "MISSING_CREDENTIAL", Message: "OpenAI Codex requires an OAuth access token through apiKeyEnv"}
 	}
+	supportsStrict := true
+	if p.modelSpec.Compat.SupportsStrictMode != nil {
+		supportsStrict = *p.modelSpec.Compat.SupportsStrictMode
+	}
+	if err := validateToolSampling(req.Tools, supportsStrict); err != nil {
+		return Completion{}, err
+	}
 	accountID, err := codexAccountID(token)
 	if err != nil {
 		return Completion{}, err
@@ -134,21 +149,19 @@ func (p *catalogResponsesProvider) completeCodex(ctx context.Context, req ChatRe
 }
 
 func (p *catalogResponsesProvider) codexRequestBody(req ChatRequest) map[string]any {
-	input := openAIResponsesInput(req)
+	input := openAIResponsesInput(req, p.modelSpec)
 	filtered := input[:0]
 	for _, raw := range input {
 		row, _ := raw.(map[string]any)
-		if stringSetting(row["role"]) != "system" {
+		if role := stringSetting(row["role"]); role != "system" && role != "developer" {
 			filtered = append(filtered, raw)
 		}
 	}
-	tools := make([]any, 0, len(req.Tools))
-	for _, tool := range req.Tools {
-		tools = append(tools, map[string]any{
-			"type": "function", "name": tool.Name, "description": tool.Description,
-			"parameters": tool.Parameters, "strict": nil,
-		})
+	supportsStrict := true
+	if p.modelSpec.Compat.SupportsStrictMode != nil {
+		supportsStrict = *p.modelSpec.Compat.SupportsStrictMode
 	}
+	tools := openAIResponsesTools(req.Tools, supportsStrict, nil)
 	body := map[string]any{
 		"model": firstNonBlank(req.Model, p.model), "store": false, "stream": true,
 		"instructions": firstNonBlank(req.System, "You are a helpful assistant."), "input": filtered,

@@ -144,7 +144,8 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 			}
 			s.mu.Unlock()
 		}
-		return map[string]any{"version": e.cfg.Version, "cwd": e.cfg.Workspace, "provider": e.cfg.Provider, "model": e.cfg.Model, "attachedSessions": attached, "canOpenPath": openCommand() != ""}, nil
+		home, _ := os.UserHomeDir()
+		return map[string]any{"version": e.cfg.Version, "cwd": e.cfg.Workspace, "provider": e.cfg.Provider, "model": e.cfg.Model, "attachedSessions": attached, "home": home, "canOpenPath": openCommand() != ""}, nil
 	case "host.listDirectory":
 		path, _ := p["path"].(string)
 		if path == "" {
@@ -547,7 +548,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return nil, rpcError("internal", "settings provider has no local document to open", nil)
 		}
 		e.mu.Lock()
-		prepareErr := e.saveSettingsLocked()
+		prepareErr := e.prepareSettingsLocked()
 		e.mu.Unlock()
 		if prepareErr != nil {
 			return nil, rpcError("internal", "settings document preparation failed: "+prepareErr.Error(), nil)

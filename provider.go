@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+const (
+	// DefaultMaxRequestImageBytes bounds the accumulated base64 image payload
+	// sent in one provider request. Routes may configure a smaller value.
+	DefaultMaxRequestImageBytes = 20 << 20
+	// OffloadedImageText is the deterministic model-facing replacement for an
+	// older image removed to keep a provider request within its payload bound.
+	OffloadedImageText = "[image omitted to keep the request within its image limit; older images are omitted first. If this image is still needed, read its file again when a path is available; otherwise ask the user to attach it again.]"
+)
+
 type EchoProvider struct{ id, name string }
 
 func NewEchoProvider(id, name string) *EchoProvider {
@@ -58,6 +67,7 @@ type openAIWireTool struct {
 		Name        string         `json:"name"`
 		Description string         `json:"description,omitempty"`
 		Parameters  map[string]any `json:"parameters"`
+		Strict      *bool          `json:"strict,omitempty"`
 	} `json:"function"`
 }
 
@@ -73,32 +83,206 @@ type openAIWireToolCall struct {
 type openAIWireMessage struct {
 	Role             string               `json:"role"`
 	Content          any                  `json:"content"`
-	ReasoningContent string               `json:"reasoning_content,omitempty"`
+	ReasoningContent *string              `json:"reasoning_content,omitempty"`
 	ToolCalls        []openAIWireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string               `json:"tool_call_id,omitempty"`
+	Name             string               `json:"name,omitempty"`
 }
 
 type openAIWireThinking struct {
 	Type string `json:"type"`
 }
 
-func openAIWireMessages(messages []ChatMessage) []openAIWireMessage {
-	out := make([]openAIWireMessage, 0, len(messages))
+func appendOffloadedImageText(text string) string {
+	if text == "" {
+		return OffloadedImageText
+	}
+	return text + "\n" + OffloadedImageText
+}
+
+func contentBlocksHaveImage(blocks []ContentBlock) bool {
+	for _, block := range blocks {
+		if block.Type == "image" || contentBlocksHaveImage(block.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatContentParts(message ChatMessage) []ChatContentPart {
+	if len(message.Parts) > 0 {
+		return message.Parts
+	}
+	parts := make([]ChatContentPart, 0, len(message.Images)+1)
+	if message.Content != "" {
+		parts = append(parts, ChatContentPart{Type: "text", Text: message.Content})
+	}
+	for _, image := range message.Images {
+		parts = append(parts, ChatContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data})
+	}
+	return parts
+}
+
+func chatMessageHasImage(message ChatMessage) bool {
+	if len(message.Parts) == 0 {
+		return len(message.Images) > 0
+	}
+	for _, part := range message.Parts {
+		if part.Type == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveJSONSchemaStrictSampling(tool ToolSchema, supportsStrict bool) (bool, bool, error) {
+	config := tool.ConstrainedSampling
+	if config == nil || config.Type != "json_schema" {
+		return false, false, nil
+	}
+	if supportsStrict {
+		return true, true, nil
+	}
+	if config.Strict == "require" {
+		return false, false, fmt.Errorf("tool %q requires JSON-schema constrained sampling, but strict tools are unsupported", tool.Name)
+	}
+	return false, false, nil
+}
+
+func validateToolSampling(tools []ToolSchema, supportsStrict bool) error {
+	for _, tool := range tools {
+		if _, _, err := resolveJSONSchemaStrictSampling(tool, supportsStrict); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// offloadRequestImages returns a transient request copy whose oldest image
+// occurrences are replaced until the accumulated base64 payload fits maxBytes.
+func offloadRequestImages(messages []ChatMessage, maxBytes int) []ChatMessage {
+	if maxBytes <= 0 {
+		return messages
+	}
+	total := 0
 	for _, message := range messages {
-		var content any = message.Content
-		if len(message.Images) > 0 {
-			parts := make([]map[string]any, 0, len(message.Images)+1)
-			if message.Content != "" {
-				parts = append(parts, map[string]any{"type": "text", "text": message.Content})
+		for _, part := range chatContentParts(message) {
+			if part.Type == "image" {
+				total += len(part.Data)
 			}
-			for _, image := range message.Images {
-				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + image.MediaType + ";base64," + image.Data}})
+		}
+	}
+	if total <= maxBytes {
+		return messages
+	}
+	out := append([]ChatMessage(nil), messages...)
+	for index := range out {
+		if total <= maxBytes {
+			break
+		}
+		hadParts := len(out[index].Parts) > 0
+		parts := chatContentParts(out[index])
+		drop := 0
+		for partIndex := range parts {
+			if total <= maxBytes {
+				break
+			}
+			if parts[partIndex].Type != "image" {
+				continue
+			}
+			total -= len(parts[partIndex].Data)
+			parts[partIndex] = ChatContentPart{Type: "text", Text: OffloadedImageText}
+			drop++
+		}
+		if drop == 0 {
+			continue
+		}
+		out[index].Parts = parts
+		if drop <= len(out[index].Images) {
+			out[index].Images = append([]ChatImage(nil), out[index].Images[drop:]...)
+		}
+		if !hadParts {
+			for range drop {
+				out[index].Content = appendOffloadedImageText(out[index].Content)
+			}
+		}
+	}
+	return out
+}
+
+func openAIWireMessages(messages []ChatMessage, options ...openAICompletionsCompat) []openAIWireMessage {
+	compat := openAICompletionsCompat{}
+	if len(options) > 0 {
+		compat = options[0]
+	}
+	out := make([]openAIWireMessage, 0, len(messages))
+	toolNames := map[string]string{}
+	lastWasTool := false
+	for index := 0; index < len(messages); index++ {
+		message := messages[index]
+		if message.Role == "tool" {
+			images := make([]map[string]any, 0)
+			for ; index < len(messages) && messages[index].Role == "tool"; index++ {
+				toolMessage := messages[index]
+				content := toolMessage.Content
+				hasImages := chatMessageHasImage(toolMessage)
+				if content == "" {
+					if hasImages {
+						content = "(see attached image)"
+					} else {
+						content = "(no output)"
+					}
+				}
+				wire := openAIWireMessage{Role: "tool", Content: content, ToolCallID: toolMessage.ToolCallID}
+				if compat.requiresToolResultName {
+					wire.Name = toolNames[toolMessage.ToolCallID]
+				}
+				out = append(out, wire)
+				for _, part := range chatContentParts(toolMessage) {
+					if part.Type == "image" {
+						images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + part.MediaType + ";base64," + part.Data}})
+					}
+				}
+			}
+			index--
+			if len(images) > 0 {
+				if compat.requiresAssistantAfterToolResult {
+					out = append(out, openAIWireMessage{Role: "assistant", Content: "I have processed the tool results."})
+				}
+				content := []map[string]any{{"type": "text", "text": "Attached image(s) from tool result:"}}
+				content = append(content, images...)
+				out = append(out, openAIWireMessage{Role: "user", Content: content})
+				lastWasTool = false
+			} else {
+				lastWasTool = true
+			}
+			continue
+		}
+		if compat.requiresAssistantAfterToolResult && lastWasTool && message.Role == "user" {
+			out = append(out, openAIWireMessage{Role: "assistant", Content: "I have processed the tool results."})
+		}
+		var content any = message.Content
+		if chatMessageHasImage(message) {
+			parts := make([]map[string]any, 0, len(chatContentParts(message)))
+			for _, part := range chatContentParts(message) {
+				if part.Type == "text" {
+					parts = append(parts, map[string]any{"type": "text", "text": part.Text})
+				} else if part.Type == "image" {
+					parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + part.MediaType + ";base64," + part.Data}})
+				}
 			}
 			content = parts
 		}
 		wire := openAIWireMessage{Role: message.Role, Content: content, ToolCallID: message.ToolCallID}
-		if message.Reasoning != "" && len(message.ToolCalls) > 0 {
-			wire.ReasoningContent = message.Reasoning
+		if message.Reasoning != "" && compat.requiresThinkingAsText {
+			parts := []map[string]any{{"type": "text", "text": message.Reasoning}}
+			if message.Content != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": message.Content})
+			}
+			wire.Content = parts
+		} else if message.Reasoning != "" {
+			reasoning := message.Reasoning
+			wire.ReasoningContent = &reasoning
 		}
 		for _, call := range message.ToolCalls {
 			encoded := string(call.Arguments)
@@ -108,15 +292,21 @@ func openAIWireMessages(messages []ChatMessage) []openAIWireMessage {
 			item := openAIWireToolCall{ID: call.ID, Type: "function"}
 			item.Function.Name, item.Function.Arguments = call.Name, encoded
 			wire.ToolCalls = append(wire.ToolCalls, item)
+			toolNames[call.ID] = call.Name
+		}
+		if wire.Role == "assistant" && compat.requiresReasoningContent && wire.ReasoningContent == nil {
+			empty := ""
+			wire.ReasoningContent = &empty
+		}
+		if wire.Role == "tool" && compat.requiresToolResultName {
+			wire.Name = toolNames[message.ToolCallID]
 		}
 		// Provider APIs reject null content for tool-call assistant turns.
-		if wire.Role == "assistant" && message.Content == "" && len(message.Images) == 0 {
+		if wire.Role == "assistant" && message.Content == "" && !chatMessageHasImage(message) {
 			wire.Content = ""
 		}
-		if wire.Role == "tool" && message.Content == "" {
-			wire.Content = "(no output)"
-		}
 		out = append(out, wire)
+		lastWasTool = false
 	}
 	return out
 }
@@ -135,15 +325,22 @@ func NewOpenAIProvider(id, baseURL, apiKey, model string) *OpenAIProvider {
 }
 
 type openAICompletionsCompat struct {
-	thinkingFormat             string
-	cacheControlFormat         string
-	maxTokensField             string
-	sessionAffinityFormat      string
-	supportsReasoningEffort    bool
-	supportsLongCacheRetention bool
-	supportsStore              bool
-	supportsUsageInStreaming   bool
-	sendSessionAffinityHeaders bool
+	thinkingFormat                   string
+	cacheControlFormat               string
+	maxTokensField                   string
+	sessionAffinityFormat            string
+	chatTemplateKwargs               map[string]any
+	supportsDeveloperRole            bool
+	supportsReasoningEffort          bool
+	supportsLongCacheRetention       bool
+	supportsStore                    bool
+	supportsUsageInStreaming         bool
+	supportsStrictMode               bool
+	requiresToolResultName           bool
+	requiresAssistantAfterToolResult bool
+	requiresThinkingAsText           bool
+	requiresReasoningContent         bool
+	sendSessionAffinityHeaders       bool
 }
 
 func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) openAICompletionsCompat {
@@ -156,6 +353,7 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	isCloudflare := provider == "cloudflare-ai-gateway" || strings.Contains(baseURL, "gateway.ai.cloudflare.com")
 	isDeepSeek := provider == "deepseek" || strings.Contains(baseURL, "deepseek.com")
 	isGrok := provider == "xai" || strings.Contains(baseURL, "api.x.ai")
+	isOpenRouterDeveloperRoleModel := isOpenRouter && (strings.HasPrefix(model.ID, "anthropic/") || strings.HasPrefix(model.ID, "openai/"))
 	isNonStandard := isNVIDIA || provider == "cerebras" || strings.Contains(baseURL, "cerebras.ai") || isGrok || isTogether || strings.Contains(baseURL, "chutes.ai") || isDeepSeek || isZAI || isMoonshot || provider == "opencode" || strings.Contains(baseURL, "opencode.ai") || provider == "cloudflare-workers-ai" || strings.Contains(baseURL, "api.cloudflare.com") || isCloudflare || isAntLing
 	sessionAffinityFormat := "openai"
 	if isOpenRouter {
@@ -164,9 +362,12 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	compat := openAICompletionsCompat{
 		thinkingFormat: "openai", maxTokensField: "max_completion_tokens",
 		sessionAffinityFormat:      sessionAffinityFormat,
+		supportsDeveloperRole:      isOpenRouterDeveloperRoleModel || !isNonStandard && !isOpenRouter,
 		supportsReasoningEffort:    !isGrok && !isZAI && !isMoonshot && !isTogether && !isCloudflare && !isNVIDIA && !isAntLing,
 		supportsLongCacheRetention: !isTogether && provider != "cloudflare-workers-ai" && !isCloudflare && !isNVIDIA && !isAntLing,
 		supportsStore:              !isNonStandard, supportsUsageInStreaming: true,
+		supportsStrictMode:       !isMoonshot && !isTogether && !isCloudflare && !isNVIDIA,
+		requiresReasoningContent: isDeepSeek && model.Reasoning,
 	}
 	switch {
 	case isDeepSeek:
@@ -214,6 +415,25 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	if value := model.Compat.SupportsUsageInStreaming; value != nil {
 		compat.supportsUsageInStreaming = *value
 	}
+	if value := model.Compat.SupportsDeveloperRole; value != nil {
+		compat.supportsDeveloperRole = *value
+	}
+	if value := model.Compat.SupportsStrictMode; value != nil {
+		compat.supportsStrictMode = *value
+	}
+	if value := model.Compat.RequiresToolResultName; value != nil {
+		compat.requiresToolResultName = *value
+	}
+	if value := model.Compat.RequiresAssistantAfterToolResult; value != nil {
+		compat.requiresAssistantAfterToolResult = *value
+	}
+	if value := model.Compat.RequiresThinkingAsText; value != nil {
+		compat.requiresThinkingAsText = *value
+	}
+	if value := model.Compat.RequiresReasoningContent; value != nil {
+		compat.requiresReasoningContent = *value && model.Reasoning
+	}
+	compat.chatTemplateKwargs = cloneSettingsValue(model.Compat.ChatTemplateKwargs)
 	if value := model.Compat.SendSessionAffinityHeaders; value != nil {
 		compat.sendSessionAffinityHeaders = *value
 	}
@@ -283,6 +503,12 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 		}
 	case "qwen":
 		body["enable_thinking"] = enabled
+	case "qwen-chat-template":
+		body["chat_template_kwargs"] = map[string]any{"enable_thinking": enabled, "preserve_thinking": true}
+	case "chat-template":
+		if kwargs := openAIChatTemplateKwargs(model, req.ReasoningEffort, compat.chatTemplateKwargs); len(kwargs) > 0 {
+			body["chat_template_kwargs"] = kwargs
+		}
 	case "deepseek":
 		if enabled {
 			body["thinking"] = map[string]any{"type": "enabled"}
@@ -332,6 +558,45 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 	}
 }
 
+func openAIChatTemplateKwargs(model piAIModel, effort string, configured map[string]any) map[string]any {
+	enabled := effort != "" && effort != "off"
+	result := map[string]any{}
+	for name, raw := range configured {
+		value, include := raw, true
+		if variable, ok := raw.(map[string]any); ok {
+			if !enabled {
+				if omit, _ := variable["omitWhenOff"].(bool); omit {
+					continue
+				}
+			}
+			switch variable["$var"] {
+			case "thinking.enabled":
+				value = enabled
+			case "thinking.effort":
+				level := effort
+				if !enabled {
+					level = "off"
+				}
+				mapped, exists := model.ThinkingLevelMap[level]
+				switch {
+				case exists && mapped != nil:
+					value = *mapped
+				case exists:
+					include = false
+				case enabled:
+					value = effort
+				default:
+					include = false
+				}
+			}
+		}
+		if include {
+			result[name] = value
+		}
+	}
+	return result
+}
+
 func openAICompletionsCacheControl(compat openAICompletionsCompat, retention string) map[string]any {
 	if compat.cacheControlFormat != "anthropic" || retention == "none" {
 		return nil
@@ -358,7 +623,7 @@ func applyOpenAICompletionsCacheControl(messages []openAIWireMessage, tools []op
 		}
 	}
 	for index := range messages {
-		if messages[index].Role == "system" {
+		if messages[index].Role == "system" || messages[index].Role == "developer" {
 			apply(index)
 			break
 		}
@@ -415,6 +680,8 @@ func providerHTTPFailure(resp *http.Response, body string) error {
 		code = "RATE_LIMIT"
 	case status == http.StatusBadRequest && isContextWindowExceeded(detail):
 		code = "CONTEXT_WINDOW_EXCEEDED"
+	case status == http.StatusRequestEntityTooLarge:
+		code = "INVALID_REQUEST"
 	case status == http.StatusRequestTimeout || status == 524:
 		code = "TIMEOUT"
 	case status >= 500 && status <= 599:
@@ -524,17 +791,35 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	if model == "" {
 		model = p.model
 	}
+	compat := resolveOpenAICompletionsCompat(p.id, p.baseURL, p.modelSpec)
+	if err := validateToolSampling(req.Tools, compat.supportsStrictMode); err != nil {
+		return Completion{}, err
+	}
 	tools := make([]openAIWireTool, 0, len(req.Tools))
 	for _, schema := range req.Tools {
 		item := openAIWireTool{Type: "function"}
 		item.Function.Name, item.Function.Description, item.Function.Parameters = schema.Name, schema.Description, schema.Parameters
+		if strict, requested, _ := resolveJSONSchemaStrictSampling(schema, compat.supportsStrictMode); requested {
+			item.Function.Strict = &strict
+		}
 		tools = append(tools, item)
 	}
-	messages := openAIWireMessages(req.Messages)
-	if req.System != "" {
-		messages = append([]openAIWireMessage{{Role: "system", Content: req.System}}, messages...)
+	if compat.supportsStrictMode {
+		strict := false
+		for index := range tools {
+			if tools[index].Function.Strict == nil {
+				tools[index].Function.Strict = &strict
+			}
+		}
 	}
-	compat := resolveOpenAICompletionsCompat(p.id, p.baseURL, p.modelSpec)
+	messages := openAIWireMessages(req.Messages, compat)
+	if req.System != "" {
+		role := "system"
+		if p.modelSpec.Reasoning && compat.supportsDeveloperRole {
+			role = "developer"
+		}
+		messages = append([]openAIWireMessage{{Role: role, Content: req.System}}, messages...)
+	}
 	cacheRetention := resolvedPiAICacheRetention(p.cacheRetention)
 	if cache := openAICompletionsCacheControl(compat, cacheRetention); cache != nil {
 		applyOpenAICompletionsCacheControl(messages, tools, cache)
@@ -661,6 +946,9 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
+			if err := onDelta(Delta{Usage: cloneStringMap(usage)}); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

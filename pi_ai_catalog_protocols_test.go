@@ -180,13 +180,22 @@ func TestAzureOpenAIResponsesProtocol(t *testing.T) {
 		if body["model"] != "deployment-five" || body["store"] != false || body["temperature"] != float64(0) {
 			t.Errorf("request body = %#v", body)
 		}
+		input := body["input"].([]any)
+		tools := body["tools"].([]any)
+		if input[0].(map[string]any)["role"] != "developer" || tools[0].(map[string]any)["strict"] != false {
+			t.Errorf("compat body = %#v", body)
+		}
 		writeResponsesStream(t, w, "azure")
 	}))
 	defer server.Close()
 
 	provider := newCatalogResponsesProvider("azure-openai-responses", server.URL, "azure-key", "gpt-5", false)
 	provider.modelSpec = piAIModel{ID: "gpt-5", Reasoning: true}
-	completion, err := provider.Complete(context.Background(), ChatRequest{Model: "gpt-5", Temperature: float64Pointer(0), Messages: []ChatMessage{{Role: "user", Content: "hello"}}}, func(Delta) error { return nil })
+	completion, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "gpt-5", System: "system", Temperature: float64Pointer(0),
+		Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+		Tools:    []ToolSchema{{Name: "unit_tool", Parameters: map[string]any{"type": "object"}}},
+	}, func(Delta) error { return nil })
 	if err != nil || completion.Text != "azure" {
 		t.Fatalf("Complete() = %#v, %v", completion, err)
 	}
@@ -206,6 +215,11 @@ func TestOpenAICodexResponsesProtocol(t *testing.T) {
 		if body["instructions"] != "system" || body["prompt_cache_key"] != "session-codex" || body["store"] != false || body["temperature"] != float64(0) {
 			t.Errorf("request body = %#v", body)
 		}
+		tools := body["tools"].([]any)
+		strict, exists := tools[0].(map[string]any)["strict"]
+		if !exists || strict != nil {
+			t.Errorf("Codex strict = %#v", tools[0])
+		}
 		writeResponsesStream(t, w, "codex")
 	}))
 	defer server.Close()
@@ -216,6 +230,7 @@ func TestOpenAICodexResponsesProtocol(t *testing.T) {
 	completion, err := provider.Complete(context.Background(), ChatRequest{
 		SessionID: "session-codex", Model: "gpt-5.4", System: "system", ReasoningEffort: "high", Temperature: float64Pointer(0),
 		Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+		Tools:    []ToolSchema{{Name: "unit_tool", Parameters: map[string]any{"type": "object"}}},
 	}, func(Delta) error { return nil })
 	if err != nil || completion.Text != "codex" {
 		t.Fatalf("Complete() = %#v, %v", completion, err)

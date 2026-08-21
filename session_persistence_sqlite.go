@@ -2,8 +2,10 @@ package harness
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
-	"encoding/json"
+	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -11,11 +13,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	modernsqlite "modernc.org/sqlite"
 )
 
 const (
-	SessionSQLiteSchemaVersion            = 15
+	SessionSQLiteSchemaVersion            = 17
 	SessionSQLiteApplicationID            = 0x44534850
+	DefaultSQLiteBusyTimeout              = 5 * time.Second
+	MaxSQLiteBusyTimeout                  = time.Duration(2_147_483_647) * time.Millisecond
 	DefaultSQLitePreparedSessionCacheSize = 5
 	DefaultSQLiteWriteBatchMaxDelay       = 200 * time.Millisecond
 	MaxSQLiteWriteBatchDelay              = time.Duration(2_147_483_647) * time.Millisecond
@@ -24,6 +30,8 @@ const (
 type SQLiteSessionStoreOptions struct {
 	Path                     string
 	JournalMode              SQLiteJournalMode
+	BusyTimeout              time.Duration
+	BusyTimeoutSet           bool
 	PreparedSessionCacheSize int
 	WriteBatchMaxDelay       time.Duration
 }
@@ -78,6 +86,12 @@ func normalizeSQLiteSessionStoreOptions(options SQLiteSessionStoreOptions) (SQLi
 	default:
 		return SQLiteSessionStoreOptions{}, fmt.Errorf("unsupported sqlite journal mode %q", options.JournalMode)
 	}
+	if !options.BusyTimeoutSet && options.BusyTimeout == 0 {
+		options.BusyTimeout = DefaultSQLiteBusyTimeout
+	}
+	if options.BusyTimeout < 0 || options.BusyTimeout > MaxSQLiteBusyTimeout || options.BusyTimeout%time.Millisecond != 0 {
+		return SQLiteSessionStoreOptions{}, errors.New("busyTimeoutMs must be between 0 and 2147483647")
+	}
 	if options.PreparedSessionCacheSize == 0 {
 		options.PreparedSessionCacheSize = DefaultSQLitePreparedSessionCacheSize
 	}
@@ -94,7 +108,7 @@ func normalizeSQLiteSessionStoreOptions(options SQLiteSessionStoreOptions) (SQLi
 }
 
 func newSQLiteSessionStore(options SQLiteSessionStoreOptions, coordinated bool) (*SQLiteSessionStore, error) {
-	db, identity, err := openSessionSQLite(options.Path, options.JournalMode)
+	db, identity, err := openSessionSQLite(options.Path, options.JournalMode, options.BusyTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -456,9 +470,13 @@ func (s *SQLiteSessionStore) readPrefix(ctx context.Context, id string, fromSeq 
 	if err != nil {
 		return sqliteStoredPrefix{}, false, err
 	}
+	base, err := sqlitePackedReadBase(ctx, tx, id, fromSeq)
+	if err != nil {
+		return sqliteStoredPrefix{}, false, err
+	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
-		FROM events WHERE session_id = ? AND seq >= ? ORDER BY seq`, id, fromSeq)
+		FROM events WHERE session_id = ? AND seq >= ? ORDER BY seq`, id, base)
 	if err != nil {
 		return sqliteStoredPrefix{}, false, err
 	}
@@ -480,11 +498,56 @@ func (s *SQLiteSessionStore) readPrefix(ctx context.Context, id string, fromSeq 
 	if err := tx.Commit(); err != nil {
 		return sqliteStoredPrefix{}, false, err
 	}
-	events, tornFrom, err := scanSQLiteSessionEvents(stored, fromSeq)
+	events, tornFrom, err := scanSQLiteSessionEvents(stored, base)
 	if err != nil {
 		return sqliteStoredPrefix{}, false, err
 	}
+	if base < fromSeq {
+		first := len(events)
+		for index, event := range events {
+			if event.Seq >= fromSeq {
+				first = index
+				break
+			}
+		}
+		events = events[first:]
+	}
 	return sqliteStoredPrefix{meta: row.meta, events: events, tornFrom: tornFrom}, true, nil
+}
+
+func sqlitePackedReadBase(ctx context.Context, tx *sql.Tx, id string, fromSeq int) (int, error) {
+	if fromSeq == 0 {
+		return 0, nil
+	}
+	floor := fromSeq - maxSQLitePackedRowMembers + 1
+	if floor < 0 {
+		floor = 0
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
+		FROM events
+		WHERE session_id = ? AND seq >= ? AND seq < ?
+		  AND type IN ('text-chunks', 'reasoning-chunks', 'tool-call-chunks')
+		  AND ignorable = 0
+		ORDER BY seq`, id, floor, fromSeq)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	base := fromSeq
+	for rows.Next() {
+		var row sqliteEventRow
+		if err := rows.Scan(&row.seq, &row.typ, &row.time, &row.data, &row.sources, &row.surface, &row.ignorable); err != nil {
+			return 0, err
+		}
+		events, err := sqliteRowEvents(row)
+		if err != nil || len(events) > 0 && events[len(events)-1].Seq >= fromSeq {
+			if row.seq < base {
+				base = row.seq
+			}
+		}
+	}
+	return base, rows.Err()
 }
 
 func (s *SQLiteSessionStore) appendTransaction(ctx context.Context, meta SessionHeader, events []Event, materialize bool) error {
@@ -497,6 +560,33 @@ func (s *SQLiteSessionStore) appendTransaction(ctx context.Context, meta Session
 		return err
 	}
 	defer tx.Rollback()
+	if err := validateSQLiteSchemaForMutation(ctx, tx); err != nil {
+		return err
+	}
+	var storedNext int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE((SELECT seq FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1), -1)`, meta.ID).
+		Scan(&storedNext); err != nil {
+		return err
+	}
+	if storedNext >= 0 {
+		lastRows, err := querySQLiteEventRows(ctx, tx, `
+			SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
+			FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1`, meta.ID)
+		if err != nil {
+			return err
+		}
+		lastEvents, err := sqliteRowEvents(lastRows[0])
+		if err != nil {
+			return fmt.Errorf("session %s has an invalid physical tail at seq %d", meta.ID, lastRows[0].seq)
+		}
+		storedNext = lastEvents[len(lastEvents)-1].Seq + 1
+	} else {
+		storedNext = 0
+	}
+	if bindings[0].seq != storedNext {
+		return fmt.Errorf("session %s append starts at seq %d, stored next seq is %d", meta.ID, bindings[0].seq, storedNext)
+	}
 	if materialize {
 		if err := insertSQLiteSessionHeader(ctx, tx, meta); err != nil {
 			return err
@@ -528,6 +618,35 @@ func (s *SQLiteSessionStore) repair(ctx context.Context, meta SessionHeader, tor
 		return err
 	}
 	defer tx.Rollback()
+	if err := validateSQLiteSchemaForMutation(ctx, tx); err != nil {
+		return err
+	}
+	currentRows, err := querySQLiteEventRows(ctx, tx, `
+		SELECT seq, type, time, data, source_event_seqs, surface_op, ignorable
+		FROM events WHERE session_id = ? ORDER BY seq`, meta.ID)
+	if err != nil {
+		return err
+	}
+	current, currentTorn, err := scanSQLiteSessionEvents(currentRows, 0)
+	if err != nil {
+		return err
+	}
+	if tornFrom != nil {
+		if currentTorn == nil || *currentTorn != *tornFrom {
+			return fmt.Errorf("session %s repair is stale: physical tail no longer starts at seq %d", meta.ID, *tornFrom)
+		}
+	} else if currentTorn != nil {
+		return fmt.Errorf("session %s repair omitted current torn tail at seq %d", meta.ID, *currentTorn)
+	}
+	if len(bindings) > 0 {
+		expected := 0
+		if len(current) > 0 {
+			expected = current[len(current)-1].Seq + 1
+		}
+		if bindings[0].seq != expected {
+			return fmt.Errorf("session %s repair is stale: closer starts at seq %d, stored next seq is %d", meta.ID, bindings[0].seq, expected)
+		}
+	}
 	if tornFrom != nil {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM events WHERE session_id = ? AND seq >= ?", meta.ID, *tornFrom); err != nil {
 			return err
@@ -546,132 +665,119 @@ func (s *SQLiteSessionStore) repair(ctx context.Context, meta SessionHeader, tor
 	return tx.Commit()
 }
 
-type sqliteEventRow struct {
-	seq       int
-	typ       string
-	time      int64
-	data      string
-	sources   sql.NullString
-	surface   sql.NullString
-	ignorable sql.NullInt64
-}
-
-type sqliteEventBinding struct {
-	seq       int
-	typ       string
-	time      int64
-	data      string
-	sources   any
-	surface   any
-	ignorable any
-}
-
-func sqliteEventBindingsFor(events []Event) ([]sqliteEventBinding, error) {
-	bindings := make([]sqliteEventBinding, 0, len(events))
-	for _, event := range events {
-		data, err := json.Marshal(event.Data)
-		if err != nil {
-			return nil, fmt.Errorf("session event %q is not JSON-serializable: %w", event.Type, err)
-		}
-		var sources, surface any
-		if event.SourceEventSeqs != nil {
-			encoded, err := json.Marshal(event.SourceEventSeqs)
-			if err != nil {
-				return nil, err
-			}
-			sources = string(encoded)
-		}
-		if event.SurfaceOp != nil {
-			encoded, err := json.Marshal(event.SurfaceOp)
-			if err != nil {
-				return nil, err
-			}
-			surface = string(encoded)
-		}
-		var ignorable any
-		if event.Ignorable {
-			ignorable = 1
-		}
-		bindings = append(bindings, sqliteEventBinding{
-			seq: event.Seq, typ: event.Type, time: event.Time, data: string(data),
-			sources: sources, surface: surface, ignorable: ignorable,
-		})
-	}
-	return bindings, nil
-}
-
-func scanSQLiteSessionEvents(rows []sqliteEventRow, base int) ([]Event, *int, error) {
-	parsed := make([]*Event, len(rows))
-	lastTurnEnd := -1
-	for index, row := range rows {
-		event, err := sqliteRowEvent(row)
-		if err == nil {
-			parsed[index] = &event
-			if event.Type == "turn/end" {
-				lastTurnEnd = index
-			}
-		}
-	}
-	events := make([]Event, 0, len(rows))
-	for index, event := range parsed {
-		if event == nil {
-			if index <= lastTurnEnd {
-				return nil, nil, fmt.Errorf("corrupt session log: unparsable committed event at seq %d", rows[index].seq)
-			}
-			break
-		}
-		if event.Seq != base+index {
-			if index <= lastTurnEnd {
-				return nil, nil, fmt.Errorf("corrupt session log: seq gap in committed region (expected %d, got %d)", base+index, event.Seq)
-			}
-			break
-		}
-		events = append(events, *event)
-	}
-	if base == 0 {
-		if _, err := foldSurfaceEvents(events, true); err != nil {
-			return nil, nil, err
-		}
-	}
-	if len(events) < len(rows) {
-		torn := base + len(events)
-		return events, &torn, nil
-	}
-	return events, nil, nil
-}
-
-func sqliteRowEvent(row sqliteEventRow) (Event, error) {
-	var data any
-	if err := json.Unmarshal([]byte(row.data), &data); err != nil {
-		return Event{}, err
-	}
-	event := Event{Type: row.typ, Seq: row.seq, Time: row.time, Data: data}
-	if row.sources.Valid {
-		if err := json.Unmarshal([]byte(row.sources.String), &event.SourceEventSeqs); err != nil {
-			return Event{}, err
-		}
-	}
-	if row.surface.Valid {
-		if err := json.Unmarshal([]byte(row.surface.String), &event.SurfaceOp); err != nil {
-			return Event{}, err
-		}
-	}
-	event.Ignorable = row.ignorable.Valid && row.ignorable.Int64 == 1
-	encoded, err := json.Marshal(event)
+func querySQLiteEventRows(ctx context.Context, queryer sqliteQueryer, query string, args ...any) ([]sqliteEventRow, error) {
+	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
-		return Event{}, err
+		return nil, err
 	}
-	decoded, err := decodeSessionStorageRecord(encoded)
-	if err != nil {
-		return Event{}, err
+	defer rows.Close()
+	var events []sqliteEventRow
+	for rows.Next() {
+		var event sqliteEventRow
+		if err := rows.Scan(&event.seq, &event.typ, &event.time, &event.data, &event.sources, &event.surface, &event.ignorable); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
 	}
-	if len(decoded) != 1 {
-		return Event{}, fmt.Errorf("decoded into %d events", len(decoded))
-	}
-	return decoded[0], nil
+	return events, rows.Err()
 }
 
 const sessionSQLiteSelectHeaders = `SELECT id, version, created_at, cwd, parent_session, seed_length, origin, delegation_depth, agent_preset, incarnation, revision FROM sessions`
+
+const (
+	sessionSQLitePersistenceTable = `CREATE TABLE IF NOT EXISTS persistence_state (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		store_id TEXT NOT NULL
+	) STRICT`
+	sessionSQLiteSessionsTable = `CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		version INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		cwd TEXT,
+		parent_session TEXT,
+		seed_length INTEGER,
+		origin TEXT,
+		delegation_depth INTEGER,
+		agent_preset TEXT,
+		incarnation TEXT NOT NULL,
+		revision INTEGER NOT NULL
+	) STRICT`
+	sessionSQLiteEventsTable = `CREATE TABLE IF NOT EXISTS events (
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		seq INTEGER NOT NULL,
+		type TEXT NOT NULL,
+		time INTEGER NOT NULL,
+		data ANY NOT NULL,
+		source_event_seqs ANY,
+		surface_op TEXT,
+		ignorable INTEGER CHECK (ignorable IS NULL OR ignorable IN (0, 1)),
+		PRIMARY KEY (session_id, seq)
+	) STRICT`
+)
+
+var sessionSQLiteExpectedSchema = map[string]string{
+	"events":            normalizeSQLiteSQL(strings.Replace(sessionSQLiteEventsTable, " IF NOT EXISTS", "", 1)),
+	"persistence_state": normalizeSQLiteSQL(strings.Replace(sessionSQLitePersistenceTable, " IF NOT EXISTS", "", 1)),
+	"sessions":          normalizeSQLiteSQL(strings.Replace(sessionSQLiteSessionsTable, " IF NOT EXISTS", "", 1)),
+}
+
+type sqliteQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateSQLiteRequiredSchema(ctx context.Context, queryer sqliteQueryer) error {
+	rows, err := queryer.QueryContext(ctx, `
+		SELECT type, name, tbl_name, sql
+		FROM sqlite_schema
+		WHERE name NOT GLOB 'sqlite_*'
+		ORDER BY type, name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var typ, name, table, statement string
+		if err := rows.Scan(&typ, &name, &table, &statement); err != nil {
+			return err
+		}
+		expected, ok := sessionSQLiteExpectedSchema[name]
+		if !ok || typ != "table" || table != name || normalizeSQLiteSQL(statement) != expected {
+			return errors.New("session database does not contain the required schema objects")
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if seen != len(sessionSQLiteExpectedSchema) {
+		return errors.New("session database does not contain the required schema objects")
+	}
+	return nil
+}
+
+func normalizeSQLiteSQL(value string) string { return strings.Join(strings.Fields(value), " ") }
+
+func validateSQLiteSchemaForMutation(ctx context.Context, tx *sql.Tx) error {
+	var version, applicationID int
+	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, "PRAGMA application_id").Scan(&applicationID); err != nil {
+		return err
+	}
+	if applicationID != SessionSQLiteApplicationID {
+		return fmt.Errorf("session database application id changed before mutation (expected %d, got %d)", SessionSQLiteApplicationID, applicationID)
+	}
+	if err := validateSQLiteRequiredSchema(ctx, tx); err != nil {
+		return err
+	}
+	if version != SessionSQLiteSchemaVersion {
+		return fmt.Errorf("session database schema changed before mutation (expected %d, got %d)", SessionSQLiteSchemaVersion, version)
+	}
+	return nil
+}
 
 type sqliteSessionHeaderRow struct {
 	meta        SessionHeader
@@ -712,6 +818,12 @@ func scanSQLiteSessionHeader(scanner sqliteScanner) (sqliteSessionHeaderRow, err
 	if err := validateSessionHeader(meta); err != nil {
 		return sqliteSessionHeaderRow{}, err
 	}
+	if !isSQLiteUUID(incarnation) {
+		return sqliteSessionHeaderRow{}, errors.New("stored session incarnation must be a UUID")
+	}
+	if revision < 0 || revision > maxJSONSafeInteger {
+		return sqliteSessionHeaderRow{}, errors.New("stored session revision must be a non-negative safe integer")
+	}
 	return sqliteSessionHeaderRow{meta: meta, incarnation: incarnation, revision: revision}, nil
 }
 
@@ -735,48 +847,147 @@ func insertSQLiteSessionHeader(ctx context.Context, tx *sql.Tx, meta SessionHead
 	if meta.AgentPreset != "" {
 		preset = meta.AgentPreset
 	}
-	_, err := tx.ExecContext(ctx, `
+	incarnation, err := newSQLiteUUID()
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO sessions
 		(id, version, created_at, cwd, parent_session, seed_length, origin, delegation_depth, agent_preset, incarnation, revision)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-		meta.ID, meta.Version, meta.CreatedAt, cwd, parent, seed, origin, depth, preset, newID("incarnation"))
+		meta.ID, meta.Version, meta.CreatedAt, cwd, parent, seed, origin, depth, preset, incarnation)
 	return err
 }
 
-func openSessionSQLite(path string, journalMode SQLiteJournalMode) (*sql.DB, string, error) {
-	actual := path
-	if path != ":memory:" {
-		var err error
-		actual, err = filepath.Abs(path)
-		if err != nil {
-			return nil, "", err
-		}
-		if err := os.MkdirAll(filepath.Dir(actual), 0o700); err != nil {
-			return nil, "", err
-		}
-		file, err := os.OpenFile(actual, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			if err := file.Close(); err != nil {
-				return nil, "", err
-			}
-		} else if !errors.Is(err, os.ErrExist) {
-			return nil, "", err
+func newSQLiteUUID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	value[6] = value[6]&0x0f | 0x40
+	value[8] = value[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:]), nil
+}
+
+func isSQLiteUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.ReplaceAll(value, "-", ""))
+	return err == nil && len(decoded) == 16 && decoded[6]>>4 >= 1 && decoded[6]>>4 <= 8 && decoded[8]&0xc0 == 0x80
+}
+
+type sessionSQLiteConnector struct {
+	driver.Connector
+	busyTimeoutMS int64
+}
+
+func (c sessionSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	execer, ok := conn.(driver.ExecerContext)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("sqlite driver connection does not support context execution")
+	}
+	statements := []string{
+		fmt.Sprintf("PRAGMA busy_timeout = %d", c.busyTimeoutMS),
+		"PRAGMA trusted_schema = OFF",
+		"PRAGMA mmap_size = 0",
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA synchronous = FULL",
+	}
+	for _, statement := range statements {
+		if _, err := execer.ExecContext(ctx, statement, nil); err != nil {
+			_ = conn.Close()
+			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", actual)
+	return conn, nil
+}
+
+func prepareSessionSQLitePath(path string) (string, error) {
+	if path == ":memory:" {
+		return path, nil
+	}
+	actual, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	parent := filepath.Dir(actual)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", err
+	}
+	if err := validateSessionSQLiteParentDirectory(parent); err != nil {
+		return "", err
+	}
+	if err := validateSessionSQLiteDatabaseFileIfPresent(actual); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(actual, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		if err := file.Close(); err != nil {
+			return "", err
+		}
+	} else if !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	if err := validateSessionSQLiteDatabaseFile(actual); err != nil {
+		return "", err
+	}
+	return actual, nil
+}
+
+func validateSessionSQLiteParentDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("session database parent %q must be a real directory", path)
+	}
+	return validateSessionSQLiteParentAccess(path, info)
+}
+
+func validateSessionSQLiteDatabaseFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("session database %q must be a regular file, not a symbolic link", path)
+	}
+	return validateSessionSQLiteFileAccess(path, info)
+}
+
+func validateSessionSQLiteDatabaseFileIfPresent(path string) error {
+	err := validateSessionSQLiteDatabaseFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func openSessionSQLite(path string, journalMode SQLiteJournalMode, busyTimeout time.Duration) (*sql.DB, string, error) {
+	actual, err := prepareSessionSQLitePath(path)
 	if err != nil {
 		return nil, "", err
 	}
+	base, err := modernsqlite.NewConnector(actual)
+	if err != nil {
+		return nil, "", err
+	}
+	db := sql.OpenDB(sessionSQLiteConnector{Connector: base, busyTimeoutMS: busyTimeout.Milliseconds()})
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	fail := func(err error) (*sql.DB, string, error) {
 		_ = db.Close()
 		return nil, "", err
 	}
-	if err := db.Ping(); err != nil {
-		return fail(err)
-	}
-	conn, err := db.Conn(context.Background())
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fail(err)
 	}
@@ -784,26 +995,37 @@ func openSessionSQLite(path string, journalMode SQLiteJournalMode) (*sql.DB, str
 		_ = conn.Close()
 		return fail(err)
 	}
-	if _, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys = ON"); err != nil {
+	if err := requireSessionSQLitePragma(ctx, conn, actual, "trusted_schema", 0, "0"); err != nil {
 		return closeConn(err)
 	}
-	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+	if actual != ":memory:" {
+		if err := requireSessionSQLitePragma(ctx, conn, actual, "mmap_size", 0, "0"); err != nil {
+			return closeConn(err)
+		}
+	}
+	if err := requireSessionSQLitePragma(ctx, conn, actual, "foreign_keys", 1, "1"); err != nil {
+		return closeConn(err)
+	}
+	if err := requireSessionSQLitePragma(ctx, conn, actual, "busy_timeout", busyTimeout.Milliseconds(), fmt.Sprint(busyTimeout.Milliseconds())); err != nil {
+		return closeConn(err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return closeConn(err)
 	}
 	rollback := func(err error) (*sql.DB, string, error) {
-		if _, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK"); rollbackErr != nil {
+		if _, rollbackErr := conn.ExecContext(ctx, "ROLLBACK"); rollbackErr != nil {
 			err = errors.Join(err, rollbackErr)
 		}
 		return closeConn(err)
 	}
 	var onDisk, applicationID, objects int
-	if err := conn.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&onDisk); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&onDisk); err != nil {
 		return rollback(err)
 	}
-	if err := conn.QueryRowContext(context.Background(), "PRAGMA application_id").Scan(&applicationID); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA application_id").Scan(&applicationID); err != nil {
 		return rollback(err)
 	}
-	if err := conn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'").Scan(&objects); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'").Scan(&objects); err != nil {
 		return rollback(err)
 	}
 	if onDisk == 0 && (applicationID != 0 || objects > 0) {
@@ -815,59 +1037,59 @@ func openSessionSQLite(path string, journalMode SQLiteJournalMode) (*sql.DB, str
 	if onDisk == SessionSQLiteSchemaVersion && applicationID != SessionSQLiteApplicationID {
 		return rollback(fmt.Errorf("session database at %q has application id %d, expected %d", actual, applicationID, SessionSQLiteApplicationID))
 	}
-	if _, err := conn.ExecContext(context.Background(), `
-		CREATE TABLE IF NOT EXISTS persistence_state (
-			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-			store_id TEXT NOT NULL
-		) STRICT;
-		CREATE TABLE IF NOT EXISTS sessions (
-			id TEXT PRIMARY KEY,
-			version INTEGER NOT NULL,
-			created_at INTEGER NOT NULL,
-			cwd TEXT,
-			parent_session TEXT,
-			seed_length INTEGER,
-			origin TEXT,
-			delegation_depth INTEGER,
-			agent_preset TEXT,
-			incarnation TEXT NOT NULL,
-			revision INTEGER NOT NULL
-		) STRICT;
-		CREATE TABLE IF NOT EXISTS events (
-			session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-			seq INTEGER NOT NULL,
-			type TEXT NOT NULL,
-			time INTEGER NOT NULL,
-			data TEXT NOT NULL,
-			source_event_seqs TEXT,
-			surface_op TEXT,
-			ignorable INTEGER,
-			PRIMARY KEY (session_id, seq)
-		) STRICT`); err != nil {
-		return rollback(err)
-	}
-	if _, err := conn.ExecContext(context.Background(), "INSERT OR IGNORE INTO persistence_state (singleton, store_id) VALUES (1, ?)", newID("store")); err != nil {
-		return rollback(err)
-	}
 	if onDisk == 0 {
-		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA application_id = %d", SessionSQLiteApplicationID)); err != nil {
+		if _, err := conn.ExecContext(ctx, strings.Join([]string{
+			sessionSQLitePersistenceTable,
+			sessionSQLiteSessionsTable,
+			sessionSQLiteEventsTable,
+		}, ";\n")); err != nil {
 			return rollback(err)
 		}
-		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA user_version = %d", SessionSQLiteSchemaVersion)); err != nil {
+		storeID, err := newSQLiteUUID()
+		if err != nil {
+			return rollback(err)
+		}
+		if _, err := conn.ExecContext(ctx, "INSERT INTO persistence_state (singleton, store_id) VALUES (1, ?)", storeID); err != nil {
+			return rollback(err)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA application_id = %d", SessionSQLiteApplicationID)); err != nil {
+			return rollback(err)
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SessionSQLiteSchemaVersion)); err != nil {
 			return rollback(err)
 		}
 	}
-	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+	if err := validateSQLiteRequiredSchema(ctx, conn); err != nil {
 		return rollback(err)
 	}
-	if _, err := conn.ExecContext(context.Background(), "PRAGMA journal_mode = "+strings.ToUpper(string(journalMode))); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return rollback(err)
+	}
+	var selectedJournal string
+	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode = "+strings.ToUpper(string(journalMode))).Scan(&selectedJournal); err != nil {
+		return closeConn(err)
+	}
+	expectedJournal := string(journalMode)
+	if actual == ":memory:" {
+		expectedJournal = "memory"
+	}
+	if !strings.EqualFold(selectedJournal, expectedJournal) {
+		return closeConn(fmt.Errorf("session database at %q selected journal mode %s, expected %s", actual, selectedJournal, expectedJournal))
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
+		return closeConn(err)
+	}
+	if err := requireSessionSQLitePragma(ctx, conn, actual, "synchronous", 2, "FULL (2)"); err != nil {
 		return closeConn(err)
 	}
 	var storeID string
-	if err := conn.QueryRowContext(context.Background(), "SELECT store_id FROM persistence_state WHERE singleton = 1").Scan(&storeID); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT store_id FROM persistence_state WHERE singleton = 1").Scan(&storeID); err != nil {
 		return closeConn(err)
 	}
 	if storeID == "" {
+		return closeConn(errors.New("session database has no valid store identity"))
+	}
+	if !isSQLiteUUID(storeID) {
 		return closeConn(errors.New("session database has no valid store identity"))
 	}
 	if err := conn.Close(); err != nil {
@@ -880,4 +1102,15 @@ func openSessionSQLite(path string, journalMode SQLiteJournalMode) (*sql.DB, str
 		actual = canonical
 	}
 	return db, fmt.Sprintf("file:%s:store:%s", actual, storeID), nil
+}
+
+func requireSessionSQLitePragma(ctx context.Context, conn *sql.Conn, path, name string, want int64, expected string) error {
+	var got int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA "+name).Scan(&got); err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("session database at %q retained %s=%d, expected %s", path, name, got, expected)
+	}
+	return nil
 }

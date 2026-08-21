@@ -212,7 +212,7 @@ export function apply(ctx) {
 		args []string
 	}{
 		{name: "headless", args: []string{"--profile", "headless", "profile-exit"}},
-		{name: "web", args: []string{"--profile", "web", "--port", "0", "--trusted-host", "profile-exit"}},
+		{name: "web", args: []string{"--profile", "web", "--no-open", "--port", "0", "--trusted-host", "profile-exit"}},
 	} {
 		if err := os.Remove(external); err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)
@@ -243,7 +243,7 @@ export function apply(ctx) {
 	requireProfileLauncherMarker(t, launcherMarker, []string{"verify", "headless", "profile"})
 	requireProfileModelRequest(t, requests, "verify headless profile", "GLOBAL PROFILE E2E MARKER")
 
-	web := exec.Command(binary, "--profile", "web", "--port", "0")
+	web := exec.Command(binary, "--profile", "web", "--no-open", "--port", "0")
 	web.Env, web.Dir = environment, home
 	stdout, err := web.StdoutPipe()
 	if err != nil {
@@ -272,7 +272,7 @@ export function apply(ctx) {
 	if err != nil {
 		t.Fatalf("read web address: %v; stderr=%s", err, stderr.String())
 	}
-	requireProfileLauncherMarker(t, launcherMarker, []string{"--port", "0"})
+	requireProfileLauncherMarker(t, launcherMarker, []string{"--no-open", "--port", "0"})
 	endpoint := strings.TrimSpace(strings.TrimPrefix(line, "dsh web: "))
 	session := profileRPC(t, endpoint, "session.create", map[string]any{"cwd": home})
 	sessionID, _ := session["sessionId"].(string)

@@ -234,12 +234,12 @@ func (pty *windowsConPTY) signal(name string) (int, error) {
 	switch name {
 	case TerminalSignalInterrupt:
 		return pty.pid, pty.write([]byte{3})
-	case TerminalSignalStop:
-		return pty.pid, pty.write([]byte{26})
-	case TerminalSignalTerminate, TerminalSignalHangup:
+	case TerminalSignalTerminate:
 		return pty.pid, pty.terminateJob(1)
 	case TerminalSignalKill:
 		return pty.pid, pty.terminateJob(137)
+	case TerminalSignalStop, TerminalSignalHangup:
+		return 0, fmt.Errorf("signal %s is unsupported on Windows; only SIGINT, SIGTERM, and SIGKILL are available", name)
 	default:
 		return 0, fmt.Errorf("unsupported terminal signal %q", name)
 	}

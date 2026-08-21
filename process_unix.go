@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	shellToolName        = "bash"
-	shellToolDescription = "Run a bash command under the current sandbox policy. Set run_in_background for long-running commands, then use job_output or job_kill with the returned job id."
-	shellToolPersistent  = true
+	shellToolName           = "bash"
+	shellToolDescription    = "Run a bash command under the current sandbox policy. Set run_in_background for long-running commands, then use job_output or job_kill with the returned job id."
+	shellCommandDescription = "The bash command to run. Relative path is preferred in the command."
+	shellToolPersistent     = true
 )
 
 func shellInvocation(command, mode, workspace, workdir string) (string, []string, error) {

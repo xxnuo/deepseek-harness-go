@@ -350,7 +350,7 @@ func TestDeepSeekWebSearchProviderErrorsAndRequestEvent(t *testing.T) {
 	tool := e.tools["web_search"]
 	e.mu.RUnlock()
 	if _, err := tool.Execute(context.Background(), ToolCall{
-		Name: "web_search", SessionID: id, Arguments: json.RawMessage(`{"query":"logged"}`),
+		Name: "web_search", SessionID: id, Arguments: json.RawMessage(`{"queries":["logged"]}`),
 	}); err != nil {
 		t.Fatal(err)
 	}

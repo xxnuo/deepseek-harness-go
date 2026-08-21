@@ -24,8 +24,12 @@ type remoteDescriptor struct {
 }
 
 var remoteDescriptors = map[string]remoteDescriptor{
-	"commands/execute": {allowed: []string{"agentId", "line"}, required: []string{"agentId", "line"}},
-	"commands/list":    {allowed: []string{"agentId"}, required: []string{"agentId"}},
+	"commands/execute":    {allowed: []string{"agentId", "images", "line"}, required: []string{"agentId", "images", "line"}},
+	"commands/list":       {allowed: []string{"agentId"}, required: []string{"agentId"}},
+	"fileReferences/list": {allowed: []string{"agentId", "query"}, required: []string{"agentId", "query"}},
+	"sessionReferenceResolver/candidates": {
+		allowed: []string{"agentId", "query"}, required: []string{"agentId", "query"},
+	},
 
 	"goals/clear":    {allowed: []string{"agentId", "ref"}, required: []string{"agentId", "ref"}},
 	"goals/complete": {allowed: []string{"agentId", "ref"}, required: []string{"agentId", "ref"}},
@@ -78,6 +82,10 @@ func (e *Engine) dispatchRemote(ctx context.Context, endpoint string, raw json.R
 		return value, true, rpcErr
 	case "commands/execute":
 		return e.remoteCommandsExecute(ctx, args)
+	case "fileReferences/list":
+		return e.remoteFileReferencesList(ctx, args)
+	case "sessionReferenceResolver/candidates":
+		return e.remoteSessionReferenceCandidates(ctx, args)
 	case "goals/create", "goals/edit", "goals/pause", "goals/resume", "goals/complete", "goals/clear":
 		value, rpcErr := e.remoteGoal(endpoint, args)
 		return value, true, rpcErr
@@ -392,15 +400,7 @@ func (e *Engine) remoteCommandsList(args map[string]json.RawMessage) (any, *RPCE
 	if _, sessionErr := e.getSession(id); sessionErr != nil {
 		return nil, errorToRPC(sessionErr)
 	}
-	return []map[string]any{
-		{"name": "clear", "description": "Clear the current Session title"},
-		{"name": "compact", "description": "Compact older conversation history"},
-		{"name": "export", "description": "Download this Session log as a ZIP archive"},
-		{"name": "feedback", "description": "record feedback about this session", "input": map[string]any{"hint": "<text>"}},
-		{"name": "goal", "description": "set or view the goal for a long-running task", "input": map[string]any{"hint": "[<objective>|clear|edit <objective>|pause|resume]"}},
-		{"name": "permission", "description": "Switch the permission preset (sandbox mode + approval policy)", "input": map[string]any{"hint": "<preset>"}},
-		{"name": "plan", "description": "Enter or leave plan mode", "input": map[string]any{"hint": "[off|message]"}},
-	}, nil
+	return commandCatalog(), nil
 }
 
 func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json.RawMessage) (any, bool, *RPCError) {
@@ -412,11 +412,15 @@ func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json
 	if err != nil {
 		return nil, false, err
 	}
+	images, err := remoteEncodedImages(args["images"])
+	if err != nil {
+		return nil, false, remoteBoundaryError("commands/execute", "images")
+	}
 	s, sessionErr := e.getSession(id)
 	if sessionErr != nil {
 		return nil, false, errorToRPC(sessionErr)
 	}
-	execution, admitted, runErr := e.executeCommand(ctx, s, line)
+	execution, admitted, runErr := e.executeCommand(ctx, s, line, images)
 	if runErr != nil {
 		return nil, false, errorToRPC(runErr)
 	}
@@ -424,6 +428,72 @@ func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json
 		return nil, false, nil
 	}
 	return execution, true, nil
+}
+
+func remoteEncodedImages(raw json.RawMessage) ([]EncodedImageAttachment, *RPCError) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, remoteBoundaryError("commands/execute", "images")
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil || rows == nil {
+		return nil, remoteBoundaryError("commands/execute", "images")
+	}
+	images := make([]EncodedImageAttachment, len(rows))
+	for index, row := range rows {
+		object, err := remoteObject(row, []string{"mediaType", "data", "name"}, []string{"mediaType", "data"})
+		if err != nil {
+			return nil, remoteBoundaryError("commands/execute", "images")
+		}
+		mediaType, rpcErr := remoteString("commands/execute", object, "mediaType")
+		if rpcErr != nil || imageExtension(mediaType) == "" {
+			return nil, remoteBoundaryError("commands/execute", "images")
+		}
+		data, rpcErr := remoteString("commands/execute", object, "data")
+		if rpcErr != nil {
+			return nil, remoteBoundaryError("commands/execute", "images")
+		}
+		name := ""
+		if _, present := object["name"]; present {
+			name, rpcErr = remoteString("commands/execute", object, "name")
+			if rpcErr != nil {
+				return nil, remoteBoundaryError("commands/execute", "images")
+			}
+		}
+		images[index] = EncodedImageAttachment{MediaType: mediaType, Data: data, Name: name}
+	}
+	return images, nil
+}
+
+func (e *Engine) remoteFileReferencesList(ctx context.Context, args map[string]json.RawMessage) (any, bool, *RPCError) {
+	agentID, err := remoteString("fileReferences/list", args, "agentId")
+	if err != nil {
+		return nil, false, err
+	}
+	query, err := remoteString("fileReferences/list", args, "query")
+	if err != nil {
+		return nil, false, err
+	}
+	candidates, listErr := e.ListFileReferenceCandidates(ctx, agentID, query)
+	if listErr != nil {
+		return nil, false, errorToRPC(listErr)
+	}
+	return candidates, true, nil
+}
+
+func (e *Engine) remoteSessionReferenceCandidates(ctx context.Context, args map[string]json.RawMessage) (any, bool, *RPCError) {
+	agentID, err := remoteString("sessionReferenceResolver/candidates", args, "agentId")
+	if err != nil {
+		return nil, false, err
+	}
+	query, err := remoteString("sessionReferenceResolver/candidates", args, "query")
+	if err != nil {
+		return nil, false, err
+	}
+	candidates, listErr := e.ListSessionReferenceMentionCandidates(ctx, agentID, query)
+	if listErr != nil {
+		return nil, false, errorToRPC(listErr)
+	}
+	return candidates, true, nil
 }
 
 type remoteGoalRef struct {

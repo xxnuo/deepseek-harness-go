@@ -206,6 +206,7 @@ func (e *Engine) dynamicCordisAgentEnter(run *dynamicCordisRun, id, sessionID, o
 			delete(e.dynamicCordis.agents, id)
 		}
 		e.dynamicCordis.Unlock()
+		e.releaseFileReferenceSearch(id)
 		if entry.announced {
 			_ = e.emitDynamicCordisEventFrom(run, "agent/disposed", map[string]any{"agent": e.dynamicCordisAgentEvent(run, id)})
 		}

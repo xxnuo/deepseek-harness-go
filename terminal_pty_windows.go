@@ -17,9 +17,16 @@ const (
 	terminalPrompt       = "dsh> "
 )
 
-func platformTerminalShellDefaults() (string, []string) {
-	prompt := `function global:prompt { [Console]::Write(([char]27).ToString() + ']133;D;' + [string]$global:LASTEXITCODE + [char]7); 'dsh> ' }`
-	return "pwsh.exe", []string{"-NoLogo", "-NoProfile", "-NoExit", "-Command", prompt}
+func platformTerminalShellDefaults() (string, string, []string) {
+	path, args := terminalShellDefaults(TerminalShellDialectPwsh)
+	return TerminalShellDialectPwsh, path, args
+}
+
+func terminalShellDefaults(dialect string) (string, []string) {
+	if dialect == TerminalShellDialectBash {
+		return "/bin/bash", []string{"--noprofile", "--norc", "-i"}
+	}
+	return "pwsh.exe", []string{"-NoLogo", "-NoProfile"}
 }
 
 type powershellTerminalBackend struct{ config TerminalConfig }
@@ -35,7 +42,7 @@ func (backend *powershellTerminalBackend) Spawn(ctx context.Context, spec Termin
 		return nil, err
 	}
 	program := backend.config.ShellPath
-	if strings.EqualFold(program, "pwsh.exe") {
+	if backend.config.ShellDialect == TerminalShellDialectPwsh && strings.EqualFold(program, "pwsh.exe") {
 		resolved, err := resolvePowerShell()
 		if err != nil {
 			return nil, err
@@ -50,10 +57,7 @@ func (backend *powershellTerminalBackend) Spawn(ctx context.Context, spec Termin
 			return nil, err
 		}
 	}
-	env := scrubbedChildEnv(map[string]string{
-		"NO_COLOR": "1", "PAGER": "cat", "GIT_PAGER": "cat",
-		"DSH_SHELL": "1", "DSH_SESSION_ID": spec.OwnerID, "DSH_PTY_SESSION_ID": spec.SessionID,
-	})
+	env := scrubbedChildEnv(terminalShellEnvironment(backend.config, spec))
 	if sandbox != nil {
 		env = sandbox.environment(env)
 	}
@@ -429,28 +433,14 @@ func (session *windowsPTYSession) initialize(ctx context.Context) error {
 	session.mu.Lock()
 	session.initializing = true
 	session.mu.Unlock()
-	operation, err := session.StartSend(ctx, TerminalSendRequest{})
-	if err != nil {
-		return err
-	}
-	<-operation.Done()
-	result, err := operation.Result()
+	motd, err := initializeTerminalShell(ctx, session, session.config)
 	session.mu.Lock()
 	session.initializing = false
 	if err == nil {
-		session.motd = result.Viewport
+		session.motd = motd
 	}
 	session.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if result.WaitReason == TerminalWaitSessionExit {
-		return errors.New("PTY shell exited during startup")
-	}
-	if result.WaitReason == TerminalWaitTimeout {
-		return errors.New("PTY shell did not reach readiness before startup timeout")
-	}
-	return nil
+	return err
 }
 
 func (session *windowsPTYSession) MOTD() string {
@@ -721,6 +711,9 @@ func (session *windowsPTYSession) Signal(name string) (TerminalSignalResult, err
 	session.mu.Unlock()
 	if closing {
 		return TerminalSignalResult{}, errors.New("PTY session is closing")
+	}
+	if name == TerminalSignalKill {
+		return TerminalSignalResult{}, errors.New("refusing to SIGKILL the terminal shell; close the terminal session instead")
 	}
 	pid, err := session.pty.signal(name)
 	return TerminalSignalResult{Delivered: err == nil, TargetPGID: pid}, err

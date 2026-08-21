@@ -84,34 +84,37 @@ type entryRef struct {
 }
 
 type composition struct {
-	entries               []*yaml.Node
-	provenance            []provenance
-	index                 map[string]entryRef
-	profileDir            string
-	e2b                   *harness.E2BConfig
-	hooks                 []harness.HookBridgeConfig
-	mcpConfigs            []harness.MCPConfig
-	lspServers            map[string]harness.LSPStdioConfig
-	lspTool               harness.LSPToolConfig
-	terminalConfig        harness.TerminalConfig
-	terminalToolConfig    harness.TerminalToolConfig
-	persist               bool
-	sessionStore          harness.SessionStore
-	sessionTitleLLM       *harness.SessionTitleLLMConfig
-	sessionTelemetry      *harness.SessionTelemetryConfig
-	subagentProviders     []harness.SubagentProvider
-	subagentTools         []harness.SubagentToolConfig
-	exaSearch             *harness.ExaSearchProviderOptions
-	perplexitySearch      *harness.PerplexitySearchProviderOptions
-	storage               *harness.StorageRuntimeConfig
-	clientHMRPollInterval time.Duration
-	httpFetch             bool
-	httpFetchConfig       *harness.HTTPWebFetchConfig
-	webTools              *harness.WebToolConfig
-	webSearchProvider     string
-	webSearchSet          bool
-	webFetchProvider      string
-	webFetchSet           bool
+	entries                []*yaml.Node
+	provenance             []provenance
+	index                  map[string]entryRef
+	profileDir             string
+	e2b                    *harness.E2BConfig
+	hooks                  []harness.HookBridgeConfig
+	mcpConfigs             []harness.MCPConfig
+	lspServers             map[string]harness.LSPStdioConfig
+	lspTool                harness.LSPToolConfig
+	terminalConfig         harness.TerminalConfig
+	terminalToolConfig     harness.TerminalToolConfig
+	persist                bool
+	sessionStore           harness.SessionStore
+	sessionTitleLLM        *harness.SessionTitleLLMConfig
+	sessionTelemetry       *harness.SessionTelemetryConfig
+	subagentProviders      []harness.SubagentProvider
+	subagentTools          []harness.SubagentToolConfig
+	subagentReportDelivery string
+	exaSearch              *harness.ExaSearchProviderOptions
+	perplexitySearch       *harness.PerplexitySearchProviderOptions
+	storage                *harness.StorageRuntimeConfig
+	fileReference          *harness.FileReferenceConfig
+	agentTeams             *harness.AgentTeamConfig
+	clientHMRPollInterval  time.Duration
+	httpFetch              bool
+	httpFetchConfig        *harness.HTTPWebFetchConfig
+	webTools               *harness.WebToolConfig
+	webSearchProvider      string
+	webSearchSet           bool
+	webFetchProvider       string
+	webFetchSet            bool
 }
 
 type pluginEntry struct {
@@ -140,7 +143,9 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-client-ui-deliverables":              true,
 	"@deepseek-ai/dsh-client-ui-directory-picker-native":   true,
 	"@deepseek-ai/dsh-client-ui-agent-preset":              true,
+	"@deepseek-ai/dsh-client-ui-attachment":                true,
 	"@deepseek-ai/dsh-client-ui-commands":                  true,
+	"@deepseek-ai/dsh-client-ui-brand-official":            true,
 	"@deepseek-ai/dsh-client-ui-cordis":                    true,
 	"@deepseek-ai/dsh-client-ui-goal":                      true,
 	"@deepseek-ai/dsh-client-ui-input-trigger":             true,
@@ -150,6 +155,8 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-client-ui-model-selection":           true,
 	"@deepseek-ai/dsh-client-ui-permission-presets":        true,
 	"@deepseek-ai/dsh-client-ui-plan":                      true,
+	"@deepseek-ai/dsh-client-ui-reference":                 true,
+	"@deepseek-ai/dsh-client-ui-renderer":                  true,
 	"@deepseek-ai/dsh-client-ui-settings":                  true,
 	"@deepseek-ai/dsh-client-ui-settings-general":          true,
 	"@deepseek-ai/dsh-client-ui-settings-models":           true,
@@ -178,7 +185,11 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-cordis-client-runner":                true,
 	"@deepseek-ai/dsh-cordis-host-runner":                  true,
 	"@deepseek-ai/dsh-e2b":                                 true,
+	"@deepseek-ai/dsh-experimental-agent-team":             true,
+	"@deepseek-ai/dsh-experimental-tool-agent-team":        true,
 	"@deepseek-ai/dsh-fs-e2b":                              true,
+	"@deepseek-ai/dsh-file-reference":                      true,
+	"@deepseek-ai/dsh-file-reference-local":                true,
 	"@deepseek-ai/dsh-fs-observation-policy":               true,
 	"@deepseek-ai/dsh-fs-sandbox":                          true,
 	"@deepseek-ai/dsh-goal":                                true,
@@ -245,6 +256,7 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-terminal-bash":                       true,
 	"@deepseek-ai/dsh-token-meter":                         true,
 	"@deepseek-ai/dsh-tool-bash":                           true,
+	"@deepseek-ai/dsh-tool-bash-persistent":                true,
 	"@deepseek-ai/dsh-tool-call-timeout-policy":            true,
 	"@deepseek-ai/dsh-tool-fs":                             true,
 	"@deepseek-ai/dsh-tool-fs-search":                      true,
@@ -252,6 +264,7 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-tool-jobs":                           true,
 	"@deepseek-ai/dsh-tool-lsp":                            true,
 	"@deepseek-ai/dsh-tool-pwsh":                           true,
+	"@deepseek-ai/dsh-tool-pwsh-persistent":                true,
 	"@deepseek-ai/dsh-tool-ralph":                          true,
 	"@deepseek-ai/dsh-tool-skill":                          true,
 	"@deepseek-ai/dsh-tool-str-replace-editor":             true,
@@ -1258,11 +1271,145 @@ func (composition *composition) resolveWebConfigs() error {
 	return nil
 }
 
+func (composition *composition) resolveFileReferenceConfig() (*harness.FileReferenceConfig, error) {
+	var resolved *harness.FileReferenceConfig
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-file-reference-local" {
+			return nil
+		}
+		if resolved != nil {
+			return errors.New("file-reference-local is configured more than once")
+		}
+		var raw struct {
+			MaxResults          *int64    `json:"maxResults"`
+			MaxEntries          *int64    `json:"maxEntries"`
+			ExcludedDirectories *[]string `json:"excludedDirectories"`
+		}
+		if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+			return fmt.Errorf("file-reference-local(%s): invalid config: %w", id, err)
+		}
+		const maxSafeInteger = int64(1<<53 - 1)
+		maxInt := int64(^uint(0) >> 1)
+		for field, value := range map[string]*int64{"maxResults": raw.MaxResults, "maxEntries": raw.MaxEntries} {
+			if value != nil && (*value < 1 || *value > maxSafeInteger || *value > maxInt) {
+				return fmt.Errorf("file-reference-local(%s): %s must be a positive safe integer", id, field)
+			}
+		}
+		config := harness.DefaultConfig().FileReference
+		if raw.MaxResults != nil {
+			config.MaxResults = int(*raw.MaxResults)
+		}
+		if raw.MaxEntries != nil {
+			config.MaxEntries = int(*raw.MaxEntries)
+		}
+		if raw.ExcludedDirectories != nil {
+			for _, directory := range *raw.ExcludedDirectories {
+				if directory == "" || strings.ContainsAny(directory, `/\\`) {
+					return fmt.Errorf("file-reference-local(%s): excludedDirectories entries must be non-empty directory basenames", id)
+				}
+			}
+			config.ExcludedDirectories = append([]string(nil), (*raw.ExcludedDirectories)...)
+		}
+		resolved = &config
+		return nil
+	})
+	return resolved, err
+}
+
+func (composition *composition) resolveAgentTeamConfig() (*harness.AgentTeamConfig, error) {
+	config := harness.DefaultAgentTeamConfig()
+	ownerSeen := false
+	toolSeen := false
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		switch name {
+		case "@deepseek-ai/dsh-experimental-agent-team":
+			if ownerSeen {
+				return errors.New("experimental-agent-team is configured more than once")
+			}
+			ownerSeen = true
+			var raw struct {
+				MaxMembers                  *int64 `json:"maxMembers"`
+				MaxTasks                    *int64 `json:"maxTasks"`
+				MaxPendingMessagesPerMember *int64 `json:"maxPendingMessagesPerMember"`
+				MaxMessageBytes             *int64 `json:"maxMessageBytes"`
+				DisposalTimeoutMS           *int64 `json:"disposalTimeoutMs"`
+			}
+			if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+				return fmt.Errorf("experimental-agent-team(%s): invalid config: %w", id, err)
+			}
+			const maxSafeInteger = int64(1<<53 - 1)
+			maxInt := int64(^uint(0) >> 1)
+			limits := []struct {
+				name   string
+				value  *int64
+				target *int
+			}{
+				{"maxMembers", raw.MaxMembers, &config.MaxMembers},
+				{"maxTasks", raw.MaxTasks, &config.MaxTasks},
+				{"maxPendingMessagesPerMember", raw.MaxPendingMessagesPerMember, &config.MaxPendingMessagesPerMember},
+				{"maxMessageBytes", raw.MaxMessageBytes, &config.MaxMessageBytes},
+			}
+			for _, limit := range limits {
+				if limit.value == nil {
+					continue
+				}
+				if *limit.value < 1 || *limit.value > maxSafeInteger || *limit.value > maxInt {
+					return fmt.Errorf("experimental-agent-team(%s): %s must be a positive safe integer", id, limit.name)
+				}
+				*limit.target = int(*limit.value)
+			}
+			if raw.DisposalTimeoutMS != nil {
+				maxDurationMS := int64(^uint64(0)>>1) / int64(time.Millisecond)
+				if *raw.DisposalTimeoutMS < 1 || *raw.DisposalTimeoutMS > maxSafeInteger || *raw.DisposalTimeoutMS > maxDurationMS {
+					return fmt.Errorf("experimental-agent-team(%s): disposalTimeoutMs must be a positive safe integer within the Go duration range", id)
+				}
+				config.DisposalTimeout = time.Duration(*raw.DisposalTimeoutMS) * time.Millisecond
+			}
+		case "@deepseek-ai/dsh-experimental-tool-agent-team":
+			if toolSeen {
+				return errors.New("experimental-tool-agent-team is configured more than once")
+			}
+			toolSeen = true
+			var raw struct {
+				FreshProvider *string `json:"freshProvider"`
+				ForkProvider  *string `json:"forkProvider"`
+			}
+			if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+				return fmt.Errorf("experimental-tool-agent-team(%s): invalid config: %w", id, err)
+			}
+			if raw.FreshProvider != nil {
+				config.FreshProvider = strings.TrimSpace(*raw.FreshProvider)
+				if config.FreshProvider == "" {
+					return fmt.Errorf("experimental-tool-agent-team(%s): freshProvider must be non-empty", id)
+				}
+			}
+			if raw.ForkProvider != nil {
+				config.ForkProvider = strings.TrimSpace(*raw.ForkProvider)
+				if config.ForkProvider == "" {
+					return fmt.Errorf("experimental-tool-agent-team(%s): forkProvider must be non-empty", id)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if toolSeen && !ownerSeen {
+		return nil, errors.New("experimental-tool-agent-team requires an enabled @deepseek-ai/dsh-experimental-agent-team owner")
+	}
+	if !ownerSeen {
+		return nil, nil
+	}
+	return &config, nil
+}
+
 func (composition *composition) resolveSessionPersistence() error {
 	var kind string
 	var sqliteConfig struct {
 		Path                     string `json:"path"`
 		JournalMode              string `json:"journalMode"`
+		BusyTimeoutMS            *int64 `json:"busyTimeoutMs"`
 		PreparedSessionCacheSize *int   `json:"preparedSessionCacheSize"`
 		WriteBatchMaxDelayMS     *int   `json:"writeBatchMaxDelayMs"`
 	}
@@ -1292,6 +1439,9 @@ func (composition *composition) resolveSessionPersistence() error {
 		if sqliteConfig.PreparedSessionCacheSize != nil && *sqliteConfig.PreparedSessionCacheSize < 1 {
 			return fmt.Errorf("session-persistence-sqlite(%s): preparedSessionCacheSize must be a positive integer", id)
 		}
+		if sqliteConfig.BusyTimeoutMS != nil && (*sqliteConfig.BusyTimeoutMS < 0 || *sqliteConfig.BusyTimeoutMS > int64(harness.MaxSQLiteBusyTimeout/time.Millisecond)) {
+			return fmt.Errorf("session-persistence-sqlite(%s): busyTimeoutMs must be between 0 and 2147483647", id)
+		}
 		if sqliteConfig.WriteBatchMaxDelayMS != nil && (*sqliteConfig.WriteBatchMaxDelayMS < 1 || int64(*sqliteConfig.WriteBatchMaxDelayMS) > int64(harness.MaxSQLiteWriteBatchDelay/time.Millisecond)) {
 			return fmt.Errorf("session-persistence-sqlite(%s): writeBatchMaxDelayMs must be between 1 and 2147483647", id)
 		}
@@ -1309,6 +1459,10 @@ func (composition *composition) resolveSessionPersistence() error {
 		return nil
 	}
 	options := harness.SQLiteSessionStoreOptions{Path: sqliteConfig.Path, JournalMode: harness.SQLiteJournalMode(sqliteConfig.JournalMode)}
+	if sqliteConfig.BusyTimeoutMS != nil {
+		options.BusyTimeout = time.Duration(*sqliteConfig.BusyTimeoutMS) * time.Millisecond
+		options.BusyTimeoutSet = true
+	}
 	if sqliteConfig.PreparedSessionCacheSize != nil {
 		options.PreparedSessionCacheSize = *sqliteConfig.PreparedSessionCacheSize
 	}
@@ -1436,6 +1590,16 @@ func (composition *composition) validate() error {
 	if err := composition.resolveWebConfigs(); err != nil {
 		return err
 	}
+	fileReference, err := composition.resolveFileReferenceConfig()
+	if err != nil {
+		return err
+	}
+	composition.fileReference = fileReference
+	agentTeams, err := composition.resolveAgentTeamConfig()
+	if err != nil {
+		return err
+	}
+	composition.agentTeams = agentTeams
 	mcpConfigs, err := composition.resolveMCPConfigs()
 	if err != nil {
 		return err
@@ -1466,6 +1630,11 @@ func (composition *composition) validate() error {
 		return err
 	}
 	composition.subagentTools = subagentTools
+	reportDelivery, err := composition.resolveSubagentReportDelivery()
+	if err != nil {
+		return err
+	}
+	composition.subagentReportDelivery = reportDelivery
 	toolsMode := strings.TrimSpace(os.Getenv("DSH_TOOLS_MODE"))
 	if configured, ok := composition.configString("tools", "mode"); ok {
 		toolsMode = configured
@@ -1540,30 +1709,66 @@ func (composition *composition) resolveSubagentProviders() ([]harness.SubagentPr
 				})
 			case "@deepseek-ai/dsh-subagent-codex":
 				var raw struct {
+					ProviderName   *string           `json:"providerName"`
+					PermissionMode *string           `json:"permissionMode"`
 					Env            map[string]string `json:"env"`
 					DisposeGraceMS *int              `json:"disposeGraceMs"`
 				}
 				if err := json.Unmarshal(data, &raw); err != nil {
 					return fmt.Errorf("subagent-codex(%s): invalid config: %w", id, err)
 				}
+				if raw.ProviderName != nil && strings.TrimSpace(*raw.ProviderName) == "" {
+					return fmt.Errorf("subagent-codex(%s): providerName must not be empty", id)
+				}
 				disposeGrace, err := profileSubagentDuration("disposeGraceMs", raw.DisposeGraceMS)
 				if err != nil {
 					return fmt.Errorf("subagent-codex(%s): %w", id, err)
 				}
-				provider, err = harness.NewCodexSubagentProvider(harness.CodexSubagentConfig{Env: raw.Env, DisposeGrace: disposeGrace})
+				providerName, permissionMode := "", harness.CodexPermissionMode("")
+				if raw.ProviderName != nil {
+					providerName = *raw.ProviderName
+				}
+				if raw.PermissionMode != nil {
+					permissionMode = harness.CodexPermissionMode(*raw.PermissionMode)
+				}
+				executable, resolveErr := profileProductExecutable(composition.profileDir, name, "codex")
+				if resolveErr != nil {
+					return fmt.Errorf("subagent-codex(%s): %w", id, resolveErr)
+				}
+				provider, err = harness.NewCodexSubagentProvider(harness.CodexSubagentConfig{
+					ProviderName: providerName, PermissionMode: permissionMode, Executable: executable, Env: raw.Env, DisposeGrace: disposeGrace,
+				})
 			case "@deepseek-ai/dsh-subagent-claude-code":
 				var raw struct {
+					ProviderName   *string           `json:"providerName"`
+					PermissionMode *string           `json:"permissionMode"`
 					Env            map[string]string `json:"env"`
 					DisposeGraceMS *int              `json:"disposeGraceMs"`
 				}
 				if err := json.Unmarshal(data, &raw); err != nil {
 					return fmt.Errorf("subagent-claude-code(%s): invalid config: %w", id, err)
 				}
+				if raw.ProviderName != nil && strings.TrimSpace(*raw.ProviderName) == "" {
+					return fmt.Errorf("subagent-claude-code(%s): providerName must not be empty", id)
+				}
 				disposeGrace, err := profileSubagentDuration("disposeGraceMs", raw.DisposeGraceMS)
 				if err != nil {
 					return fmt.Errorf("subagent-claude-code(%s): %w", id, err)
 				}
-				provider, err = harness.NewClaudeCodeSubagentProvider(harness.ClaudeCodeSubagentConfig{Env: raw.Env, DisposeGrace: disposeGrace})
+				providerName, permissionMode := "", harness.ClaudeCodePermissionMode("")
+				if raw.ProviderName != nil {
+					providerName = *raw.ProviderName
+				}
+				if raw.PermissionMode != nil {
+					permissionMode = harness.ClaudeCodePermissionMode(*raw.PermissionMode)
+				}
+				executable, resolveErr := profileProductExecutable(composition.profileDir, name, "claude")
+				if resolveErr != nil {
+					return fmt.Errorf("subagent-claude-code(%s): %w", id, resolveErr)
+				}
+				provider, err = harness.NewClaudeCodeSubagentProvider(harness.ClaudeCodeSubagentConfig{
+					ProviderName: providerName, PermissionMode: permissionMode, Executable: executable, Env: raw.Env, DisposeGrace: disposeGrace,
+				})
 			case "@deepseek-ai/dsh-subagent-dsh-sdk":
 				var raw struct {
 					ProviderName      string            `json:"providerName"`
@@ -1632,6 +1837,22 @@ func (composition *composition) resolveSubagentProviders() ([]harness.SubagentPr
 		}
 	}
 	return providers, nil
+}
+
+func profileProductExecutable(profileDir, packageName, command string) (string, error) {
+	if profileDir == "" {
+		return command, nil
+	}
+	name := command
+	if runtime.GOOS == "windows" {
+		name += ".cmd"
+	}
+	path := filepath.Join(profileDir, "node_modules", ".bin", name)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return "", fmt.Errorf("cannot resolve package-local %s launcher at %s; install the matching Profile Bundle", command, path)
+	}
+	return path, nil
 }
 
 func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolConfig, error) {
@@ -1724,6 +1945,33 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 		}
 	}
 	return tools, nil
+}
+
+func (composition *composition) resolveSubagentReportDelivery() (string, error) {
+	delivery := ""
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-tool-subagent-report" {
+			return nil
+		}
+		if delivery != "" {
+			return errors.New("tool-subagent-report is configured more than once")
+		}
+		var raw struct {
+			ReportDelivery *string `json:"reportDelivery"`
+		}
+		if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+			return fmt.Errorf("tool-subagent-report(%s): invalid config: %w", id, err)
+		}
+		delivery = harness.SubagentReportNextStep
+		if raw.ReportDelivery != nil {
+			delivery = *raw.ReportDelivery
+		}
+		if delivery != harness.SubagentReportQuiet && delivery != harness.SubagentReportNextStep {
+			return fmt.Errorf("tool-subagent-report(%s): reportDelivery must be quiet or next-step", id)
+		}
+		return nil
+	})
+	return delivery, err
 }
 
 func profileSubagentCWD(configured *string) (string, error) {

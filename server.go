@@ -561,11 +561,47 @@ func injectBoot(html string, e *Engine) string {
 	}
 	data, _ := json.Marshal(graph)
 	data = []byte(strings.ReplaceAll(string(data), "<", "\\u003c"))
-	script := "<script>window.__DSH_BOOT__ = " + string(data) + "</script>"
+	const modulesID = "@deepseek-ai/dsh-client-modules"
+	queue := `<script>(()=>{
+const pendingQueue=[]
+window.__ModuleLoader__={
+  mode:"queue",
+  pendingQueue,
+  load(registration){pendingQueue.push(registration)},
+  create(options){
+    if(this.mode!=="queue")throw new Error("client-modules: window.__ModuleLoader__.create called after module-system boot")
+    const index=pendingQueue.findIndex(registration=>registration.id===` + strconv.Quote(modulesID) + `)
+    const registration=pendingQueue[index]
+    if(registration===undefined)throw new Error("client-modules: HTML did not preload ` + modulesID + `/client.js")
+    pendingQueue.splice(index,1)
+    const exports=registration.factory(specifier=>{
+      throw new Error('client-modules: ` + modulesID + `/client.js requested external "'+specifier+'" before the module system existed')
+    })
+    if(typeof exports!=="object"||exports===null||typeof exports.createClientModuleSystem!=="function"||typeof exports.apply!=="function"){
+      throw new Error("client-modules: ` + modulesID + `/client.js did not export the bootstrap module face")
+    }
+    return exports.createClientModuleSystem(this,{id:registration.id,exports},options)
+  }
+}
+})()</script>`
+	var preload strings.Builder
+	for _, id := range []string{modulesID, "@deepseek-ai/dsh-client-runtime"} {
+		for _, entry := range graph.Entries {
+			if entry.ID == id {
+				preload.WriteString(`<script src="` + htmlAttribute(entry.URL) + `"></script>`)
+				break
+			}
+		}
+	}
+	script := queue + preload.String() + "<script>window.__DSH_BOOT__ = " + string(data) + "</script>"
 	if strings.Contains(html, "<head>") {
 		return strings.Replace(html, "<head>", "<head>"+script, 1)
 	}
 	return script + html
+}
+
+func htmlAttribute(value string) string {
+	return strings.NewReplacer("&", "&amp;", `"`, "&quot;", "<", "&lt;", ">", "&gt;").Replace(value)
 }
 
 func injectThemeBootstrap(html string, e *Engine) string {

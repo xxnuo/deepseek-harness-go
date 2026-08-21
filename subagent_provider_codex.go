@@ -13,27 +13,68 @@ import (
 
 const defaultCodexDisposeGrace = 3 * time.Second
 
-// CodexSubagentConfig configures the fixed codex app-server provider.
+// CodexPermissionMode fixes the native non-interactive policy for one Codex
+// provider instance.
+type CodexPermissionMode string
+
+const (
+	CodexPermissionNever                                CodexPermissionMode = "never"
+	CodexPermissionApproveForMe                         CodexPermissionMode = "approve-for-me"
+	CodexPermissionDangerouslyBypassApprovalsAndSandbox CodexPermissionMode = "dangerously-bypass-approvals-and-sandbox"
+)
+
+// CodexSubagentConfig configures one named Codex app-server provider.
 type CodexSubagentConfig struct {
-	Env          map[string]string
-	DisposeGrace time.Duration
+	ProviderName   string
+	PermissionMode CodexPermissionMode
+	Executable     string
+	Env            map[string]string
+	DisposeGrace   time.Duration
 }
 
 // CodexSubagentProvider drives one fresh codex app-server process per run.
 type CodexSubagentProvider struct {
-	env          map[string]string
-	disposeGrace time.Duration
+	name           string
+	permissionMode CodexPermissionMode
+	executable     string
+	env            map[string]string
+	disposeGrace   time.Duration
 }
 
 func NewCodexSubagentProvider(config CodexSubagentConfig) (*CodexSubagentProvider, error) {
+	name := strings.TrimSpace(config.ProviderName)
+	if name == "" {
+		name = "codex"
+	}
+	permissionMode, err := resolveCodexPermissionMode(config.PermissionMode)
+	if err != nil {
+		return nil, err
+	}
+	executable := strings.TrimSpace(config.Executable)
+	if executable == "" {
+		executable = "codex"
+	}
 	grace, err := positiveSubagentDuration("subagent-codex", "disposeGrace", config.DisposeGrace, defaultCodexDisposeGrace)
 	if err != nil {
 		return nil, err
 	}
-	return &CodexSubagentProvider{env: cloneSubagentEnv(config.Env), disposeGrace: grace}, nil
+	return &CodexSubagentProvider{name: name, permissionMode: permissionMode, executable: executable, env: cloneSubagentEnv(config.Env), disposeGrace: grace}, nil
 }
 
-func (p *CodexSubagentProvider) Name() string { return "codex" }
+func resolveCodexPermissionMode(mode CodexPermissionMode) (CodexPermissionMode, error) {
+	switch CodexPermissionMode(strings.TrimSpace(string(mode))) {
+	case "", CodexPermissionNever:
+		return CodexPermissionNever, nil
+	case CodexPermissionApproveForMe:
+		return CodexPermissionApproveForMe, nil
+	case CodexPermissionDangerouslyBypassApprovalsAndSandbox:
+		return CodexPermissionDangerouslyBypassApprovalsAndSandbox, nil
+	default:
+		return "", fmt.Errorf("subagent-codex: permissionMode must be never, approve-for-me, or dangerously-bypass-approvals-and-sandbox")
+	}
+}
+
+func (p *CodexSubagentProvider) Name() string { return p.name }
 func (p *CodexSubagentProvider) Capabilities() SubagentCapabilities {
 	return NoSubagentStartCapabilities()
 }
@@ -51,13 +92,13 @@ func (p *CodexSubagentProvider) Start(ctx context.Context, request SubagentStart
 	if err != nil {
 		return nil, err
 	}
-	command, args := codexAppServerCommand()
+	command, args := codexAppServerCommand(p.executable)
 	process, err := startSubagentProcess(command, args, cwd, p.env)
 	if err != nil {
 		return nil, fmt.Errorf("subagent-codex: start app-server: %w", err)
 	}
 	rpc := newSubagentRPCClient(process.stdout, process.stdin)
-	wire := newCodexSubagentWire(rpc)
+	wire := newCodexSubagentWire(rpc, p.permissionMode)
 	rpc.setHandlers(func(method string, raw json.RawMessage) (any, error) {
 		result, handleErr := wire.handleRequest(method, raw)
 		if handleErr != nil {
@@ -119,11 +160,14 @@ func (p *CodexSubagentProvider) Start(ctx context.Context, request SubagentStart
 	return run, nil
 }
 
-func codexAppServerCommand() (string, []string) {
-	if runtime.GOOS == "windows" {
-		return "cmd.exe", []string{"/d", "/s", "/c", "codex", "app-server", "--stdio"}
+func codexAppServerCommand(executable string) (string, []string) {
+	if executable == "" {
+		executable = "codex"
 	}
-	return "codex", []string{"app-server", "--stdio"}
+	if runtime.GOOS == "windows" {
+		return "cmd.exe", []string{"/d", "/s", "/c", executable, "app-server", "--stdio"}
+	}
+	return executable, []string{"app-server", "--stdio"}
 }
 
 func codexTextTask(prompt []ContentBlock) ([]string, error) {
@@ -151,7 +195,8 @@ type codexNotification struct {
 }
 
 type codexSubagentWire struct {
-	rpc *subagentRPCClient
+	rpc            *subagentRPCClient
+	permissionMode CodexPermissionMode
 
 	mu                 sync.Mutex
 	threadID           string
@@ -168,8 +213,8 @@ type codexSubagentWire struct {
 	fatalOnce          sync.Once
 }
 
-func newCodexSubagentWire(rpc *subagentRPCClient) *codexSubagentWire {
-	return &codexSubagentWire{rpc: rpc, fatal: make(chan struct{})}
+func newCodexSubagentWire(rpc *subagentRPCClient, permissionMode CodexPermissionMode) *codexSubagentWire {
+	return &codexSubagentWire{rpc: rpc, permissionMode: permissionMode, fatal: make(chan struct{})}
 }
 
 func (w *codexSubagentWire) fail(err error) {
@@ -197,7 +242,11 @@ func (w *codexSubagentWire) initialize(ctx context.Context) error {
 
 func (w *codexSubagentWire) startThread(ctx context.Context, cwd string) error {
 	var response map[string]any
-	if err := w.rpc.request(ctx, "thread/start", map[string]any{"cwd": cwd, "ephemeral": true}, &response); err != nil {
+	params := map[string]any{"cwd": cwd, "ephemeral": true}
+	for key, value := range codexThreadPermissionParams(w.permissionMode) {
+		params[key] = value
+	}
+	if err := w.rpc.request(ctx, "thread/start", params, &response); err != nil {
 		return fmt.Errorf("subagent-codex: thread/start: %w", err)
 	}
 	thread, err := subagentObject(response["thread"], "thread/start thread")
@@ -215,6 +264,17 @@ func (w *codexSubagentWire) startThread(ctx context.Context, cwd string) error {
 	w.threadID = id
 	w.mu.Unlock()
 	return nil
+}
+
+func codexThreadPermissionParams(mode CodexPermissionMode) map[string]any {
+	switch mode {
+	case CodexPermissionApproveForMe:
+		return map[string]any{"approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "sandbox": "workspace-write"}
+	case CodexPermissionDangerouslyBypassApprovalsAndSandbox:
+		return map[string]any{"approvalPolicy": "never", "sandbox": "danger-full-access"}
+	default:
+		return map[string]any{"approvalPolicy": "never"}
+	}
 }
 
 func (w *codexSubagentWire) runTurn(ctx context.Context, texts []string) (SubagentResult, error) {

@@ -83,9 +83,9 @@ func TestCodexSubagentProviderRealProtocol(t *testing.T) {
 		t.Skip("test wrapper uses a POSIX shell")
 	}
 	dir := t.TempDir()
-	writeHelperWrapper(t, filepath.Join(dir, "codex"), "codex")
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	provider, err := NewCodexSubagentProvider(CodexSubagentConfig{DisposeGrace: time.Second})
+	launcher := filepath.Join(dir, "codex")
+	writeHelperWrapper(t, launcher, "codex")
+	provider, err := NewCodexSubagentProvider(CodexSubagentConfig{Executable: launcher, DisposeGrace: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +102,81 @@ func TestCodexSubagentProviderRealProtocol(t *testing.T) {
 	}
 	if result.StopReason != SubagentCompleted || contentValueText(result.Output) != "codex-final" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCodexSubagentProviderPassesSelectedPermissionModeToRealProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test wrapper uses a POSIX shell")
+	}
+	dir := t.TempDir()
+	launcher := filepath.Join(dir, "codex")
+	writeHelperWrapper(t, launcher, "codex")
+	t.Setenv("SUBAGENT_EXPECT_CODEX_PERMISSION_MODE", string(CodexPermissionDangerouslyBypassApprovalsAndSandbox))
+	provider, err := NewCodexSubagentProvider(CodexSubagentConfig{
+		ProviderName: "codex-bypass", PermissionMode: CodexPermissionDangerouslyBypassApprovalsAndSandbox, Executable: launcher, DisposeGrace: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := provider.Start(context.Background(), SubagentStartRequest{CWD: dir, Prompt: []ContentBlock{{Type: "text", Text: "test bypass"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = run.Dispose() })
+	result, err := run.Wait(testContext(t))
+	if err != nil || result.StopReason != SubagentCompleted {
+		t.Fatalf("result = %#v, %v", result, err)
+	}
+}
+
+func TestProductSubagentProviderNamesAndPermissionModes(t *testing.T) {
+	codex, err := NewCodexSubagentProvider(CodexSubagentConfig{
+		ProviderName: "codex-safe", PermissionMode: CodexPermissionApproveForMe,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codex.Name() != "codex-safe" || codex.permissionMode != CodexPermissionApproveForMe {
+		t.Fatalf("codex provider = %#v", codex)
+	}
+	for mode, want := range map[CodexPermissionMode]map[string]any{
+		CodexPermissionApproveForMe:                         {"approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "sandbox": "workspace-write"},
+		CodexPermissionDangerouslyBypassApprovalsAndSandbox: {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+	} {
+		for key, value := range want {
+			if got := codexThreadPermissionParams(mode)[key]; got != value {
+				t.Fatalf("%s thread permission %s = %#v, want %#v", mode, key, got, value)
+			}
+		}
+	}
+	claude, err := NewClaudeCodeSubagentProvider(ClaudeCodeSubagentConfig{
+		ProviderName: "claude-safe", PermissionMode: ClaudeCodePermissionAcceptEdits,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Name() != "claude-safe" || claude.permissionMode != ClaudeCodePermissionAcceptEdits {
+		t.Fatalf("Claude provider = %#v", claude)
+	}
+	for _, test := range []struct {
+		name string
+		run  func() error
+	}{
+		{"codex", func() error {
+			_, err := NewCodexSubagentProvider(CodexSubagentConfig{PermissionMode: "unsafe"})
+			return err
+		}},
+		{"claude", func() error {
+			_, err := NewClaudeCodeSubagentProvider(ClaudeCodeSubagentConfig{PermissionMode: "unsafe"})
+			return err
+		}},
+	} {
+		t.Run("reject invalid "+test.name, func(t *testing.T) {
+			if err := test.run(); err == nil || !strings.Contains(err.Error(), "permissionMode") {
+				t.Fatalf("invalid permission mode error = %v", err)
+			}
+		})
 	}
 }
 
@@ -127,6 +202,27 @@ func TestClaudeCodeSubagentProviderRealProcess(t *testing.T) {
 	}
 	if result.StopReason != SubagentCompleted || contentValueText(result.Output) != "claude|hello claude|args-ok|entry=sdk-ts" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestClaudeCodeSubagentProviderPassesSelectedPermissionModeToRealProcess(t *testing.T) {
+	t.Setenv("SUBAGENT_EXPECT_CLAUDE_PERMISSION_MODE", string(ClaudeCodePermissionBypassPermissions))
+	provider, err := NewClaudeCodeSubagentProvider(ClaudeCodeSubagentConfig{
+		ProviderName: "claude-bypass", PermissionMode: ClaudeCodePermissionBypassPermissions,
+		Executable: helperExecutable(t), Env: map[string]string{subagentHelperEnv: "1"}, DisposeGrace: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.executable = writeClaudeHelperWrapper(t)
+	run, err := provider.Start(context.Background(), SubagentStartRequest{CWD: t.TempDir(), Prompt: []ContentBlock{{Type: "text", Text: "test bypass"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = run.Dispose() })
+	result, err := run.Wait(testContext(t))
+	if err != nil || result.StopReason != SubagentCompleted {
+		t.Fatalf("result = %#v, %v", result, err)
 	}
 }
 
@@ -473,6 +569,9 @@ func runCodexHelper(args []string) {
 			helperReply(frame, map[string]any{})
 		case "initialized":
 		case "thread/start":
+			if !matchesCodexPermissionMode(frame.Params, os.Getenv("SUBAGENT_EXPECT_CODEX_PERMISSION_MODE")) {
+				os.Exit(6)
+			}
 			helperReply(frame, map[string]any{"thread": map[string]any{"id": "thread-1", "ephemeral": true}})
 		case "turn/start":
 			helperWrite(map[string]any{"jsonrpc": "2.0", "method": "turn/started", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1"}}})
@@ -496,8 +595,30 @@ func runCodexHelper(args []string) {
 	}
 }
 
+func matchesCodexPermissionMode(params map[string]any, mode string) bool {
+	if mode == "" {
+		mode = string(CodexPermissionNever)
+	}
+	want := codexThreadPermissionParams(CodexPermissionMode(mode))
+	for _, key := range []string{"approvalPolicy", "approvalsReviewer", "sandbox"} {
+		got, present := params[key]
+		expected, wanted := want[key]
+		if present != wanted || wanted && got != expected {
+			return false
+		}
+	}
+	return true
+}
+
 func runClaudeHelper(args []string) {
-	want := "--output-format stream-json --verbose --input-format stream-json --disallowedTools AskUserQuestion --permission-mode default --no-session-persistence"
+	mode := os.Getenv("SUBAGENT_EXPECT_CLAUDE_PERMISSION_MODE")
+	if mode == "" {
+		mode = string(ClaudeCodePermissionDontAsk)
+	}
+	want := "--output-format stream-json --verbose --input-format stream-json --disallowedTools AskUserQuestion --permission-mode " + mode + " --no-session-persistence"
+	if mode == string(ClaudeCodePermissionBypassPermissions) {
+		want += " --dangerously-skip-permissions"
+	}
 	argsOK := strings.Join(args, " ") == want
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {

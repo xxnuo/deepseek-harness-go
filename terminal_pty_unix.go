@@ -26,7 +26,15 @@ const (
 	terminalPrompt       = "dsh> "
 )
 
-func platformTerminalShellDefaults() (string, []string) {
+func platformTerminalShellDefaults() (string, string, []string) {
+	path, args := terminalShellDefaults(TerminalShellDialectBash)
+	return TerminalShellDialectBash, path, args
+}
+
+func terminalShellDefaults(dialect string) (string, []string) {
+	if dialect == TerminalShellDialectPwsh {
+		return "pwsh", []string{"-NoLogo", "-NoProfile"}
+	}
 	return "/bin/bash", []string{"--noprofile", "--norc", "-i"}
 }
 
@@ -48,13 +56,7 @@ func (backend *bashTerminalBackend) Spawn(ctx context.Context, spec TerminalBack
 	}
 	cmd := exec.Command(program, args...)
 	cmd.Dir = spec.CWD
-	cmd.Env = scrubbedChildEnv(map[string]string{
-		"TERM": "dumb", "PAGER": "cat", "GIT_PAGER": "cat",
-		"PS1":                              terminalPrompt,
-		"PROMPT_COMMAND":                   `printf "\033]133;D;%s\007" "$?"; PS1='` + terminalPrompt + `'`,
-		"BASH_SILENCE_DEPRECATION_WARNING": "1", "DSH_SHELL": "1",
-		"DSH_SESSION_ID": spec.OwnerID, "DSH_PTY_SESSION_ID": spec.SessionID,
-	})
+	cmd.Env = scrubbedChildEnv(terminalShellEnvironment(backend.config, spec))
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(backend.config.Rows), Cols: uint16(backend.config.Cols)})
 	if err != nil {
 		return nil, err
@@ -472,28 +474,14 @@ func (session *localPTYSession) initialize(ctx context.Context) error {
 	session.mu.Lock()
 	session.initializing = true
 	session.mu.Unlock()
-	operation, err := session.StartSend(ctx, TerminalSendRequest{})
-	if err != nil {
-		return err
-	}
-	<-operation.Done()
-	result, err := operation.Result()
+	motd, err := initializeTerminalShell(ctx, session, session.config)
 	session.mu.Lock()
 	session.initializing = false
 	if err == nil {
-		session.motd = result.Viewport
+		session.motd = motd
 	}
 	session.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if result.WaitReason == TerminalWaitSessionExit {
-		return errors.New("PTY shell exited during startup")
-	}
-	if result.WaitReason == TerminalWaitTimeout {
-		return errors.New("PTY shell did not reach readiness before startup timeout")
-	}
-	return nil
+	return err
 }
 
 func (session *localPTYSession) MOTD() string {
