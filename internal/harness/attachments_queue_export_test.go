@@ -89,12 +89,19 @@ func TestAttachmentAdmissionFormatsAndIntegrity(t *testing.T) {
 			if ref.Name != "photo."+strings.TrimPrefix(mediaType, "image/") {
 				t.Fatalf("sanitized name = %q", ref.Name)
 			}
-			if ref.Bytes != len(data) || ref.Width <= 0 || ref.Height <= 0 {
+			if ref.Bytes <= 0 || ref.Width <= 0 || ref.Height <= 0 {
 				t.Fatalf("metadata = %#v", ref)
 			}
 			got, err := e.readImage(ref)
-			if err != nil || !bytes.Equal(got, data) {
-				t.Fatalf("readImage() err=%v equal=%v", err, bytes.Equal(got, data))
+			if err != nil {
+				t.Fatalf("readImage() err=%v", err)
+			}
+			if mediaType == "image/gif" {
+				if ref.MediaType != "image/jpeg" || ref.OriginalDimensions == nil {
+					t.Fatalf("GIF normalization metadata = %#v", ref)
+				}
+			} else if !bytes.Equal(got, data) {
+				t.Fatalf("readImage() changed an already normalized image")
 			}
 		})
 	}
@@ -127,7 +134,7 @@ func TestAttachmentAdmissionFormatsAndIntegrity(t *testing.T) {
 }
 
 func TestAttachmentRC8ByteAndDimensionLimits(t *testing.T) {
-	if maxImageBytes != int(3.5*1024*1024) || maxImageDimension != 2000 {
+	if maxImageBytes != 20<<20 || maxImageDimension != 8192 || maxImagePixels != 64_000_000 {
 		t.Fatalf("limits = %d bytes, %d px", maxImageBytes, maxImageDimension)
 	}
 	e := attachmentEngine(t, false)
@@ -145,6 +152,44 @@ func TestAttachmentRC8ByteAndDimensionLimits(t *testing.T) {
 	if _, err := e.StoreImage("image/png", b64(encoded.Bytes()), "wide.png"); err == nil ||
 		!strings.Contains(err.Error(), "per-side") {
 		t.Fatalf("oversized dimension error = %v", err)
+	}
+	largeButAdmissible := image.NewRGBA(image.Rect(0, 0, normalizedImageMaxDimension+1, 2))
+	encoded.Reset()
+	if err := png.Encode(&encoded, largeButAdmissible); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := e.StoreImage("image/png", b64(encoded.Bytes()), "scaled.png")
+	if err != nil {
+		t.Fatalf("scaled image should be admitted: %v", err)
+	}
+	if ref.OriginalDimensions == nil || ref.OriginalDimensions.Width != normalizedImageMaxDimension+1 || ref.Width > normalizedImageMaxDimension {
+		t.Fatalf("scaled image metadata = %#v", ref)
+	}
+}
+
+func TestRequestImageVersionIsStableAndCached(t *testing.T) {
+	e := attachmentEngine(t, false)
+	ref, err := e.StoreImage("image/png", readImagePNG, "request.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := ImageRequestPolicy{MaxPixels: 1, MaxBytes: 1024}
+	first, err := e.ReadImageRequest(ref, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := e.ReadImageRequest(ref, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.VariantID == "" || first.VariantID != second.VariantID || !bytes.Equal(first.Data, second.Data) {
+		t.Fatalf("request image cache mismatch: first=%#v second=%#v", first, second)
+	}
+	if first.Width*first.Height > policy.MaxPixels || first.Bytes > policy.MaxBytes {
+		t.Fatalf("request image exceeds policy: %#v", first)
+	}
+	if _, err := e.ReadImageRequest(ref, ImageRequestPolicy{}); err == nil {
+		t.Fatal("zero request policy unexpectedly accepted")
 	}
 }
 

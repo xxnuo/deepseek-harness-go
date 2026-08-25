@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"image"
 	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"image/jpeg"
+	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
@@ -24,20 +26,50 @@ import (
 // session events. Bytes are stored below Config.DataDir and never embedded in
 // the session log.
 type ImageAttachmentRef struct {
-	AttachmentID string `json:"attachmentId"`
-	MediaType    string `json:"mediaType"`
-	Bytes        int    `json:"bytes"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	Name         string `json:"name,omitempty"`
+	AttachmentID       string           `json:"attachmentId"`
+	MediaType          string           `json:"mediaType"`
+	Bytes              int              `json:"bytes"`
+	Width              int              `json:"width"`
+	Height             int              `json:"height"`
+	Name               string           `json:"name,omitempty"`
+	OriginalDimensions *ImageDimensions `json:"originalDimensions,omitempty"`
+}
+
+type ImageDimensions struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// ImageRequestPolicy is the route-owned pixel and encoded-byte budget used to
+// derive a deterministic provider request version from a durable attachment.
+type ImageRequestPolicy struct {
+	MaxPixels int `json:"maxPixels"`
+	MaxBytes  int `json:"maxBytes"`
+}
+
+// RequestImageAttachment is a transient, verified request image. It is never
+// written to session history; only the durable ImageAttachmentRef is logged.
+type RequestImageAttachment struct {
+	VariantID  string             `json:"variantId"`
+	Attachment ImageAttachmentRef `json:"attachment"`
+	Data       []byte             `json:"-"`
+	MediaType  string             `json:"mediaType"`
+	Bytes      int                `json:"bytes"`
+	Width      int                `json:"width"`
+	Height     int                `json:"height"`
+	Depth      string             `json:"depth"`
+	Space      string             `json:"space"`
+	HasAlpha   bool               `json:"hasAlpha"`
 }
 
 const (
-	maxImageBytes        = 7 << 19
-	maxImagesPerMessage  = 20
-	maxMessageImageBytes = 100 << 20
-	maxImagePixels       = 40_000_000
-	maxImageDimension    = 2000
+	maxImageBytes               = 20 << 20
+	maxImagesPerMessage         = 20
+	maxMessageImageBytes        = 200 << 20
+	maxImagePixels              = 64_000_000
+	maxImageDimension           = 8192
+	normalizedImageMaxDimension = 2048
+	normalizedImageMaxBytes     = 4 << 20
 )
 
 // EncodedImageAttachment is the public wire shape used by slash commands.
@@ -100,6 +132,81 @@ func imageDimensions(mediaType string, data []byte) (int, int, error) {
 	return config.Width, config.Height, nil
 }
 
+func imageHasAlpha(img image.Image) bool {
+	if opaque, ok := img.(interface{ Opaque() bool }); ok && opaque.Opaque() {
+		return false
+	}
+	bounds := img.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			_, _, _, alpha := img.At(x, y).RGBA()
+			if alpha != 0xffff {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func encodeNormalizedImage(img image.Image, alpha bool, format string) ([]byte, string, error) {
+	var output bytes.Buffer
+	if alpha || format == "png" {
+		if err := png.Encode(&output, img); err != nil {
+			return nil, "", err
+		}
+		return output.Bytes(), "image/png", nil
+	}
+	if err := jpeg.Encode(&output, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, "", err
+	}
+	return output.Bytes(), "image/jpeg", nil
+}
+
+func normalizeImageData(mediaType string, data []byte, width, height int) ([]byte, string, int, int, *ImageDimensions, error) {
+	if mediaType != "image/gif" && width <= normalizedImageMaxDimension && height <= normalizedImageMaxDimension && len(data) <= normalizedImageMaxBytes {
+		return data, mediaType, width, height, nil, nil
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", 0, 0, nil, fmt.Errorf("image normalization failed: %w", err)
+	}
+	alpha := imageHasAlpha(decoded)
+	targetWidth, targetHeight := width, height
+	if width > normalizedImageMaxDimension || height > normalizedImageMaxDimension {
+		scale := float64(normalizedImageMaxDimension) / float64(max(width, height))
+		targetWidth = max(1, int(float64(width)*scale+0.5))
+		targetHeight = max(1, int(float64(height)*scale+0.5))
+	}
+	original := (*ImageDimensions)(nil)
+	if targetWidth != width || targetHeight != height || mediaType == "image/gif" {
+		original = &ImageDimensions{Width: width, Height: height}
+	}
+	for {
+		var target image.Image = decoded
+		if targetWidth != width || targetHeight != height {
+			dst := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))
+			draw.CatmullRom.Scale(dst, dst.Bounds(), decoded, decoded.Bounds(), draw.Over, nil)
+			target = dst
+		}
+		encoded, normalizedType, encodeErr := encodeNormalizedImage(target, alpha, "")
+		if encodeErr != nil {
+			return nil, "", 0, 0, nil, encodeErr
+		}
+		if len(encoded) <= normalizedImageMaxBytes {
+			return encoded, normalizedType, targetWidth, targetHeight, original, nil
+		}
+		if targetWidth == 1 && targetHeight == 1 {
+			return nil, "", 0, 0, nil, errors.New("image cannot be encoded within the normalized byte limit")
+		}
+		scale := 0.9
+		targetWidth = max(1, int(float64(targetWidth)*scale))
+		targetHeight = max(1, int(float64(targetHeight)*scale))
+		if original == nil {
+			original = &ImageDimensions{Width: width, Height: height}
+		}
+	}
+}
+
 func sanitizeImageName(value string) string {
 	if slash := max(strings.LastIndex(value, "/"), strings.LastIndex(value, `\`)); slash >= 0 {
 		value = value[slash+1:]
@@ -143,12 +250,16 @@ func prepareImage(mediaType, encoded, name string) (preparedImage, error) {
 	if err != nil {
 		return preparedImage{}, fmt.Errorf("attachment-error: %w", err)
 	}
-	hash := sha256.Sum256(data)
-	ref := ImageAttachmentRef{AttachmentID: "sha256:" + hex.EncodeToString(hash[:]), MediaType: mediaType, Bytes: len(data), Width: w, Height: h}
+	normalized, normalizedType, normalizedWidth, normalizedHeight, originalDimensions, err := normalizeImageData(mediaType, data, w, h)
+	if err != nil {
+		return preparedImage{}, fmt.Errorf("attachment-error: %w", err)
+	}
+	hash := sha256.Sum256(normalized)
+	ref := ImageAttachmentRef{AttachmentID: "sha256:" + hex.EncodeToString(hash[:]), MediaType: normalizedType, Bytes: len(normalized), Width: normalizedWidth, Height: normalizedHeight, OriginalDimensions: originalDimensions}
 	if clean := sanitizeImageName(name); clean != "" {
 		ref.Name = clean
 	}
-	return preparedImage{ref: ref, data: data}, nil
+	return preparedImage{ref: ref, data: normalized}, nil
 }
 
 func (e *Engine) imagePath(ref ImageAttachmentRef) (string, error) {
@@ -292,4 +403,127 @@ func (e *Engine) readImage(ref ImageAttachmentRef) ([]byte, error) {
 		return nil, errors.New("attachment-error: image metadata does not match stored bytes")
 	}
 	return data, nil
+}
+
+const requestImageTransformVersion = "request-image-v1"
+
+// requestImageDimensions computes inward-rounded aspect-preserving dimensions
+// without enlarging small images.
+func requestImageDimensions(width, height, maxPixels int) (int, int, error) {
+	if width <= 0 || height <= 0 || maxPixels <= 0 {
+		return 0, 0, errors.New("attachment-error: image request policy must contain positive integers")
+	}
+	if width <= maxPixels/height {
+		return width, height, nil
+	}
+	scale := math.Sqrt(float64(maxPixels) / float64(width*height))
+	if width >= height {
+		w := max(1, int(float64(width)*scale))
+		h := max(1, int(float64(w)*float64(height)/float64(width)+0.5))
+		for w > 1 && w*h > maxPixels {
+			w--
+			h = max(1, int(float64(w)*float64(height)/float64(width)+0.5))
+		}
+		return w, h, nil
+	}
+	h := max(1, int(float64(height)*scale))
+	w := max(1, int(float64(h)*float64(width)/float64(height)+0.5))
+	for h > 1 && w*h > maxPixels {
+		h--
+		w = max(1, int(float64(h)*float64(width)/float64(height)+0.5))
+	}
+	return w, h, nil
+}
+
+func requestImageVariantID(ref ImageAttachmentRef, policy ImageRequestPolicy) string {
+	descriptor := fmt.Sprintf("%s\x00%s\x00%d\x00%d", requestImageTransformVersion, ref.AttachmentID, policy.MaxPixels, policy.MaxBytes)
+	hash := sha256.Sum256([]byte(descriptor))
+	return "sha256:" + hex.EncodeToString(hash[:])
+}
+
+func requestImageCachePath(root, variantID string) string {
+	match := attachmentIDPattern.FindStringSubmatch(variantID)
+	if len(match) != 2 {
+		return ""
+	}
+	return filepath.Join(root, "request-images", match[1][:2], match[1])
+}
+
+// readImageRequest generates or reuses a deterministic request image version.
+// The same exact bytes can subsequently be sent inline or uploaded to a Files
+// API, which keeps both transport paths stable for one model route.
+func (e *Engine) readImageRequest(ref ImageAttachmentRef, policy ImageRequestPolicy) (RequestImageAttachment, error) {
+	if policy.MaxPixels <= 0 || policy.MaxBytes <= 0 {
+		return RequestImageAttachment{}, errors.New("attachment-error: image request policy must contain positive integers")
+	}
+	data, err := e.readImage(ref)
+	if err != nil {
+		return RequestImageAttachment{}, err
+	}
+	variantID := requestImageVariantID(ref, policy)
+	root := filepath.Join(e.cfg.DataDir, "attachments", "v1")
+	cache := requestImageCachePath(root, variantID)
+	if cache != "" {
+		if cached, readErr := os.ReadFile(cache); readErr == nil && len(cached) <= policy.MaxBytes {
+			if w, h, metadataErr := imageDimensions("image/png", cached); metadataErr == nil {
+				return RequestImageAttachment{VariantID: variantID, Attachment: ref, Data: cached, MediaType: "image/png", Bytes: len(cached), Width: w, Height: h, Depth: "uchar", Space: "srgb", HasAlpha: true}, nil
+			}
+			if w, h, metadataErr := imageDimensions("image/jpeg", cached); metadataErr == nil {
+				return RequestImageAttachment{VariantID: variantID, Attachment: ref, Data: cached, MediaType: "image/jpeg", Bytes: len(cached), Width: w, Height: h, Depth: "uchar", Space: "srgb"}, nil
+			}
+		}
+	}
+	w, h, err := imageDimensions(ref.MediaType, data)
+	if err != nil {
+		return RequestImageAttachment{}, err
+	}
+	targetWidth, targetHeight, err := requestImageDimensions(w, h, policy.MaxPixels)
+	if err != nil {
+		return RequestImageAttachment{}, err
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return RequestImageAttachment{}, fmt.Errorf("attachment-error: decode request image: %w", err)
+	}
+	alpha := imageHasAlpha(decoded)
+	for {
+		var target image.Image = decoded
+		if targetWidth != w || targetHeight != h {
+			dst := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))
+			draw.CatmullRom.Scale(dst, dst.Bounds(), decoded, decoded.Bounds(), draw.Over, nil)
+			target = dst
+		}
+		encoded, mediaType, encodeErr := encodeNormalizedImage(target, alpha, "")
+		if encodeErr != nil {
+			return RequestImageAttachment{}, fmt.Errorf("attachment-error: encode request image: %w", encodeErr)
+		}
+		if len(encoded) <= policy.MaxBytes {
+			if cache != "" {
+				if err := os.MkdirAll(filepath.Dir(cache), 0o700); err == nil {
+					tmp, tempErr := os.CreateTemp(filepath.Dir(cache), ".request-image-*")
+					if tempErr == nil {
+						if _, writeErr := tmp.Write(encoded); writeErr == nil {
+							_ = tmp.Close()
+							_ = os.Rename(tmp.Name(), cache)
+						} else {
+							_ = tmp.Close()
+						}
+						_ = os.Remove(tmp.Name())
+					}
+				}
+			}
+			return RequestImageAttachment{VariantID: variantID, Attachment: ref, Data: encoded, MediaType: mediaType, Bytes: len(encoded), Width: targetWidth, Height: targetHeight, Depth: "uchar", Space: "srgb", HasAlpha: alpha}, nil
+		}
+		if targetWidth == 1 && targetHeight == 1 {
+			return RequestImageAttachment{}, errors.New("attachment-error: image cannot be encoded within the model-request byte budget")
+		}
+		targetWidth = max(1, int(float64(targetWidth)*0.9))
+		targetHeight = max(1, int(float64(targetHeight)*0.9))
+	}
+}
+
+// ReadImageRequest exposes request-image derivation to custom frontends and
+// provider adapters while keeping durable attachment bytes immutable.
+func (e *Engine) ReadImageRequest(ref ImageAttachmentRef, policy ImageRequestPolicy) (RequestImageAttachment, error) {
+	return e.readImageRequest(ref, policy)
 }

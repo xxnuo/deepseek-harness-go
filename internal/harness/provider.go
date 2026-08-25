@@ -52,12 +52,24 @@ func (p *EchoProvider) Complete(ctx context.Context, req ChatRequest, onDelta fu
 }
 
 type OpenAIProvider struct {
-	id, baseURL, apiKey, model string
-	client                     *http.Client
-	headers                    map[string]string
-	modelSpec                  piAIModel
-	cacheRetention             string
-	streamIdleTimeout          time.Duration
+	id, baseURL, apiKey, model            string
+	client                                *http.Client
+	headers                               map[string]string
+	modelSpec                             piAIModel
+	cacheRetention                        string
+	streamIdleTimeout                     time.Duration
+	deepSeekFiles                         *DeepSeekFileStore
+	deepSeekFileConnection                DeepSeekFileConnection
+	deepSeekFilePolicy                    DeepSeekFilePolicy
+	deepSeekRequestImagePolicy            ImageRequestPolicy
+	deepSeekModelImagePolicies            map[string]ImageRequestPolicy
+	deepSeekMaxRequestFilesBytes          int
+	deepSeekMaxInlineRequestImageBytes    int
+	deepSeekMaxImagesPerRequest           int
+	deepSeekImageOffloadByteQuantum       int
+	deepSeekInlineImageOffloadByteQuantum int
+	deepSeekImageOffloadCountQuantum      int
+	deepSeekFilesAPITimeout               time.Duration
 }
 
 type openAIWireTool struct {
@@ -118,7 +130,7 @@ func chatContentParts(message ChatMessage) []ChatContentPart {
 		parts = append(parts, ChatContentPart{Type: "text", Text: message.Content})
 	}
 	for _, image := range message.Images {
-		parts = append(parts, ChatContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data})
+		parts = append(parts, ChatContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data, FileID: image.FileID, AttachmentID: image.AttachmentID})
 	}
 	return parts
 }
@@ -167,7 +179,7 @@ func offloadRequestImages(messages []ChatMessage, maxBytes int) []ChatMessage {
 	total := 0
 	for _, message := range messages {
 		for _, part := range chatContentParts(message) {
-			if part.Type == "image" {
+			if part.Type == "image" && part.FileID == "" {
 				total += len(part.Data)
 			}
 		}
@@ -187,7 +199,7 @@ func offloadRequestImages(messages []ChatMessage, maxBytes int) []ChatMessage {
 			if total <= maxBytes {
 				break
 			}
-			if parts[partIndex].Type != "image" {
+			if parts[partIndex].Type != "image" || parts[partIndex].FileID != "" {
 				continue
 			}
 			total -= len(parts[partIndex].Data)
@@ -204,6 +216,141 @@ func offloadRequestImages(messages []ChatMessage, maxBytes int) []ChatMessage {
 		if !hadParts {
 			for range drop {
 				out[index].Content = appendOffloadedImageText(out[index].Content)
+			}
+		}
+	}
+	return out
+}
+
+// offloadDeepSeekImages applies the rc.2 count, Files-byte, and inline-byte
+// budgets to one transient request copy. Images are selected in durable
+// message order; file references use their normalized request-version bytes
+// while inline parts use their already encoded payload length.
+func offloadDeepSeekImages(messages []ChatMessage, versions map[string]RequestImageAttachment, maxFilesBytes, maxInlineBytes, maxImages, fileQuantum, inlineQuantum, countQuantum int) []ChatMessage {
+	return offloadDeepSeekImagesWithRefs(messages, versions, nil, maxFilesBytes, maxInlineBytes, maxImages, fileQuantum, inlineQuantum, countQuantum)
+}
+
+// offloadDeepSeekImagesWithRefs is the same projection with an optional
+// durable-byte map. Before request-image variants exist, rc.2 uses the durable
+// attachment size as a conservative upper bound so omitted images are never
+// read or uploaded just to discover that they would be dropped.
+func offloadDeepSeekImagesWithRefs(messages []ChatMessage, versions map[string]RequestImageAttachment, refBytes map[string]int, maxFilesBytes, maxInlineBytes, maxImages, fileQuantum, inlineQuantum, countQuantum int) []ChatMessage {
+	if maxFilesBytes <= 0 && maxInlineBytes <= 0 && maxImages <= 0 {
+		return messages
+	}
+	type occurrence struct {
+		message int
+		part    int
+		bytes   int
+		inline  int
+	}
+	occurrences := make([]occurrence, 0)
+	totalFiles, totalInline := 0, 0
+	for messageIndex := range messages {
+		parts := chatContentParts(messages[messageIndex])
+		for partIndex, part := range parts {
+			if part.Type != "image" {
+				continue
+			}
+			bytes := len(part.Data)
+			if maxFilesBytes > 0 {
+				if version, ok := versions[part.AttachmentID]; ok {
+					bytes = version.Bytes
+				} else if durableBytes, ok := refBytes[part.AttachmentID]; ok {
+					bytes = durableBytes
+					if bytes > maxFilesBytes {
+						bytes = maxFilesBytes
+					}
+				}
+			}
+			inline := 0
+			if part.FileID == "" {
+				inline = len(part.Data)
+				if version, ok := versions[part.AttachmentID]; ok {
+					inline = base64PayloadBytes(version.Bytes)
+				}
+			}
+			occurrences = append(occurrences, occurrence{message: messageIndex, part: partIndex, bytes: bytes, inline: inline})
+			totalFiles += bytes
+			totalInline += inline
+		}
+	}
+	countTarget := 0
+	if maxImages > 0 && len(occurrences) > maxImages {
+		quantum := countQuantum
+		if quantum <= 0 {
+			quantum = 1
+		}
+		countTarget = ((len(occurrences) - maxImages + quantum - 1) / quantum) * quantum
+	}
+	fileTarget := 0
+	if maxFilesBytes > 0 && totalFiles > maxFilesBytes {
+		quantum := fileQuantum
+		if quantum <= 0 {
+			quantum = 1
+		}
+		fileTarget = ((totalFiles - maxFilesBytes + quantum - 1) / quantum) * quantum
+	}
+	inlineTarget := 0
+	if maxInlineBytes > 0 && totalInline > maxInlineBytes {
+		quantum := inlineQuantum
+		if quantum <= 0 {
+			quantum = 1
+		}
+		inlineTarget = ((totalInline - maxInlineBytes + quantum - 1) / quantum) * quantum
+	}
+	if countTarget == 0 && fileTarget == 0 && inlineTarget == 0 {
+		return messages
+	}
+	remove := 0
+	removedFiles, removedInline := 0, 0
+	byteTargetMet := func(removed, target, quantum int) bool {
+		if target == 0 {
+			return true
+		}
+		if quantum <= 1 {
+			return removed >= target
+		}
+		// rc.2 advances past the boundary for quantized byte budgets. This
+		// makes 129 one-megabyte images under a 128 MiB/64 MiB policy remove
+		// 65 images, leaving 64 MiB rather than 65 MiB.
+		return removed > target
+	}
+	for _, item := range occurrences {
+		if remove >= countTarget && byteTargetMet(removedFiles, fileTarget, fileQuantum) && byteTargetMet(removedInline, inlineTarget, inlineQuantum) {
+			break
+		}
+		remove++
+		removedFiles += item.bytes
+		removedInline += item.inline
+	}
+	if remove == 0 {
+		return messages
+	}
+	selected := make(map[[2]int]bool, remove)
+	for index := 0; index < remove; index++ {
+		selected[[2]int{occurrences[index].message, occurrences[index].part}] = true
+	}
+	out := cloneChatMessages(messages)
+	for messageIndex := range out {
+		hadParts := len(out[messageIndex].Parts) > 0
+		parts := chatContentParts(out[messageIndex])
+		changed := false
+		replaced := 0
+		for partIndex := range parts {
+			if selected[[2]int{messageIndex, partIndex}] && parts[partIndex].Type == "image" {
+				parts[partIndex] = ChatContentPart{Type: "text", Text: OffloadedImageText}
+				changed = true
+				replaced++
+			}
+		}
+		if changed {
+			out[messageIndex].Parts = parts
+			out[messageIndex].Images = nil
+			if !hadParts {
+				for range replaced {
+					out[messageIndex].Content = appendOffloadedImageText(out[messageIndex].Content)
+				}
 			}
 		}
 	}
@@ -240,7 +387,7 @@ func openAIWireMessages(messages []ChatMessage, options ...openAICompletionsComp
 				out = append(out, wire)
 				for _, part := range chatContentParts(toolMessage) {
 					if part.Type == "image" {
-						images = append(images, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + part.MediaType + ";base64," + part.Data}})
+						images = append(images, openAIWireImagePart(part, compat))
 					}
 				}
 			}
@@ -262,13 +409,31 @@ func openAIWireMessages(messages []ChatMessage, options ...openAICompletionsComp
 			out = append(out, openAIWireMessage{Role: "assistant", Content: "I have processed the tool results."})
 		}
 		var content any = message.Content
-		if chatMessageHasImage(message) {
+		if len(message.Parts) > 0 {
+			parts := make([]map[string]any, 0, len(message.Parts))
+			textOnly := true
+			var text strings.Builder
+			for _, part := range message.Parts {
+				if part.Type == "text" {
+					parts = append(parts, map[string]any{"type": "text", "text": part.Text})
+					text.WriteString(part.Text)
+				} else if part.Type == "image" {
+					textOnly = false
+					parts = append(parts, openAIWireImagePart(part, compat))
+				}
+			}
+			if textOnly {
+				content = text.String()
+			} else {
+				content = parts
+			}
+		} else if chatMessageHasImage(message) {
 			parts := make([]map[string]any, 0, len(chatContentParts(message)))
 			for _, part := range chatContentParts(message) {
 				if part.Type == "text" {
 					parts = append(parts, map[string]any{"type": "text", "text": part.Text})
 				} else if part.Type == "image" {
-					parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + part.MediaType + ";base64," + part.Data}})
+					parts = append(parts, openAIWireImagePart(part, compat))
 				}
 			}
 			content = parts
@@ -341,6 +506,23 @@ type openAICompletionsCompat struct {
 	requiresThinkingAsText           bool
 	requiresReasoningContent         bool
 	sendSessionAffinityHeaders       bool
+	deepSeekFileIDs                  bool
+}
+
+func openAIWireImagePart(part ChatContentPart, compat openAICompletionsCompat) map[string]any {
+	if compat.deepSeekFileIDs && part.FileID != "" {
+		return map[string]any{"type": "file", "file_id": part.FileID}
+	}
+	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + part.MediaType + ";base64," + part.Data}}
+}
+
+func cloneChatMessages(messages []ChatMessage) []ChatMessage {
+	out := append([]ChatMessage(nil), messages...)
+	for i := range out {
+		out[i].Parts = append([]ChatContentPart(nil), out[i].Parts...)
+		out[i].Images = append([]ChatImage(nil), out[i].Images...)
+	}
+	return out
 }
 
 func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) openAICompletionsCompat {
@@ -351,7 +533,7 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	isNVIDIA := provider == "nvidia" || strings.Contains(baseURL, "integrate.api.nvidia.com")
 	isAntLing := provider == "ant-ling" || strings.Contains(baseURL, "api.ant-ling.com")
 	isCloudflare := provider == "cloudflare-ai-gateway" || strings.Contains(baseURL, "gateway.ai.cloudflare.com")
-	isDeepSeek := provider == "deepseek" || strings.Contains(baseURL, "deepseek.com")
+	isDeepSeek := provider == "deepseek" || provider == "deepseek-official" || strings.Contains(baseURL, "deepseek.com")
 	isGrok := provider == "xai" || strings.Contains(baseURL, "api.x.ai")
 	isOpenRouterDeveloperRoleModel := isOpenRouter && (strings.HasPrefix(model.ID, "anthropic/") || strings.HasPrefix(model.ID, "openai/"))
 	isNonStandard := isNVIDIA || provider == "cerebras" || strings.Contains(baseURL, "cerebras.ai") || isGrok || isTogether || strings.Contains(baseURL, "chutes.ai") || isDeepSeek || isZAI || isMoonshot || provider == "opencode" || strings.Contains(baseURL, "opencode.ai") || provider == "cloudflare-workers-ai" || strings.Contains(baseURL, "api.cloudflare.com") || isCloudflare || isAntLing
@@ -362,6 +544,7 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	compat := openAICompletionsCompat{
 		thinkingFormat: "openai", maxTokensField: "max_completion_tokens",
 		sessionAffinityFormat:      sessionAffinityFormat,
+		deepSeekFileIDs:            isDeepSeek,
 		supportsDeveloperRole:      isOpenRouterDeveloperRoleModel || !isNonStandard && !isOpenRouter,
 		supportsReasoningEffort:    !isGrok && !isZAI && !isMoonshot && !isTogether && !isCloudflare && !isNVIDIA && !isAntLing,
 		supportsLongCacheRetention: !isTogether && provider != "cloudflare-workers-ai" && !isCloudflare && !isNVIDIA && !isAntLing,
@@ -857,6 +1040,9 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	}
 	applyOpenAICompletionsSessionHeaders(hreq.Header, req.SessionID, compat, cacheRetention)
 	p.applyHeaders(hreq)
+	if p.id == "deepseek" || p.id == "deepseek-official" || strings.Contains(p.baseURL, "deepseek.com") {
+		hreq.Header.Set("User-Agent", deepSeekHarnessUserAgent)
+	}
 	hreq.Header.Set("Content-Type", "application/json")
 	if p.apiKey != "" {
 		hreq.Header.Set("Authorization", "Bearer "+p.apiKey)

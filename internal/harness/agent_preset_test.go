@@ -126,9 +126,8 @@ func TestSessionCreateRPCPreservesOmittedPresetDuringBlankReuse(t *testing.T) {
 	}
 
 	reused, rpcErr := dispatchTestRPC(t, e, "session.create", map[string]any{
-		"workspaceId":         workspace.WorkspaceID,
-		"sessionId":           sessionID,
-		"reuseWorkspaceBlank": true,
+		"workspaceId": workspace.WorkspaceID,
+		"sessionId":   sessionID,
 	})
 	if rpcErr != nil || reused["agentPreset"] != "minimal" {
 		t.Fatalf("preset-less reuse = %#v, %#v", reused, rpcErr)

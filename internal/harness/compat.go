@@ -3,9 +3,11 @@ package harness
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -291,18 +295,30 @@ func updateSettingsYAMLLocked(e *Engine, ns string, apply func(map[string]any) (
 }
 
 const (
-	deepSeekDefaultBaseURL      = "https://api.deepseek.com"
-	deepSeekDefaultContext      = 1000000
-	deepSeekDefaultMaxTokens    = 256000
-	deepSeekDefaultStreamIdleMs = 300000
-	deepSeekDefaultImageBytes   = DefaultMaxRequestImageBytes
+	deepSeekDefaultBaseURL                    = "https://api.deepseek.com"
+	deepSeekDefaultContext                    = 1000000
+	deepSeekDefaultMaxTokens                  = 256000
+	deepSeekDefaultStreamIdleMs               = 300000
+	deepSeekDefaultMaxRequestFilesBytes       = 128 << 20
+	deepSeekDefaultMaxInlineRequestImageBytes = DefaultMaxRequestImageBytes
+	deepSeekDefaultMaxImagesPerRequest        = 600
+	deepSeekDefaultRequestImagePixels         = 640000
+	deepSeekDefaultLowImagePixels             = 512 * 512
+	deepSeekDefaultRequestImageMaxBytes       = 1 << 20
+	deepSeekDefaultImageOffloadByteQuantum    = 64 << 20
+	deepSeekDefaultInlineOffloadByteQuantum   = 10 << 20
+	deepSeekDefaultImageOffloadCountQuantum   = 20
+	deepSeekDefaultFilesAPITimeoutMs          = 60000
+	deepSeekDefaultFileExpirySeconds          = DeepSeekFileExpirySeconds
+	deepSeekDefaultFileRefreshMarginSeconds   = DeepSeekFileRefreshSeconds
+	deepSeekDefaultFileQuotaCleanupBatch      = DeepSeekQuotaCleanupBatch
 )
 
 func deepSeekDefaultModels() []any {
 	return []any{
 		map[string]any{"id": "deepseek-v4-flash", "name": "DeepSeek-V4-Flash", "contextWindow": deepSeekDefaultContext},
 		map[string]any{"id": "deepseek-v4-pro", "name": "DeepSeek-V4-Pro", "contextWindow": deepSeekDefaultContext},
-		map[string]any{"id": "deepseek-v4-flash-vision-exp", "name": "DeepSeek-V4-Flash-Vision-Exp", "contextWindow": deepSeekDefaultContext, "inputModalities": []any{"text", "image"}},
+		map[string]any{"id": "deepseek-v4-flash-vision-exp", "name": "DeepSeek-V4-Flash-Vision-Exp", "contextWindow": deepSeekDefaultContext, "inputModalities": []any{"text", "image"}, "imagePixelBudget": deepSeekDefaultRequestImagePixels, "imageMaxBytes": deepSeekDefaultRequestImageMaxBytes},
 	}
 }
 
@@ -315,13 +331,22 @@ func deepSeekBaseSettings(e *Engine) map[string]any {
 		baseURL = deepSeekDefaultBaseURL
 	}
 	return map[string]any{
-		"apiKeyEnv":            "DEEPSEEK_API_KEY",
-		"baseURL":              baseURL,
-		"maxTokens":            deepSeekDefaultMaxTokens,
-		"defaultContextWindow": deepSeekDefaultContext,
-		"models":               deepSeekDefaultModels(),
-		"streamIdleTimeoutMs":  deepSeekDefaultStreamIdleMs,
-		"maxRequestImageBytes": deepSeekDefaultImageBytes,
+		"apiKeyEnv":                     "DEEPSEEK_API_KEY",
+		"baseURL":                       baseURL,
+		"maxTokens":                     deepSeekDefaultMaxTokens,
+		"defaultContextWindow":          deepSeekDefaultContext,
+		"models":                        deepSeekDefaultModels(),
+		"streamIdleTimeoutMs":           deepSeekDefaultStreamIdleMs,
+		"maxRequestFilesBytes":          deepSeekDefaultMaxRequestFilesBytes,
+		"maxInlineRequestImageBytes":    deepSeekDefaultMaxInlineRequestImageBytes,
+		"maxImagesPerRequest":           deepSeekDefaultMaxImagesPerRequest,
+		"imageOffloadByteQuantum":       deepSeekDefaultImageOffloadByteQuantum,
+		"inlineImageOffloadByteQuantum": deepSeekDefaultInlineOffloadByteQuantum,
+		"imageOffloadCountQuantum":      deepSeekDefaultImageOffloadCountQuantum,
+		"filesApiTimeoutMs":             deepSeekDefaultFilesAPITimeoutMs,
+		"fileExpiresAfterSeconds":       deepSeekDefaultFileExpirySeconds,
+		"fileRefreshMarginSeconds":      deepSeekDefaultFileRefreshMarginSeconds,
+		"fileQuotaCleanupBatch":         deepSeekDefaultFileQuotaCleanupBatch,
 	}
 }
 
@@ -349,15 +374,30 @@ func deepSeekSettingsSchema() map[string]any {
 			"30": map[string]any{"type": "string", "meta": map[string]any{}},
 			"33": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1}},
 			"36": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1}},
-			"37": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"id": 28, "name": 29, "description": 30, "contextWindow": 33, "maxTokens": 36, "inputModalities": 47}},
+			"37": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"id": 28, "name": 29, "description": 30, "contextWindow": 33, "maxTokens": 36, "inputModalities": 47, "imagePixelBudget": 59, "imageMaxBytes": 60, "imageDetail": 61}},
 			"39": map[string]any{"type": "array", "meta": map[string]any{"default": deepSeekDefaultModels()}, "inner": 37},
 			"42": map[string]any{"type": "number", "meta": map[string]any{"min": 1, "default": deepSeekDefaultStreamIdleMs}},
-			"43": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"apiKeyEnv": 2, "baseURL": 3, "thinking": 4, "reasoningEffort": 9, "maxTokens": 22, "defaultContextWindow": 26, "models": 39, "streamIdleTimeoutMs": 42, "maxRequestImageBytes": 48}},
+			"43": map[string]any{"type": "object", "meta": map[string]any{"default": map[string]any{}}, "dict": map[string]any{"apiKeyEnv": 2, "baseURL": 3, "thinking": 4, "reasoningEffort": 9, "maxTokens": 22, "defaultContextWindow": 26, "models": 39, "streamIdleTimeoutMs": 42, "maxRequestFilesBytes": 49, "maxInlineRequestImageBytes": 50, "maxImagesPerRequest": 51, "imageOffloadByteQuantum": 52, "inlineImageOffloadByteQuantum": 53, "imageOffloadCountQuantum": 54, "filesApiTimeoutMs": 55, "fileExpiresAfterSeconds": 56, "fileRefreshMarginSeconds": 57, "fileQuotaCleanupBatch": 58}},
 			"44": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "text"},
 			"45": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "image"},
 			"46": map[string]any{"type": "union", "meta": map[string]any{}, "list": []any{44, 45}},
 			"47": map[string]any{"type": "array", "meta": map[string]any{"default": []any{"text"}, "min": 1}, "inner": 46},
-			"48": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultImageBytes}},
+			"48": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultMaxInlineRequestImageBytes}},
+			"49": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultMaxRequestFilesBytes}},
+			"50": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultMaxInlineRequestImageBytes}},
+			"51": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultMaxImagesPerRequest}},
+			"52": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultImageOffloadByteQuantum}},
+			"53": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultInlineOffloadByteQuantum}},
+			"54": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultImageOffloadCountQuantum}},
+			"55": map[string]any{"type": "number", "meta": map[string]any{"min": 1, "default": deepSeekDefaultFilesAPITimeoutMs}},
+			"56": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": DeepSeekMinFileExpirySeconds, "max": DeepSeekMaxFileExpirySeconds, "default": deepSeekDefaultFileExpirySeconds}},
+			"57": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 0, "default": deepSeekDefaultFileRefreshMarginSeconds}},
+			"58": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "max": 1000, "default": deepSeekDefaultFileQuotaCleanupBatch}},
+			"59": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultRequestImagePixels}},
+			"60": map[string]any{"type": "number", "meta": map[string]any{"step": 1, "min": 1, "default": deepSeekDefaultRequestImageMaxBytes}},
+			"61": map[string]any{"type": "union", "meta": map[string]any{}, "list": []any{62, 63}},
+			"62": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "auto"},
+			"63": map[string]any{"type": "const", "meta": map[string]any{"required": true}, "value": "low"},
 		},
 	}
 }
@@ -367,7 +407,20 @@ func deepSeekEffectiveSettings(e *Engine) map[string]any {
 	e.mu.RLock()
 	user := cloneSettingsValue(e.settings["llm-deepseek"])
 	e.mu.RUnlock()
-	return mergeSettings(base, user)
+	merged := mergeSettings(base, user)
+	// Keep old hand-authored settings readable during the rc.1 -> rc.2
+	// transition; the rc.2 schema no longer exposes this name.
+	if _, hasNew := user["maxInlineRequestImageBytes"]; !hasNew {
+		if legacy, hasLegacy := user["maxRequestImageBytes"]; hasLegacy {
+			merged["maxInlineRequestImageBytes"] = legacy
+			if _, hasQuantum := user["inlineImageOffloadByteQuantum"]; !hasQuantum {
+				// rc.1 removed the oldest inline image one byte-budget crossing at
+				// a time; preserve that behavior for legacy settings.
+				merged["inlineImageOffloadByteQuantum"] = 1
+			}
+		}
+	}
+	return merged
 }
 
 func stringSetting(value any) string {
@@ -449,12 +502,47 @@ func deepSeekCatalog(value any) []ModelInfo {
 	return out
 }
 
+func deepSeekImagePolicies(value map[string]any) map[string]ImageRequestPolicy {
+	policies := make(map[string]ImageRequestPolicy)
+	rows, ok := anySlice(value["models"])
+	if !ok {
+		rows, _ = anySlice(deepSeekDefaultModels())
+	}
+	for _, raw := range rows {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := stringSetting(model["id"])
+		if id == "" {
+			continue
+		}
+		pixels := deepSeekDefaultRequestImagePixels
+		if stringSetting(model["imageDetail"]) == "low" {
+			pixels = deepSeekDefaultLowImagePixels
+		}
+		pixels = positiveIntSetting(model["imagePixelBudget"], pixels)
+		bytes := positiveIntSetting(model["imageMaxBytes"], deepSeekDefaultRequestImageMaxBytes)
+		policies[id] = ImageRequestPolicy{MaxPixels: pixels, MaxBytes: bytes}
+	}
+	return policies
+}
+
 func validateDeepSeekSettings(value map[string]any) error {
-	for _, field := range []string{"maxTokens", "defaultContextWindow", "maxRequestImageBytes"} {
-		if raw, exists := value[field]; exists {
-			if parsed, ok := piAIPositiveInteger(raw); !ok || parsed <= 0 {
-				return fmt.Errorf("llm-deepseek.%s must be a positive integer", field)
-			}
+	positive := func(field string, fallback int) (int, error) {
+		raw, exists := value[field]
+		if !exists {
+			return fallback, nil
+		}
+		parsed, ok := piAIPositiveInteger(raw)
+		if !ok {
+			return 0, fmt.Errorf("llm-deepseek.%s must be a positive safe integer", field)
+		}
+		return parsed, nil
+	}
+	for _, field := range []string{"maxTokens", "defaultContextWindow"} {
+		if _, err := positive(field, 1); err != nil {
+			return err
 		}
 	}
 	if raw, exists := value["streamIdleTimeoutMs"]; exists {
@@ -462,6 +550,70 @@ func validateDeepSeekSettings(value map[string]any) error {
 			return fmt.Errorf("llm-deepseek.streamIdleTimeoutMs must be a positive finite number no greater than %d", piAIMaxTimerMillis)
 		}
 	}
+	if raw, exists := value["filesApiTimeoutMs"]; exists {
+		if _, ok := positiveFiniteMilliseconds(raw); !ok {
+			return fmt.Errorf("llm-deepseek.filesApiTimeoutMs must be a positive finite number no greater than %d", piAIMaxTimerMillis)
+		}
+	}
+	maxFiles, err := positive("maxRequestFilesBytes", deepSeekDefaultMaxRequestFilesBytes)
+	if err != nil {
+		return err
+	}
+	maxInline, err := positive("maxInlineRequestImageBytes", deepSeekDefaultMaxInlineRequestImageBytes)
+	if err != nil {
+		return err
+	}
+	maxImages, err := positive("maxImagesPerRequest", deepSeekDefaultMaxImagesPerRequest)
+	if err != nil {
+		return err
+	}
+	fileQuantum, err := positive("imageOffloadByteQuantum", deepSeekDefaultImageOffloadByteQuantum)
+	if err != nil {
+		return err
+	}
+	if fileQuantum > maxFiles {
+		return errors.New("llm-deepseek.imageOffloadByteQuantum must not exceed maxRequestFilesBytes")
+	}
+	inlineQuantum, err := positive("inlineImageOffloadByteQuantum", deepSeekDefaultInlineOffloadByteQuantum)
+	if err != nil {
+		return err
+	}
+	if inlineQuantum > maxInline {
+		return errors.New("llm-deepseek.inlineImageOffloadByteQuantum must not exceed maxInlineRequestImageBytes")
+	}
+	countQuantum, err := positive("imageOffloadCountQuantum", deepSeekDefaultImageOffloadCountQuantum)
+	if err != nil {
+		return err
+	}
+	if countQuantum > maxImages {
+		return errors.New("llm-deepseek.imageOffloadCountQuantum must not exceed maxImagesPerRequest")
+	}
+	expiry, err := positive("fileExpiresAfterSeconds", deepSeekDefaultFileExpirySeconds)
+	if err != nil {
+		return err
+	}
+	if expiry < DeepSeekMinFileExpirySeconds || expiry > DeepSeekMaxFileExpirySeconds {
+		return fmt.Errorf("llm-deepseek.fileExpiresAfterSeconds must be an integer from %d through %d", DeepSeekMinFileExpirySeconds, DeepSeekMaxFileExpirySeconds)
+	}
+	refresh := deepSeekDefaultFileRefreshMarginSeconds
+	if raw, exists := value["fileRefreshMarginSeconds"]; exists {
+		var ok bool
+		refresh, ok = nonNegativeInteger(raw)
+		if !ok {
+			return errors.New("llm-deepseek.fileRefreshMarginSeconds must be a non-negative integer")
+		}
+	}
+	if refresh >= expiry {
+		return errors.New("llm-deepseek.fileRefreshMarginSeconds must be a non-negative integer below fileExpiresAfterSeconds")
+	}
+	quota, err := positive("fileQuotaCleanupBatch", deepSeekDefaultFileQuotaCleanupBatch)
+	if err != nil {
+		return err
+	}
+	if quota > 1000 {
+		return errors.New("llm-deepseek.fileQuotaCleanupBatch must be an integer from 1 through 1000")
+	}
+
 	rawModels, exists := value["models"]
 	if !exists {
 		return nil
@@ -491,24 +643,45 @@ func validateDeepSeekSettings(value map[string]any) error {
 				}
 			}
 		}
-		rawModalities, exists := model["inputModalities"]
-		if !exists {
-			continue
-		}
-		modalities, ok := anySlice(rawModalities)
-		if !ok || len(modalities) == 0 {
-			return fmt.Errorf("llm-deepseek model %q inputModalities must be a non-empty array", id)
+		rawModalities, hasModalities := model["inputModalities"]
+		modalities := []any{"text"}
+		if hasModalities {
+			parsed, valid := anySlice(rawModalities)
+			if !valid || len(parsed) == 0 {
+				return fmt.Errorf("llm-deepseek model %q inputModalities must be a non-empty array", id)
+			}
+			modalities = parsed
 		}
 		seenModalities := map[string]bool{}
+		hasImage := false
 		for _, raw := range modalities {
-			modality, ok := raw.(string)
-			if !ok || modality != "text" && modality != "image" {
+			modality, valid := raw.(string)
+			if !valid || modality != "text" && modality != "image" {
 				return fmt.Errorf("llm-deepseek model %q inputModalities must contain only text and image", id)
 			}
 			if seenModalities[modality] {
 				return fmt.Errorf("llm-deepseek model %q inputModalities must not contain duplicates", id)
 			}
 			seenModalities[modality] = true
+			hasImage = hasImage || modality == "image"
+		}
+		_, hasPixelBudget := model["imagePixelBudget"]
+		_, hasMaxBytes := model["imageMaxBytes"]
+		_, hasImageDetail := model["imageDetail"]
+		if !hasImage && (hasPixelBudget || hasMaxBytes || hasImageDetail) {
+			return fmt.Errorf("llm-deepseek text-only catalog model %q cannot declare image request limits", id)
+		}
+		for _, field := range []string{"imagePixelBudget", "imageMaxBytes"} {
+			if raw, exists := model[field]; exists {
+				if parsed, valid := piAIPositiveInteger(raw); !valid || parsed <= 0 {
+					return fmt.Errorf("llm-deepseek model %q %s must be a positive safe integer", id, field)
+				}
+			}
+		}
+		if raw, exists := model["imageDetail"]; exists {
+			if detail, valid := raw.(string); !valid || detail != "auto" && detail != "low" {
+				return fmt.Errorf("llm-deepseek model %q imageDetail must be auto or low", id)
+			}
 		}
 	}
 	return nil
@@ -521,6 +694,16 @@ type managedDeepSeekProvider struct{ engine *Engine }
 
 func (p *managedDeepSeekProvider) ID() string   { return "deepseek-official" }
 func (p *managedDeepSeekProvider) Name() string { return "DeepSeek" }
+
+func (e *Engine) deepSeekFileStoreFor(cfg Config) *DeepSeekFileStore {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.deepSeekFileStore == nil {
+		indexPath := filepath.Join(cfg.DataDir, "llm-deepseek", "files-v3.json")
+		e.deepSeekFileStore = NewDeepSeekFileStore(NewDeepSeekUploadIndex(indexPath), &http.Client{})
+	}
+	return e.deepSeekFileStore
+}
 
 func (p *managedDeepSeekProvider) snapshot(settings map[string]any) (*OpenAIProvider, []ModelInfo, error) {
 	if err := validateDeepSeekSettings(settings); err != nil {
@@ -549,6 +732,26 @@ func (p *managedDeepSeekProvider) snapshot(settings map[string]any) (*OpenAIProv
 		model = "deepseek-chat"
 	}
 	provider := NewOpenAIProvider("deepseek-official", baseURL, apiKey, model)
+	provider.deepSeekFiles = p.engine.deepSeekFileStoreFor(cfg)
+	provider.deepSeekFileConnection = DeepSeekFileConnection{BaseURL: baseURL, APIKey: apiKey}
+	provider.deepSeekFilePolicy = DeepSeekFilePolicy{ExpiresAfterSeconds: DeepSeekFileExpirySeconds, RefreshMargin: DeepSeekFileRefreshSeconds * time.Second, QuotaCleanupBatch: DeepSeekQuotaCleanupBatch, APITimeout: time.Minute}
+	provider.deepSeekMaxRequestFilesBytes = positiveIntSetting(settings["maxRequestFilesBytes"], deepSeekDefaultMaxRequestFilesBytes)
+	provider.deepSeekMaxInlineRequestImageBytes = positiveIntSetting(settings["maxInlineRequestImageBytes"], deepSeekDefaultMaxInlineRequestImageBytes)
+	provider.deepSeekMaxImagesPerRequest = positiveIntSetting(settings["maxImagesPerRequest"], deepSeekDefaultMaxImagesPerRequest)
+	provider.deepSeekImageOffloadByteQuantum = positiveIntSetting(settings["imageOffloadByteQuantum"], deepSeekDefaultImageOffloadByteQuantum)
+	provider.deepSeekInlineImageOffloadByteQuantum = positiveIntSetting(settings["inlineImageOffloadByteQuantum"], deepSeekDefaultInlineOffloadByteQuantum)
+	provider.deepSeekImageOffloadCountQuantum = positiveIntSetting(settings["imageOffloadCountQuantum"], deepSeekDefaultImageOffloadCountQuantum)
+	if timeout, ok := positiveFiniteMilliseconds(settings["filesApiTimeoutMs"]); ok {
+		provider.deepSeekFilesAPITimeout = millisecondsDuration(timeout)
+		provider.deepSeekFilePolicy.APITimeout = provider.deepSeekFilesAPITimeout
+	}
+	provider.deepSeekFilePolicy.ExpiresAfterSeconds = positiveIntSetting(settings["fileExpiresAfterSeconds"], deepSeekDefaultFileExpirySeconds)
+	provider.deepSeekFilePolicy.QuotaCleanupBatch = positiveIntSetting(settings["fileQuotaCleanupBatch"], deepSeekDefaultFileQuotaCleanupBatch)
+	if raw, exists := settings["fileRefreshMarginSeconds"]; exists {
+		provider.deepSeekFilePolicy.RefreshMargin = time.Duration(positiveIntSetting(raw, 0)) * time.Second
+	}
+	provider.deepSeekModelImagePolicies = deepSeekImagePolicies(settings)
+	provider.deepSeekRequestImagePolicy = ImageRequestPolicy{MaxPixels: deepSeekDefaultRequestImagePixels, MaxBytes: deepSeekDefaultRequestImageMaxBytes}
 	idleMillis, ok := positiveFiniteMilliseconds(settings["streamIdleTimeoutMs"])
 	if !ok {
 		idleMillis = deepSeekDefaultStreamIdleMs
@@ -590,13 +793,13 @@ func deepSeekImageMessages(messages []ChatMessage) ([]ChatMessage, error) {
 			if chatMessageHasImage(tool) {
 				for _, part := range chatContentParts(tool) {
 					if part.Type == "image" {
-						pendingToolImages = append(pendingToolImages, ChatImage{MediaType: part.MediaType, Data: part.Data})
+						pendingToolImages = append(pendingToolImages, ChatImage{MediaType: part.MediaType, Data: part.Data, FileID: part.FileID, AttachmentID: part.AttachmentID})
 					}
 				}
 				tool.Images = nil
 				tool.Parts = nil
 				if tool.Content == "" {
-					tool.Content = "(see attached image)"
+					tool.Content = "(no output)"
 				}
 			}
 			out = append(out, tool)
@@ -643,7 +846,7 @@ func (p *managedDeepSeekProvider) Complete(ctx context.Context, req ChatRequest,
 			return Completion{}, &ProviderError{Code: "UNSUPPORTED_CONTENT", Message: fmt.Sprintf("DeepSeek model %q does not accept image input", req.Model)}
 		}
 	}
-	req.Messages = offloadRequestImages(req.Messages, positiveIntSetting(settings["maxRequestImageBytes"], deepSeekDefaultImageBytes))
+	durableImageRefs := collectDeepSeekImageRefs(req.Messages)
 	messages, err := deepSeekImageMessages(req.Messages)
 	if err != nil {
 		return Completion{}, err
@@ -676,5 +879,438 @@ func (p *managedDeepSeekProvider) Complete(ctx context.Context, req ChatRequest,
 	if req.MaxTokens <= 0 {
 		req.MaxTokens = positiveIntSetting(settings["maxTokens"], deepSeekDefaultMaxTokens)
 	}
+	requestImagePolicy := snapshot.deepSeekRequestImagePolicy
+	if modelPolicy, ok := snapshot.deepSeekModelImagePolicies[req.Model]; ok {
+		requestImagePolicy = modelPolicy
+	}
+	if !req.deepSeekForceInline && snapshot.deepSeekFiles != nil {
+		// Apply the raw durable-byte/count projection before reading attachments.
+		// The request-version byte cap is usually smaller than the durable cap, so
+		// this conservative pass is what keeps omitted history out of the image
+		// transform and Files API paths entirely.
+		refBytes := make(map[string]int, len(durableImageRefs))
+		refByID := make(map[string]ImageAttachmentRef, len(durableImageRefs))
+		for _, ref := range durableImageRefs {
+			conservativeBytes := ref.Bytes
+			if requestImagePolicy.MaxBytes > 0 && conservativeBytes > requestImagePolicy.MaxBytes {
+				conservativeBytes = requestImagePolicy.MaxBytes
+			}
+			refBytes[ref.AttachmentID] = conservativeBytes
+			refByID[ref.AttachmentID] = ref
+		}
+		req.Messages = offloadDeepSeekImagesWithRefs(req.Messages, nil, refBytes,
+			snapshot.deepSeekMaxRequestFilesBytes, 0, snapshot.deepSeekMaxImagesPerRequest,
+			snapshot.deepSeekImageOffloadByteQuantum, 0, snapshot.deepSeekImageOffloadCountQuantum)
+		retainedIDs := deepSeekRetainedImageIDs(req.Messages)
+		versions := map[string]RequestImageAttachment{}
+		for attachmentID, ref := range refByID {
+			if !retainedIDs[attachmentID] {
+				continue
+			}
+			if _, exists := versions[ref.AttachmentID]; exists {
+				continue
+			}
+			version, requestErr := p.engine.ReadImageRequest(ref, requestImagePolicy)
+			if requestErr != nil {
+				return Completion{}, requestErr
+			}
+			versions[ref.AttachmentID] = version
+		}
+		if len(versions) > 0 {
+			fileMessages := cloneChatMessages(req.Messages)
+			resolvedFiles := make(map[string]string, len(versions))
+			fileResolutionFailed := false
+		resolveFiles:
+			for index := range fileMessages {
+				for partIndex := range fileMessages[index].Parts {
+					part := &fileMessages[index].Parts[partIndex]
+					version, exists := versions[part.AttachmentID]
+					if !exists || part.Type != "image" {
+						continue
+					}
+					fileID, alreadyResolved := resolvedFiles[part.AttachmentID]
+					if alreadyResolved {
+						part.FileID, part.Data = fileID, ""
+						continue
+					}
+					file, fileErr := snapshot.deepSeekFiles.EnsureUploaded(ctx, version, snapshot.deepSeekFileConnection, snapshot.deepSeekFilePolicy)
+					if fileErr != nil {
+						if ctx.Err() != nil {
+							return Completion{}, ctx.Err()
+						}
+						fileResolutionFailed = true
+						break resolveFiles
+					}
+					resolvedFiles[part.AttachmentID] = file.Record.FileID
+					part.FileID, part.Data = file.Record.FileID, ""
+				}
+				for imageIndex := range fileMessages[index].Images {
+					image := &fileMessages[index].Images[imageIndex]
+					if image.AttachmentID == "" {
+						continue
+					}
+					if _, exists := versions[image.AttachmentID]; !exists {
+						continue
+					}
+					if fileID, exists := resolvedFiles[image.AttachmentID]; exists {
+						image.FileID = fileID
+						image.Data = ""
+						continue
+					}
+					version := versions[image.AttachmentID]
+					file, fileErr := snapshot.deepSeekFiles.EnsureUploaded(ctx, version, snapshot.deepSeekFileConnection, snapshot.deepSeekFilePolicy)
+					if fileErr == nil {
+						resolvedFiles[image.AttachmentID] = file.Record.FileID
+						image.FileID = file.Record.FileID
+						image.Data = ""
+					} else {
+						if ctx.Err() != nil {
+							return Completion{}, ctx.Err()
+						}
+						fileResolutionFailed = true
+						break resolveFiles
+					}
+				}
+			}
+			if !fileResolutionFailed {
+				req.Messages = fileMessages
+			} else {
+				// A failed Files API resolution switches the entire request to
+				// the base64 representation. Restore every retained image from
+				// its verified request version so the fallback cannot send the
+				// original hydrated bytes or a partially resolved file id. Do not
+				// retain a Files-byte budget here: rc.2 applies only the inline
+				// budget after this fallback.
+				req.Messages = deepSeekRestoreInlineMessages(req.Messages, versions)
+				req.deepSeekForceInline = true
+			}
+			req.deepSeekFileVersions = versions
+		}
+	}
+	// Apply count and raw/inline byte budgets after file resolution. File IDs
+	// remain represented in the request but their bytes are counted against the
+	// Files budget; only inline parts count against the fallback base64 budget.
+	maxRequestFilesBytes := snapshot.deepSeekMaxRequestFilesBytes
+	if req.deepSeekForceInline {
+		maxRequestFilesBytes = 0
+	}
+	req.Messages = offloadDeepSeekImages(req.Messages, req.deepSeekFileVersions,
+		maxRequestFilesBytes, snapshot.deepSeekMaxInlineRequestImageBytes,
+		snapshot.deepSeekMaxImagesPerRequest, snapshot.deepSeekImageOffloadByteQuantum,
+		snapshot.deepSeekInlineImageOffloadByteQuantum, snapshot.deepSeekImageOffloadCountQuantum)
+	req.Messages = deepSeekAddImageHandles(req.Messages, req.deepSeekFileVersions)
+	completion, completeErr := snapshot.Complete(ctx, req, onDelta)
+	if completeErr == nil || len(req.deepSeekFileVersions) == 0 || len(deepSeekMessageFileIDs(req.Messages)) == 0 || !deepSeekFileReferenceFailure(completeErr) {
+		return completion, completeErr
+	}
+	// One precise stale-file recovery: invalidate only named mappings, then
+	// resolve those variants once more. If any replacement fails, retry the
+	// whole request inline so one request never mixes representations.
+	originalFileIDs := deepSeekMessageFileIDs(req.Messages)
+	staleIDs := deepSeekStaleFileIDs(completeErr, req.Messages)
+	for _, message := range req.Messages {
+		for _, part := range chatContentParts(message) {
+			if part.FileID == "" || !staleIDs[part.FileID] {
+				continue
+			}
+			if version, ok := req.deepSeekFileVersions[part.AttachmentID]; ok {
+				_ = snapshot.deepSeekFiles.Invalidate(version, part.FileID, snapshot.deepSeekFileConnection)
+			}
+		}
+	}
+	retryMessages := deepSeekRestoreInlineMessages(req.Messages, req.deepSeekFileVersions)
+	deepSeekApplyFileIDs(retryMessages, originalFileIDs, staleIDs)
+	needsInlineFallback := false
+	resolvedRetry := make(map[string]string)
+	resolveRetryFile := func(attachmentID string) (string, bool, error) {
+		if attachmentID == "" || !staleIDs[originalFileIDs[attachmentID]] || originalFileIDs[attachmentID] == "" {
+			return "", false, nil
+		}
+		version, ok := req.deepSeekFileVersions[attachmentID]
+		if !ok {
+			return "", false, nil
+		}
+		if fileID, exists := resolvedRetry[attachmentID]; exists {
+			return fileID, true, nil
+		}
+		file, fileErr := snapshot.deepSeekFiles.EnsureUploaded(ctx, version, snapshot.deepSeekFileConnection, snapshot.deepSeekFilePolicy)
+		if fileErr != nil {
+			if ctx.Err() != nil {
+				return "", false, ctx.Err()
+			}
+			needsInlineFallback = true
+			return "", false, nil
+		}
+		resolvedRetry[attachmentID] = file.Record.FileID
+		return file.Record.FileID, true, nil
+	}
+	for index := range retryMessages {
+		for partIndex := range retryMessages[index].Parts {
+			part := &retryMessages[index].Parts[partIndex]
+			if part.Type != "image" {
+				continue
+			}
+			fileID, replace, resolveErr := resolveRetryFile(part.AttachmentID)
+			if resolveErr != nil {
+				return Completion{}, resolveErr
+			}
+			if replace {
+				part.FileID, part.Data = fileID, ""
+			}
+		}
+		if needsInlineFallback {
+			break
+		}
+		for imageIndex := range retryMessages[index].Images {
+			image := &retryMessages[index].Images[imageIndex]
+			fileID, replace, resolveErr := resolveRetryFile(image.AttachmentID)
+			if resolveErr != nil {
+				return Completion{}, resolveErr
+			}
+			if replace {
+				image.FileID, image.Data = fileID, ""
+			}
+		}
+		if needsInlineFallback {
+			break
+		}
+	}
+	if needsInlineFallback {
+		retryMessages = deepSeekRestoreInlineMessages(req.Messages, req.deepSeekFileVersions)
+		req.deepSeekForceInline = true
+	} else {
+		deepSeekApplyFileIDs(retryMessages, resolvedRetry, nil)
+	}
+	retryFilesBytes := snapshot.deepSeekMaxRequestFilesBytes
+	if req.deepSeekForceInline {
+		retryFilesBytes = 0
+	}
+	retryMessages = offloadDeepSeekImages(retryMessages, req.deepSeekFileVersions,
+		retryFilesBytes, snapshot.deepSeekMaxInlineRequestImageBytes,
+		snapshot.deepSeekMaxImagesPerRequest, snapshot.deepSeekImageOffloadByteQuantum,
+		snapshot.deepSeekInlineImageOffloadByteQuantum, snapshot.deepSeekImageOffloadCountQuantum)
+	req.Messages = deepSeekAddImageHandles(retryMessages, req.deepSeekFileVersions)
 	return snapshot.Complete(ctx, req, onDelta)
+}
+
+func collectDeepSeekImageRefs(messages []ChatMessage) []ImageAttachmentRef {
+	refs := make([]ImageAttachmentRef, 0)
+	seen := map[string]bool{}
+	var walk func([]ContentBlock)
+	walk = func(blocks []ContentBlock) {
+		for _, block := range blocks {
+			if block.Type == "image" && block.Attachment != nil && !seen[block.Attachment.AttachmentID] {
+				seen[block.Attachment.AttachmentID] = true
+				refs = append(refs, *block.Attachment)
+			}
+			walk(block.Content)
+		}
+	}
+	for _, message := range messages {
+		walk(message.Blocks)
+	}
+	return refs
+}
+
+func findDeepSeekImagePart(parts []ChatContentPart, attachmentID string) int {
+	for index, part := range parts {
+		if part.Type == "image" && part.AttachmentID == attachmentID {
+			return index
+		}
+	}
+	return -1
+}
+
+func deepSeekRetainedImageIDs(messages []ChatMessage) map[string]bool {
+	retained := make(map[string]bool)
+	for _, message := range messages {
+		for _, part := range chatContentParts(message) {
+			if part.Type == "image" && part.AttachmentID != "" {
+				retained[part.AttachmentID] = true
+			}
+		}
+	}
+	return retained
+}
+
+func deepSeekAddImageHandles(messages []ChatMessage, versions map[string]RequestImageAttachment) []ChatMessage {
+	if len(versions) == 0 {
+		return messages
+	}
+	out := cloneChatMessages(messages)
+	for index := range out {
+		parts := chatContentParts(out[index])
+		changed := false
+		for partIndex := 0; partIndex < len(parts); partIndex++ {
+			part := parts[partIndex]
+			if part.Type != "image" {
+				continue
+			}
+			version, ok := versions[part.AttachmentID]
+			if !ok {
+				continue
+			}
+			handle := fmt.Sprintf("Image %s; request image %dx%dpx.", version.Attachment.AttachmentID, version.Width, version.Height)
+			if partIndex > 0 {
+				handle = "\n" + handle
+			}
+			if partIndex > 0 && parts[partIndex-1].Type == "text" && parts[partIndex-1].Text == handle {
+				continue
+			}
+			parts = append(parts[:partIndex], append([]ChatContentPart{{Type: "text", Text: handle}}, parts[partIndex:]...)...)
+			partIndex++
+			changed = true
+		}
+		if changed {
+			out[index].Parts = parts
+			out[index].Images = nil
+		}
+	}
+	return out
+}
+
+func deepSeekMessageFileIDs(messages []ChatMessage) map[string]string {
+	ids := make(map[string]string)
+	for _, message := range messages {
+		for _, part := range chatContentParts(message) {
+			if part.Type == "image" && part.AttachmentID != "" && part.FileID != "" {
+				ids[part.AttachmentID] = part.FileID
+			}
+		}
+	}
+	return ids
+}
+
+// deepSeekApplyFileIDs restores the one-representation invariant after a
+// stale-file retry. staleIDs nil means every supplied mapping is reusable.
+func deepSeekApplyFileIDs(messages []ChatMessage, ids map[string]string, staleIDs map[string]bool) {
+	for index := range messages {
+		for partIndex := range messages[index].Parts {
+			part := &messages[index].Parts[partIndex]
+			if part.Type != "image" || part.AttachmentID == "" {
+				continue
+			}
+			fileID := ids[part.AttachmentID]
+			if fileID == "" || staleIDs != nil && staleIDs[fileID] {
+				continue
+			}
+			part.FileID, part.Data = fileID, ""
+		}
+		for imageIndex := range messages[index].Images {
+			image := &messages[index].Images[imageIndex]
+			fileID := ids[image.AttachmentID]
+			if fileID == "" || staleIDs != nil && staleIDs[fileID] {
+				continue
+			}
+			image.FileID, image.Data = fileID, ""
+		}
+	}
+}
+
+func deepSeekRestoreInlineMessages(messages []ChatMessage, versions map[string]RequestImageAttachment) []ChatMessage {
+	out := cloneChatMessages(messages)
+	for index := range out {
+		for partIndex := range out[index].Parts {
+			part := &out[index].Parts[partIndex]
+			if version, ok := versions[part.AttachmentID]; ok && part.Type == "image" {
+				part.FileID = ""
+				part.Data = base64.StdEncoding.EncodeToString(version.Data)
+				part.MediaType = version.MediaType
+			}
+		}
+		for imageIndex := range out[index].Images {
+			image := &out[index].Images[imageIndex]
+			if version, ok := versions[image.AttachmentID]; ok {
+				image.FileID = ""
+				image.Data = base64.StdEncoding.EncodeToString(version.Data)
+				image.MediaType = version.MediaType
+			}
+		}
+	}
+	return out
+}
+
+func deepSeekFileReferenceFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	hasFile := strings.Contains(message, "file")
+	missing := strings.Contains(message, "expired") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "file_not_found") ||
+		strings.Contains(message, "deleted") ||
+		strings.Contains(message, "does not exist") ||
+		strings.Contains(message, "does_not_exist") ||
+		strings.Contains(message, "do not exist") ||
+		strings.Contains(message, "not created under this account") ||
+		strings.Contains(message, "not created under your account")
+	invalidID := strings.Contains(message, "invalid") &&
+		(strings.Contains(message, "file id") || strings.Contains(message, "file_id") || strings.Contains(message, "file-api"))
+	return hasFile && (missing || invalidID)
+}
+
+func deepSeekStaleFileIDs(err error, messages []ChatMessage) map[string]bool {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	used := make(map[string]bool)
+	for _, chatMessage := range messages {
+		for _, part := range chatContentParts(chatMessage) {
+			if part.Type == "image" && part.FileID != "" {
+				used[part.FileID] = true
+			}
+		}
+	}
+	named := make(map[string]bool)
+	for fileID := range used {
+		if deepSeekDetailNamesFileID(message, fileID) {
+			named[fileID] = true
+		}
+	}
+	if len(named) > 0 {
+		return named
+	}
+	return used
+}
+
+func deepSeekDetailNamesFileID(detail, fileID string) bool {
+	if fileID == "" {
+		return false
+	}
+	for start := 0; ; {
+		index := strings.Index(detail[start:], fileID)
+		if index < 0 {
+			return false
+		}
+		index += start
+		if deepSeekFileIDBoundaryBefore(detail, index) && deepSeekFileIDBoundaryAfter(detail, index+len(fileID)) {
+			return true
+		}
+		start = index + 1
+		if start > len(detail)-len(fileID) {
+			return false
+		}
+	}
+}
+
+func deepSeekFileIDTokenRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-'
+}
+
+func deepSeekFileIDBoundaryBefore(detail string, index int) bool {
+	if index <= 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(detail[:index])
+	return !deepSeekFileIDTokenRune(r)
+}
+
+func deepSeekFileIDBoundaryAfter(detail string, index int) bool {
+	if index >= len(detail) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(detail[index:])
+	return !deepSeekFileIDTokenRune(r)
 }

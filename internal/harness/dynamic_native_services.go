@@ -813,7 +813,7 @@ func (e *Engine) dynamicCordisPermissionPresetsFacade(run *dynamicCordisRun) *go
 			typ    string
 			data   map[string]any
 		}{
-			{currentPermissionPreset(events) != name, "permission/preset", map[string]any{"preset": name, "origin": "selection"}},
+			{currentPermissionPreset(events) != name, "permission/preset", map[string]any{"preset": name}},
 			{currentSandbox != spec.sandbox, "sandbox/mode", map[string]any{"mode": spec.sandbox}},
 			{effectiveEventString(events, "approval/policy", "policy", "ask") != spec.approval, "approval/policy", map[string]any{"policy": spec.approval}},
 		}

@@ -459,6 +459,7 @@ func cloneChatRequest(request ChatRequest) ChatRequest {
 	for index := range clone.Messages {
 		clone.Messages[index].Blocks = cloneContentBlocks(clone.Messages[index].Blocks)
 		clone.Messages[index].Images = append([]ChatImage(nil), clone.Messages[index].Images...)
+		clone.Messages[index].Parts = append([]ChatContentPart(nil), clone.Messages[index].Parts...)
 		clone.Messages[index].ToolCalls = append([]ToolCall(nil), clone.Messages[index].ToolCalls...)
 		for callIndex := range clone.Messages[index].ToolCalls {
 			clone.Messages[index].ToolCalls[callIndex].Arguments = append(json.RawMessage(nil), clone.Messages[index].ToolCalls[callIndex].Arguments...)

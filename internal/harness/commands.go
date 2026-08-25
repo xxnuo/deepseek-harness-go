@@ -467,7 +467,7 @@ func (e *Engine) commandPermission(_ context.Context, invocation commandInvocati
 		)}, nil
 	}
 	if currentPermissionPreset(events) != name {
-		if _, err := e.appendEvent(invocation.Session, "permission/preset", map[string]any{"preset": name, "origin": "selection"}); err != nil {
+		if _, err := e.appendEvent(invocation.Session, "permission/preset", map[string]any{"preset": name}); err != nil {
 			return CommandResult{}, err
 		}
 	}

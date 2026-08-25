@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -264,6 +265,85 @@ func TestManagedDeepSeekVisionUsesModelCapabilityAndImageBudget(t *testing.T) {
 	}
 }
 
+func TestManagedDeepSeekFilesResolutionFailureUsesOnlyInlineBudget(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "vision-key")
+	imageData := attachmentFixtureBytes(t)["image/png"]
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/files":
+			if r.Method == http.MethodPost {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"error":{"message":"files unavailable"}}`)
+				return
+			}
+		case "/chat/completions":
+			var readErr error
+			requestBody, readErr = io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace, cfg.BaseURL, cfg.Persist = t.TempDir(), t.TempDir(), server.URL, false
+	engine, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	ref, err := engine.StoreImage("image/png", base64.StdEncoding.EncodeToString(imageData), "fallback.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	engine.settings["llm-deepseek"] = map[string]any{
+		"baseURL":                       server.URL,
+		"maxRequestFilesBytes":          float64(1 << 20),
+		"maxInlineRequestImageBytes":    float64(1 << 20),
+		"imageOffloadByteQuantum":       float64(1),
+		"inlineImageOffloadByteQuantum": float64(1),
+		"models":                        []any{map[string]any{"id": "vision", "inputModalities": []any{"text", "image"}, "imagePixelBudget": float64(1)}},
+	}
+	engine.mu.Unlock()
+
+	_, err = (&managedDeepSeekProvider{engine: engine}).Complete(context.Background(), ChatRequest{
+		Model: "vision",
+		Messages: []ChatMessage{{
+			Role:   "user",
+			Blocks: []ContentBlock{{Type: "image", Attachment: &ref}},
+			Parts:  []ChatContentPart{{Type: "image", MediaType: ref.MediaType, Data: base64.StdEncoding.EncodeToString(imageData), AttachmentID: ref.AttachmentID}},
+		}},
+	}, func(Delta) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := engine.ReadImageRequest(ref, ImageRequestPolicy{MaxPixels: 1, MaxBytes: deepSeekDefaultRequestImageMaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedInline := `data:` + version.MediaType + `;base64,` + base64.StdEncoding.EncodeToString(version.Data)
+	if body := string(requestBody); !strings.Contains(body, `"type":"image_url"`) || strings.Contains(body, `"file_id"`) || !strings.Contains(body, expectedInline) {
+		t.Fatalf("Files API fallback wire = %s", body)
+	}
+}
+
+func TestDeepSeekStaleRecoveryRequiresActualFileReference(t *testing.T) {
+	err := errors.New("file reference expired")
+	if deepSeekFileReferenceFailure(err) == false {
+		t.Fatal("expired file error was not classified")
+	}
+	if len(deepSeekMessageFileIDs([]ChatMessage{{Role: "user", Parts: []ChatContentPart{{Type: "image", AttachmentID: "attachment", Data: "AQI="}}}})) != 0 {
+		t.Fatal("inline image was treated as a file reference")
+	}
+}
+
 func TestManagedDeepSeekRejectsImagesForTextOnlyModelBeforeCredential(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "")
 	cfg := DefaultConfig()
@@ -309,7 +389,7 @@ func TestDeepSeekImageMessagesKeepToolContentTextual(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 4 || messages[0].Role != "tool" || messages[0].Content != "(see attached image)" || len(messages[0].Images) != 0 {
+	if len(messages) != 4 || messages[0].Role != "tool" || messages[0].Content != "(no output)" || len(messages[0].Images) != 0 {
 		t.Fatalf("first tool message = %#v", messages)
 	}
 	if messages[1].Role != "tool" || messages[1].Content != "text" || len(messages[1].Images) != 0 {

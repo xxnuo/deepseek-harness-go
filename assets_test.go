@@ -44,7 +44,7 @@ func TestRootMaterializeAssetsInvalidatesLegacyCommitOnlyCache(t *testing.T) {
 		t.Fatal("legacy commit-only cache was reused")
 	}
 	if _, err := os.Stat(filepath.Join(materialized.PluginDir, "client", "ui-brand-official", "lib", "client.js")); err != nil {
-		t.Fatalf("current rc.1 client assets were not materialized: %v", err)
+		t.Fatalf("current rc.2 client assets were not materialized: %v", err)
 	}
 }
 

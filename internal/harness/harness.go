@@ -406,29 +406,35 @@ type ChatMessage struct {
 }
 
 type ChatImage struct {
-	MediaType string `json:"mediaType"`
-	Data      string `json:"data"`
+	MediaType    string `json:"mediaType"`
+	Data         string `json:"data"`
+	FileID       string `json:"-"`
+	AttachmentID string `json:"-"`
 }
 
 // ChatContentPart preserves text/image ordering for provider requests.
 type ChatContentPart struct {
-	Type      string `json:"type"`
-	Text      string `json:"text,omitempty"`
-	MediaType string `json:"mediaType,omitempty"`
-	Data      string `json:"data,omitempty"`
+	Type         string `json:"type"`
+	Text         string `json:"text,omitempty"`
+	MediaType    string `json:"mediaType,omitempty"`
+	Data         string `json:"data,omitempty"`
+	FileID       string `json:"-"`
+	AttachmentID string `json:"-"`
 }
 
 type ChatRequest struct {
-	SessionID       string
-	Model           string
-	System          string
-	Messages        []ChatMessage
-	Tools           []ToolSchema
-	Thinking        string
-	ReasoningEffort string
-	Temperature     *float64
-	MaxTokens       int
-	Stop            []string
+	SessionID            string
+	Model                string
+	System               string
+	Messages             []ChatMessage
+	Tools                []ToolSchema
+	Thinking             string
+	ReasoningEffort      string
+	Temperature          *float64
+	MaxTokens            int
+	Stop                 []string
+	deepSeekFileVersions map[string]RequestImageAttachment
+	deepSeekForceInline  bool
 }
 
 type Delta struct {
@@ -703,20 +709,24 @@ type Engine struct {
 	storageBackends       []StorageBackend
 	storageDisposers      []func()
 	storageDomain         *DomainFacility
-	invariants            *InvariantRegistry
-	hooks                 []*HookBridge
-	hookCtx               context.Context
-	hookCancel            context.CancelFunc
-	hookWG                sync.WaitGroup
-	workerMu              sync.Mutex
-	workerWG              sync.WaitGroup
-	workersClosing        bool
-	titleMu               sync.Mutex
-	titleProvider         *sessionTitleProviderRegistration
-	titleWork             map[string]*sessionTitleWorkState
-	titleCtx              context.Context
-	titleCancel           context.CancelFunc
-	closed                bool
+	// DeepSeek Files uploads are shared by every provider snapshot in this
+	// process. The provider endpoint/key remain request-scoped; only the
+	// owner-private index and in-flight upload coordination are shared.
+	deepSeekFileStore *DeepSeekFileStore
+	invariants        *InvariantRegistry
+	hooks             []*HookBridge
+	hookCtx           context.Context
+	hookCancel        context.CancelFunc
+	hookWG            sync.WaitGroup
+	workerMu          sync.Mutex
+	workerWG          sync.WaitGroup
+	workersClosing    bool
+	titleMu           sync.Mutex
+	titleProvider     *sessionTitleProviderRegistration
+	titleWork         map[string]*sessionTitleWorkState
+	titleCtx          context.Context
+	titleCancel       context.CancelFunc
+	closed            bool
 }
 
 func New(opts ...Option) (*Engine, error) {
@@ -1720,7 +1730,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 			typ  string
 			data map[string]any
 		}{
-			{"permission/preset", map[string]any{"preset": name, "origin": "default"}},
+			{"permission/preset", map[string]any{"preset": name}},
 			{"sandbox/mode", map[string]any{"mode": spec.sandbox}},
 			{"approval/policy", map[string]any{"policy": spec.approval}},
 		} {

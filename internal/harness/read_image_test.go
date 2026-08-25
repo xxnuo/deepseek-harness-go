@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -123,6 +125,67 @@ func TestReadImageRejectsTextOnlyRouteAndNonImagePath(t *testing.T) {
 	}
 	if err := call("note.txt"); err == nil || !strings.Contains(err.Error(), "only accepts PNG/JPEG/WebP/GIF") {
 		t.Fatalf("extension error = %v", err)
+	}
+}
+
+func TestReadImageSchemaAndDescriptionExposeRC2ImageSemantics(t *testing.T) {
+	e := newIntegrationEngine(t)
+	e.mu.RLock()
+	tool := e.tools["read_image"]
+	e.mu.RUnlock()
+	if !strings.Contains(tool.Schema.Description, "downscales") || !strings.Contains(tool.Schema.Description, "concurrently") {
+		t.Fatalf("read_image description = %q", tool.Schema.Description)
+	}
+	imageSchema, ok := tool.Schema.Output["properties"].(map[string]any)["image"].(map[string]any)
+	if !ok {
+		t.Fatalf("read_image output image schema = %#v", tool.Schema.Output)
+	}
+	properties, ok := imageSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("read_image image properties = %#v", imageSchema)
+	}
+	original, ok := properties["originalDimensions"].(map[string]any)
+	if !ok {
+		t.Fatalf("read_image originalDimensions schema = %#v", properties)
+	}
+	if !reflect.DeepEqual(original["required"], []any{"width", "height"}) {
+		t.Fatalf("originalDimensions required = %#v", original["required"])
+	}
+}
+
+func TestFormatImageReadOutputIncludesCoordinateMapping(t *testing.T) {
+	base := ImageAttachmentRef{MediaType: "image/jpeg", Bytes: 9, Width: 2, Height: 1}
+	if got := formatImageReadOutput("/img/photo.jpg", base); strings.Contains(got, "downscaled") {
+		t.Fatalf("unscaled output = %q", got)
+	}
+	base.OriginalDimensions = &ImageDimensions{Width: 4, Height: 2}
+	if got := formatImageReadOutput("/img/photo.jpg", base); !strings.Contains(got, "downscaled from 4x2 px; multiply coordinates by 2.00 to locate features in the original file") {
+		t.Fatalf("uniform scaling output = %q", got)
+	}
+	base.OriginalDimensions = &ImageDimensions{Width: 5, Height: 2}
+	if got := formatImageReadOutput("/img/photo.jpg", base); !strings.Contains(got, "multiply x coordinates by 2.50 and y coordinates by 2.00") {
+		t.Fatalf("axis scaling output = %q", got)
+	}
+}
+
+func TestReadImageAttachmentErrorGuidesRecoverableFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  string
+		want string
+	}{
+		{name: "dimension", err: "attachment-error: image exceeds the configured per-side pixel limit", want: "at least one image side exceeds"},
+		{name: "pixels", err: "attachment-error: image exceeds the decoded pixel limit", want: "decoded-size limit"},
+		{name: "bytes", err: "attachment-error: image cannot be encoded within the normalized byte limit", want: "deployment's byte limits"},
+		{name: "mismatch", err: "attachment-error: declared image media type does not match the data", want: ".jpg extension declares image/jpeg"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := readImageAttachmentError("photo.jpg", "image/jpeg", errors.New(test.err)).Error()
+			if !strings.Contains(got, test.want) {
+				t.Fatalf("error = %q, want substring %q", got, test.want)
+			}
+		})
 	}
 }
 

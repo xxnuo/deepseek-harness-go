@@ -8,6 +8,7 @@ import (
 	core "github.com/xxnuo/deepseek-harness-go/internal/harness"
 	io "io"
 	net "net"
+	http "net/http"
 	time "time"
 )
 
@@ -68,6 +69,30 @@ const CredentialRecordGrant = core.CredentialRecordGrant
 const CredentialRecordUpdated = core.CredentialRecordUpdated
 
 const CredentialReferenceUpdated = core.CredentialReferenceUpdated
+
+const DeepSeekFileExpirySeconds = core.DeepSeekFileExpirySeconds
+
+const DeepSeekFileRefreshSeconds = core.DeepSeekFileRefreshSeconds
+
+const DeepSeekMaxChatImageBytes = core.DeepSeekMaxChatImageBytes
+
+const DeepSeekMaxFileExpirySeconds = core.DeepSeekMaxFileExpirySeconds
+
+const DeepSeekMaxFileUploadBytes = core.DeepSeekMaxFileUploadBytes
+
+const DeepSeekMaxRequestImages = core.DeepSeekMaxRequestImages
+
+const DeepSeekMaxStoredFileBytes = core.DeepSeekMaxStoredFileBytes
+
+const DeepSeekMaxStoredFileCount = core.DeepSeekMaxStoredFileCount
+
+const DeepSeekMinFileExpirySeconds = core.DeepSeekMinFileExpirySeconds
+
+const DeepSeekQuotaCleanupBatch = core.DeepSeekQuotaCleanupBatch
+
+const DeepSeekRequestImageBytes = core.DeepSeekRequestImageBytes
+
+const DeepSeekRequestImagePixels = core.DeepSeekRequestImagePixels
 
 const DefaultFileReferenceMaxEntries = core.DefaultFileReferenceMaxEntries
 
@@ -391,6 +416,26 @@ type DSHSDKSubagentConfig = core.DSHSDKSubagentConfig
 
 type DSHSDKSubagentProvider = core.DSHSDKSubagentProvider
 
+type DeepSeekFileConnection = core.DeepSeekFileConnection
+
+type DeepSeekFileObject = core.DeepSeekFileObject
+
+type DeepSeekFilePage = core.DeepSeekFilePage
+
+type DeepSeekFilePolicy = core.DeepSeekFilePolicy
+
+type DeepSeekFileReference = core.DeepSeekFileReference
+
+type DeepSeekFileStore = core.DeepSeekFileStore
+
+type DeepSeekFilesClient = core.DeepSeekFilesClient
+
+type DeepSeekFilesError = core.DeepSeekFilesError
+
+type DeepSeekUploadIndex = core.DeepSeekUploadIndex
+
+type DeepSeekUploadRecord = core.DeepSeekUploadRecord
+
 type Delta = core.Delta
 
 type Domain = core.Domain
@@ -535,7 +580,11 @@ type HookRunResult = core.HookRunResult
 
 type ImageAttachmentRef = core.ImageAttachmentRef
 
+type ImageDimensions = core.ImageDimensions
+
 type ImageReadValue = core.ImageReadValue
+
+type ImageRequestPolicy = core.ImageRequestPolicy
 
 type IndexInjection = core.IndexInjection
 
@@ -682,6 +731,8 @@ type PythonWireFieldSet = core.PythonWireFieldSet
 type RPCError = core.RPCError
 
 type RepeatToolReminderConfig = core.RepeatToolReminderConfig
+
+type RequestImageAttachment = core.RequestImageAttachment
 
 type ResolvedCredential = core.ResolvedCredential
 
@@ -1079,6 +1130,18 @@ func NewCredentialKey(scope, id string) (CredentialKey, error) {
 
 func NewDSHSDKSubagentProvider(config DSHSDKSubagentConfig) (*DSHSDKSubagentProvider, error) {
 	return core.NewDSHSDKSubagentProvider(config)
+}
+
+func NewDeepSeekFileStore(index *DeepSeekUploadIndex, client *http.Client) *DeepSeekFileStore {
+	return core.NewDeepSeekFileStore(index, client)
+}
+
+func NewDeepSeekFilesClient(baseURL, apiKey string, client *http.Client) *DeepSeekFilesClient {
+	return core.NewDeepSeekFilesClient(baseURL, apiKey, client)
+}
+
+func NewDeepSeekUploadIndex(path string) *DeepSeekUploadIndex {
+	return core.NewDeepSeekUploadIndex(path)
 }
 
 func NewDomainFacility(hub *StorageHub, backend string, routes map[string]string) (*DomainFacility, error) {

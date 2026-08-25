@@ -30,7 +30,37 @@ func imageMediaTypeForPath(path string) string {
 }
 
 func formatImageReadOutput(path string, image ImageAttachmentRef) string {
-	return fmt.Sprintf("<path>%s</path>\n<type>image</type>\n<content>\n%s image, %dx%d px, %d bytes\n</content>", path, image.MediaType, image.Width, image.Height, image.Bytes)
+	scaled := ""
+	if image.OriginalDimensions != nil && image.Width > 0 && image.Height > 0 {
+		x := float64(image.OriginalDimensions.Width) / float64(image.Width)
+		y := float64(image.OriginalDimensions.Height) / float64(image.Height)
+		if fmt.Sprintf("%.2f", x) == fmt.Sprintf("%.2f", y) {
+			scaled = fmt.Sprintf(" (downscaled from %dx%d px; multiply coordinates by %.2f to locate features in the original file)", image.OriginalDimensions.Width, image.OriginalDimensions.Height, x)
+		} else {
+			scaled = fmt.Sprintf(" (downscaled from %dx%d px; multiply x coordinates by %.2f and y coordinates by %.2f to locate features in the original file)", image.OriginalDimensions.Width, image.OriginalDimensions.Height, x, y)
+		}
+	}
+	return fmt.Sprintf("<path>%s</path>\n<type>image</type>\n<content>\n%s image, %dx%d px, %d bytes%s\n</content>", path, image.MediaType, image.Width, image.Height, image.Bytes, scaled)
+}
+
+// readImageAttachmentError turns recoverable image-admission failures into
+// model-facing repair guidance. Storage and infrastructure errors retain their
+// original message so callers can distinguish them from bad image input.
+func readImageAttachmentError(path, mediaType string, err error) error {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "image exceeds the configured per-side pixel limit"):
+		return fmt.Errorf("cannot read %q: at least one image side exceeds the %dpx limit; downscale the image and read the smaller copy", path, maxImageDimension)
+	case strings.Contains(message, "image exceeds the decoded pixel limit"):
+		return fmt.Errorf("cannot read %q: the image exceeds the %d-pixel decoded-size limit; downscale the image and read the smaller copy", path, maxImagePixels)
+	case strings.Contains(message, "image cannot be encoded within the normalized byte limit"):
+		return fmt.Errorf("cannot read %q: the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy", path)
+	case strings.Contains(message, "declared image media type does not match the data"):
+		extension := strings.ToLower(filepath.Ext(path))
+		return fmt.Errorf("cannot read %q: the %s extension declares %s, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats", path, extension, mediaType)
+	default:
+		return err
+	}
 }
 
 func imageModelSupportsInput(ctx context.Context, e *Engine, call ToolCall) error {
@@ -73,13 +103,15 @@ func builtinReadImageTool(e *Engine) Tool {
 	return Tool{
 		Schema: ToolSchema{
 			Name:        "read_image",
-			Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. Requires the current model to accept image input.",
+			Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. Harness validates and downscales large supported images before the next model request, so use this tool directly instead of installing image libraries or creating thumbnails merely to inspect an image. Independent files may be read concurrently in small batches. Requires the current model to accept image input.",
 			Parameters: objectSchema(map[string]any{
 				"file_path": map[string]any{"type": "string", "description": "Path to the image file, resolved relative to the session workspace."},
 			}, "file_path"),
 			Output: objectSchema(map[string]any{"path": map[string]any{"type": "string"}, "image": objectSchema(map[string]any{
 				"attachmentId": map[string]any{"type": "string"}, "mediaType": map[string]any{"type": "string", "enum": []string{"image/png", "image/jpeg", "image/webp", "image/gif"}},
-				"bytes": map[string]any{"type": "integer"}, "width": map[string]any{"type": "integer"}, "height": map[string]any{"type": "integer"}, "name": map[string]any{"type": "string"},
+				"bytes": map[string]any{"type": "integer"}, "width": map[string]any{"type": "integer"}, "height": map[string]any{"type": "integer"}, "name": map[string]any{"type": "string"}, "originalDimensions": objectSchema(map[string]any{
+					"width": map[string]any{"type": "integer"}, "height": map[string]any{"type": "integer"},
+				}, "width", "height"),
 			}, "attachmentId", "mediaType", "bytes", "width", "height")}, "path", "image"),
 		},
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
@@ -113,11 +145,11 @@ func builtinReadImageTool(e *Engine) Tool {
 				return ToolResult{}, err
 			}
 			if len(data) > min(maxImageBytes, maxMessageImageBytes) {
-				return ToolResult{}, errors.New("attachment-error: image exceeds the configured byte limit")
+				return ToolResult{}, fmt.Errorf("cannot read %q: the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy", target.displayPath)
 			}
 			prepared, err := prepareImage(mediaType, base64.StdEncoding.EncodeToString(data), filepath.Base(target.displayPath))
 			if err != nil {
-				return ToolResult{}, err
+				return ToolResult{}, readImageAttachmentError(target.displayPath, mediaType, err)
 			}
 			if err := e.storePreparedImage(prepared); err != nil {
 				return ToolResult{}, err

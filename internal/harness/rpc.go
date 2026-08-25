@@ -238,16 +238,8 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if workspaceProvided && cwdProvided {
 			return nil, rpcError("bad-request", "session.create accepts workspaceId or cwd, not both", nil)
 		}
-		reuseWorkspaceBlank := false
-		if rawReuse, exists := p["reuseWorkspaceBlank"]; exists {
-			value, ok := rawReuse.(bool)
-			if !ok || !value {
-				return nil, rpcError("bad-request", "session.create reuseWorkspaceBlank must be true when provided", nil)
-			}
-			if !workspaceProvided || !sessionProvided {
-				return nil, rpcError("bad-request", "session.create reuseWorkspaceBlank requires workspaceId and sessionId", nil)
-			}
-			reuseWorkspaceBlank = true
+		if _, exists := p["reuseWorkspaceBlank"]; exists {
+			return nil, rpcError("bad-request", "session.create does not accept reuseWorkspaceBlank", nil)
 		}
 		preset, presetProvided := p["agentPreset"].(string)
 		if _, exists := p["agentPreset"]; exists && !presetProvided {
@@ -258,13 +250,9 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return nil, presetErr
 		}
 		preset = resolvedPreset
-		refreshDefaultAfterReuse := false
 		if workspaceProvided {
 			e.mu.RLock()
 			w := e.workspaces[workspaceID]
-			if reuseWorkspaceBlank && w != nil {
-				refreshDefaultAfterReuse = containsString(w.SessionIDs, id) && !e.archived[id]
-			}
 			e.mu.RUnlock()
 			if w == nil {
 				return nil, rpcError("workspace-not-found", "workspace not found", map[string]any{"workspaceId": workspaceID})
@@ -287,12 +275,6 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if workspaceProvided {
 			if attachErr := e.AttachSession(workspaceID, sid); attachErr != nil {
 				return nil, rpcError("workspace-attach-failed", attachErr.Error(), map[string]any{"sessionId": sid, "workspaceId": workspaceID})
-			}
-		}
-		if refreshDefaultAfterReuse {
-			s, _ := e.getSession(sid)
-			if err := e.refreshPermissionDefaultForReuse(s); err != nil {
-				return nil, errorToRPC(err)
 			}
 		}
 		out := map[string]any{"sessionId": sid}
@@ -397,33 +379,6 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 				return nil, errorToRPC(&ClientTimeZoneError{Value: *wire.ClientTimeZone})
 			}
 			req.ClientTimeZone = canonical
-		}
-		if len(wire.Content) > 0 {
-			for _, part := range wire.Content {
-				if part.Type != "image" {
-					continue
-				}
-				s, err := e.getSession(id)
-				if err != nil {
-					return nil, errorToRPC(err)
-				}
-				s.mu.Lock()
-				selection := s.Model
-				s.mu.Unlock()
-				e.mu.RLock()
-				provider := e.providers[selection.Provider]
-				e.mu.RUnlock()
-				if provider != nil {
-					models, modelErr := provider.Models(ctx)
-					if modelErr == nil {
-						for _, model := range models {
-							if model.ID == selection.Model && len(model.InputModalities) > 0 && !containsString(model.InputModalities, "image") {
-								return nil, rpcError("attachment-error", fmt.Sprintf("Model %q does not support image input.", selection.Model), map[string]any{"reason": "MODEL_DOES_NOT_SUPPORT_IMAGES"})
-							}
-						}
-					}
-				}
-			}
 		}
 		result, err := e.Prompt(ctx, id, req)
 		if err != nil {
@@ -1177,70 +1132,6 @@ func (e *Engine) ensurePermissionSnapshotFrom(s *Session, origin *dynamicCordisR
 		if err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (e *Engine) refreshPermissionDefaultForReuse(s *Session) error {
-	if s == nil {
-		return nil
-	}
-	e.mu.RLock()
-	defaultPreset := e.permissionDefaultPresetLocked()
-	e.mu.RUnlock()
-	defaultSpec := commandPermissionPresets[defaultPreset]
-	s.mu.Lock()
-	blank, _ := sessionListMetadata(s.Events)
-	if !blank {
-		s.mu.Unlock()
-		return nil
-	}
-	selected := ""
-	for index := len(s.Events) - 1; index >= 0; index-- {
-		if s.Events[index].Type != "permission/preset" {
-			continue
-		}
-		data, _ := s.Events[index].Data.(map[string]any)
-		if data["origin"] != "default" {
-			s.mu.Unlock()
-			return nil
-		}
-		selected, _ = data["preset"].(string)
-		break
-	}
-	spec, ok := commandPermissionPresets[selected]
-	if !ok || effectiveEventString(s.Events, "sandbox/mode", "mode", sandboxWorkspaceWrite) != spec.sandbox ||
-		effectiveEventString(s.Events, "approval/policy", "policy", "ask") != spec.approval {
-		s.mu.Unlock()
-		return nil
-	}
-	changes := []struct {
-		needed bool
-		typ    string
-		data   map[string]any
-	}{
-		{selected != defaultPreset, "permission/preset", map[string]any{"preset": defaultPreset, "origin": "default"}},
-		{spec.sandbox != defaultSpec.sandbox, "sandbox/mode", map[string]any{"mode": defaultSpec.sandbox}},
-		{spec.approval != defaultSpec.approval, "approval/policy", map[string]any{"policy": defaultSpec.approval}},
-	}
-	id := s.Header.ID
-	appended := make([]Event, 0, len(changes))
-	for _, change := range changes {
-		if change.needed {
-			event, err := appendEventLocked(s, change.typ, change.data, nil, nil, false)
-			if err != nil {
-				s.mu.Unlock()
-				for _, committed := range appended {
-					e.publishEvent(id, committed)
-				}
-				return err
-			}
-			appended = append(appended, event)
-		}
-	}
-	s.mu.Unlock()
-	for _, event := range appended {
-		e.publishEvent(id, event)
 	}
 	return nil
 }

@@ -194,8 +194,8 @@ func (e *Engine) hydrateChatMessagesWithLimit(messages []ChatMessage, maxBytes i
 						continue
 					}
 					encoded := base64.StdEncoding.EncodeToString(data)
-					out[i].Images = append(out[i].Images, ChatImage{MediaType: block.Attachment.MediaType, Data: encoded})
-					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "image", MediaType: block.Attachment.MediaType, Data: encoded})
+					out[i].Images = append(out[i].Images, ChatImage{MediaType: block.Attachment.MediaType, Data: encoded, AttachmentID: block.Attachment.AttachmentID})
+					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "image", MediaType: block.Attachment.MediaType, Data: encoded, AttachmentID: block.Attachment.AttachmentID})
 				default:
 					hydrate(block.Content)
 				}
@@ -211,7 +211,7 @@ func (e *Engine) requestImageLimit(provider string) int {
 		provider = e.cfg.Provider
 	}
 	if provider == "deepseek-official" {
-		return positiveIntSetting(deepSeekEffectiveSettings(e)["maxRequestImageBytes"], deepSeekDefaultImageBytes)
+		return positiveIntSetting(deepSeekEffectiveSettings(e)["maxInlineRequestImageBytes"], deepSeekDefaultMaxInlineRequestImageBytes)
 	}
 	e.mu.RLock()
 	configured := e.piAIProviders[provider]
