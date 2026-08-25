@@ -105,7 +105,7 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 			return discoveredModelsValue(piAIModelInfos(catalog.Models)), nil
 		}
 		if api != "" && api != "openai-completions" && api != "openai-responses" {
-			return nil, rpcError("model-discovery-failed", fmt.Sprintf("pi-ai protocol %q has no model listing this Go build can read", api), map[string]any{"settingsNs": ns, "baseURL": baseURL})
+			return nil, rpcError("model-discovery-failed", fmt.Sprintf("pi-ai protocol %q has no model listing this Go build can read; enter this provider's models by hand", api), map[string]any{"settingsNs": ns, "baseURL": baseURL})
 		}
 	}
 	if strings.TrimSpace(baseURL) != "" {
