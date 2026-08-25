@@ -165,7 +165,7 @@ func TestJSONRPCSDKRoundTrip(t *testing.T) {
 func TestStandaloneSDKBinaryJSONRPCRoundTrip(t *testing.T) {
 	repository := moduleRoot(t)
 	binary := filepath.Join(t.TempDir(), "dsh-sdk")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/dsh-sdk")
+	build := runtimeAssetGoCommand(moduleRoot(t), "build", "-o", binary, "./cmd/dsh-sdk")
 	build.Dir = repository
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build dsh-sdk: %v\n%s", err, output)

@@ -598,7 +598,7 @@ func TestStandaloneBinaryServesEmbeddedRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(t.TempDir(), "dsh")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/dsh")
+	build := runtimeAssetGoCommand(repository, "build", "-o", binary, "./cmd/dsh")
 	build.Dir = repository
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build standalone dsh: %v\n%s", err, output)

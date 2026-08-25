@@ -14,7 +14,7 @@ import (
 
 func TestLandlockFallbackEnforcesWorkspaceBoundary(t *testing.T) {
 	helper := filepath.Join(t.TempDir(), "dsh-landlock-run")
-	build := exec.Command("go", "build", "-o", helper, "./cmd/dsh-landlock-run")
+	build := runtimeAssetGoCommand(moduleRoot(t), "build", "-o", helper, "./cmd/dsh-landlock-run")
 	build.Dir = moduleRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build landlock helper: %v\n%s", err, output)
@@ -80,7 +80,7 @@ func TestLandlockFallbackEnforcesWorkspaceBoundary(t *testing.T) {
 
 func TestLandlockReadOnlyDeniesWorkspaceWrite(t *testing.T) {
 	helper := filepath.Join(t.TempDir(), "dsh-landlock-run")
-	build := exec.Command("go", "build", "-o", helper, "./cmd/dsh-landlock-run")
+	build := runtimeAssetGoCommand(moduleRoot(t), "build", "-o", helper, "./cmd/dsh-landlock-run")
 	build.Dir = moduleRoot(t)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build landlock helper: %v\n%s", err, output)

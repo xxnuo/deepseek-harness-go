@@ -22,7 +22,6 @@ type asset struct {
 	relative string
 }
 
-const assetDestination = "internal/harness/embedded-assets.tar.zst"
 const testAssetDestination = "testdata/upstream"
 const clientBuildVerificationProgram = `import { officialClientBuildEnvironment, readClientBuildRecord } from './scripts/client-build-environment.ts'; const root = process.cwd(); readClientBuildRecord(root, officialClientBuildEnvironment(root));`
 
@@ -34,6 +33,8 @@ var testAssetPaths = []string{
 
 func main() {
 	check := flag.Bool("check", false, "verify that the tracked runtime assets match upstream")
+	bundleOnly := flag.Bool("bundle-only", false, "only build the runtime asset bundle")
+	output := flag.String("output", "", "write the runtime asset bundle to this path")
 	verifyClientBuildOnly := flag.Bool("verify-client-build-only", false, "verify the official upstream client build without syncing assets")
 	upstream := flag.String("upstream", "deepseek-harness", "upstream checkout")
 	flag.Parse()
@@ -50,14 +51,20 @@ func main() {
 		testAssets, testErr := collectFiles(*upstream, testAssetPaths)
 		if testErr != nil {
 			err = testErr
-		} else if *check {
-			err = verifyAssetBundle(assetDestination, "upstream.lock", assets)
-			if err == nil {
-				err = verify(testAssetDestination, testAssets)
-			}
 		} else {
-			err = syncAssetBundle(assetDestination, "upstream.lock", assets)
-			if err == nil {
+			bundle, bundleErr := buildAssetBundle("upstream.lock", assets)
+			if bundleErr != nil {
+				err = bundleErr
+			} else if *output != "" {
+				if *check {
+					err = verifyAssetBundle(*output, bundle)
+				} else {
+					err = writeAssetBundle(*output, bundle)
+				}
+			}
+			if err == nil && !*bundleOnly && *check {
+				err = verify(testAssetDestination, testAssets)
+			} else if err == nil && !*bundleOnly {
 				err = syncAssets(testAssetDestination, testAssets)
 			}
 		}
@@ -68,22 +75,14 @@ func main() {
 	}
 }
 
-func syncAssetBundle(destination, lockPath string, assets []asset) error {
-	bundle, err := buildAssetBundle(lockPath, assets)
-	if err != nil {
-		return err
-	}
+func writeAssetBundle(destination string, bundle []byte) error {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(destination, bundle, 0o644)
 }
 
-func verifyAssetBundle(destination, lockPath string, assets []asset) error {
-	want, err := buildAssetBundle(lockPath, assets)
-	if err != nil {
-		return err
-	}
+func verifyAssetBundle(destination string, want []byte) error {
 	got, err := os.ReadFile(destination)
 	if err != nil {
 		return err

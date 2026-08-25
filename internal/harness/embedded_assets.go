@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"crypto/sha256"
-	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,12 +16,6 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 )
-
-// The generated archive keeps the upstream artifacts in one reproducible blob
-// instead of exposing hundreds of generated files in the repository tree.
-//
-//go:embed embedded-assets.tar.zst
-var embeddedAssetBundle []byte
 
 var (
 	embeddedAssetOnce sync.Once
@@ -78,7 +71,12 @@ func EmbeddedAssetRevision() (string, error) {
 
 func loadEmbeddedAssetBundle() ([]bundleFile, string, error) {
 	embeddedAssetOnce.Do(func() {
-		decoder, err := zstd.NewReader(bytes.NewReader(embeddedAssetBundle))
+		bundle := embeddedAssetBundleBytes()
+		if len(bundle) == 0 {
+			embeddedAssetErr = errors.New("runtime assets were not embedded; use the Makefile build targets")
+			return
+		}
+		decoder, err := zstd.NewReader(bytes.NewReader(bundle))
 		if err != nil {
 			embeddedAssetErr = fmt.Errorf("open embedded asset bundle: %w", err)
 			return

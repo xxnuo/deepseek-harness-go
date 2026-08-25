@@ -33,3 +33,4 @@ go.work.sum
 # .vscode/
 /deepseek-harness
 /runtime-assets/
+/internal/harness/embedded-assets.tar.zst

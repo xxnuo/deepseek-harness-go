@@ -12,8 +12,9 @@ GOFLAGS ?= -trimpath -buildvcs=false
 LDFLAGS ?= -s -w
 RELEASE_COMMANDS ?= dsh dsh-sdk dsh-landlock-run
 RELEASE_PLATFORMS ?= linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
+ASSET_GO = $(GO) run ./scripts/with_runtime_assets --upstream "$(UPSTREAM_DIR)" --
 
-.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test build build-all build-platform $(RELEASE_PLATFORMS) smoke-standalone smoke-clean-archive
+.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test vet build build-all build-platform $(RELEASE_PLATFORMS) smoke-standalone smoke-clean-archive
 
 prepare:
 	@test -n "$(UPSTREAM_COMMIT)" && test -n "$(UPSTREAM_REPOSITORY)"
@@ -25,7 +26,6 @@ prepare:
 		git clone --filter=blob:none --no-checkout "$(UPSTREAM_REPOSITORY)" "$(UPSTREAM_DIR)"; \
 		git -C "$(UPSTREAM_DIR)" checkout --detach "$(UPSTREAM_COMMIT)"; \
 	fi
-	@$(MAKE) prepare-runtime-assets
 	@$(MAKE) verify-upstream
 
 check-upstream-clean:
@@ -60,8 +60,8 @@ verify-upstream: check-upstream-clean
 	@$(MAKE) verify-dynamic-inspect-catalog
 	@$(MAKE) verify-upstream-inventory
 	@$(MAKE) verify-public-facade
-	@go test -count=1 -run '^TestUpstreamContract' ./internal/harness
-	@go test -count=1 -run '^TestUpstreamCLIContract$$' ./cmd/dsh
+	@$(ASSET_GO) test -count=1 -run '^TestUpstreamContract' ./internal/harness
+	@$(ASSET_GO) test -count=1 -run '^TestUpstreamCLIContract$$' ./cmd/dsh
 
 sync-runtime-assets: check-upstream-clean
 	go run ./scripts/sync_runtime_assets.go -upstream "$(UPSTREAM_DIR)"
@@ -82,10 +82,10 @@ verify-dynamic-inspect-catalog: check-upstream-clean
 	pnpm --dir "$(UPSTREAM_DIR)" exec tsx ../scripts/gen_dynamic_inspect_catalog.ts --check
 
 generate-upstream-inventory: check-upstream-clean
-	UPDATE_UPSTREAM_INVENTORY=1 go test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
+	UPDATE_UPSTREAM_INVENTORY=1 $(ASSET_GO) test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
 
 verify-upstream-inventory: check-upstream-clean
-	go test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
+	$(ASSET_GO) test -count=1 -run '^TestUpstreamContractWorkspaceInventory$$' ./internal/harness
 
 generate-public-facade:
 	go run ./scripts/gen_public_facade
@@ -93,11 +93,14 @@ generate-public-facade:
 verify-public-facade:
 	go run ./scripts/gen_public_facade -check
 
-dev:
-	go run ./cmd/dsh web --no-open --port "$(DEV_PORT)"
+dev: prepare-runtime-assets
+	$(ASSET_GO) run ./cmd/dsh web --no-open --port "$(DEV_PORT)"
 
-test:
-	go test -count=1 ./...
+test: prepare-runtime-assets
+	$(ASSET_GO) test -count=1 ./...
+
+vet: prepare-runtime-assets
+	$(ASSET_GO) vet ./...
 
 build:
 	@$(MAKE) build-platform GOOS="$(GOOS)" GOARCH="$(GOARCH)"
@@ -107,24 +110,28 @@ build-all: $(RELEASE_PLATFORMS)
 $(RELEASE_PLATFORMS):
 	@$(MAKE) build-platform GOOS="$(word 1,$(subst -, ,$@))" GOARCH="$(word 2,$(subst -, ,$@))"
 
-build-platform:
+build-platform: prepare-runtime-assets
 	@test -n "$(GOOS)" && test -n "$(GOARCH)"
 	@mkdir -p "$(DIST_DIR)"
 	@set -e; \
 		suffix=; \
 		if test "$(GOOS)" = windows; then suffix=.exe; fi; \
+		temporary="$(DIST_DIR)/.build-$(GOOS)-$(GOARCH)"; \
+		mkdir -p "$$temporary"; \
+		CGO_ENABLED=0 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(ASSET_GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o "$$temporary/" $(foreach command,$(RELEASE_COMMANDS),./cmd/$(command)); \
 		for command in $(RELEASE_COMMANDS); do \
 			output="$(DIST_DIR)/$$command-$(VERSION)-$(GOOS)-$(GOARCH)$$suffix"; \
 			echo "building $$output"; \
-			CGO_ENABLED=0 GOOS="$(GOOS)" GOARCH="$(GOARCH)" "$(GO)" build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o "$$output" "./cmd/$$command"; \
-		done
+			mv -f "$$temporary/$$command$$suffix" "$$output"; \
+		done; \
+		rmdir "$$temporary"
 
-smoke-standalone:
-	go test -count=1 -run TestStandaloneBinaryServesEmbeddedRuntime ./cmd/dsh
+smoke-standalone: prepare-runtime-assets
+	$(ASSET_GO) test -count=1 -run TestStandaloneBinaryServesEmbeddedRuntime ./cmd/dsh
 
-smoke-clean-archive:
+smoke-clean-archive: prepare-runtime-assets
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		git archive --format=tar "$$(git write-tree)" | tar -xf - -C "$$tmp"; \
 		cd "$$tmp"; \
-		go test -count=1 ./...; \
-		go build ./cmd/dsh ./cmd/dsh-sdk ./cmd/dsh-landlock-run
+		DEEPSEEK_HARNESS_UPSTREAM="$(abspath $(UPSTREAM_DIR))" $(GO) run ./scripts/with_runtime_assets --upstream "$(abspath $(UPSTREAM_DIR))" -- test -count=1 ./...; \
+		DEEPSEEK_HARNESS_UPSTREAM="$(abspath $(UPSTREAM_DIR))" $(GO) run ./scripts/with_runtime_assets --upstream "$(abspath $(UPSTREAM_DIR))" -- build ./cmd/dsh ./cmd/dsh-sdk ./cmd/dsh-landlock-run
