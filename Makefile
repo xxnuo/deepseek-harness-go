@@ -3,7 +3,17 @@ UPSTREAM_COMMIT := $(shell sed -n 's/^commit=//p' upstream.lock)
 UPSTREAM_REPOSITORY := $(shell sed -n 's/^repository=//p' upstream.lock)
 DEV_PORT ?= 13080
 
-.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test smoke-standalone smoke-clean-archive
+GO ?= go
+GOOS ?= $(shell $(GO) env GOOS)
+GOARCH ?= $(shell $(GO) env GOARCH)
+DIST_DIR ?= dist
+VERSION ?= $(shell sed -n 's/^tag=dsh-v//p' upstream.lock)
+GOFLAGS ?= -trimpath -buildvcs=false
+LDFLAGS ?= -s -w
+RELEASE_COMMANDS ?= dsh dsh-sdk dsh-landlock-run
+RELEASE_PLATFORMS ?= linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
+
+.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test build build-all build-platform $(RELEASE_PLATFORMS) smoke-standalone smoke-clean-archive
 
 prepare:
 	@test -n "$(UPSTREAM_COMMIT)" && test -n "$(UPSTREAM_REPOSITORY)"
@@ -88,6 +98,26 @@ dev:
 
 test:
 	go test -count=1 ./...
+
+build:
+	@$(MAKE) build-platform GOOS="$(GOOS)" GOARCH="$(GOARCH)"
+
+build-all: $(RELEASE_PLATFORMS)
+
+$(RELEASE_PLATFORMS):
+	@$(MAKE) build-platform GOOS="$(word 1,$(subst -, ,$@))" GOARCH="$(word 2,$(subst -, ,$@))"
+
+build-platform:
+	@test -n "$(GOOS)" && test -n "$(GOARCH)"
+	@mkdir -p "$(DIST_DIR)"
+	@set -e; \
+		suffix=; \
+		if test "$(GOOS)" = windows; then suffix=.exe; fi; \
+		for command in $(RELEASE_COMMANDS); do \
+			output="$(DIST_DIR)/$$command-$(VERSION)-$(GOOS)-$(GOARCH)$$suffix"; \
+			echo "building $$output"; \
+			CGO_ENABLED=0 GOOS="$(GOOS)" GOARCH="$(GOARCH)" "$(GO)" build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o "$$output" "./cmd/$$command"; \
+		done
 
 smoke-standalone:
 	go test -count=1 -run TestStandaloneBinaryServesEmbeddedRuntime ./cmd/dsh
