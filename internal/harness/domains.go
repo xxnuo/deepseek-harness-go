@@ -93,14 +93,19 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 	baseURL, _ := p["baseURL"].(string)
 	apiKey, _ := p["apiKey"].(string)
 	api, _ := p["api"].(string)
-	if ns == piAISettingsNamespace && api != "" && api != "openai-completions" {
-		return nil, rpcError("model-discovery-failed", fmt.Sprintf("pi-ai protocol %q has no model listing this Go build can read", api), map[string]any{"settingsNs": ns, "baseURL": baseURL})
-	}
 	if providerID == "" {
 		if ns == "llm-deepseek" {
 			providerID = "deepseek-official"
 		} else {
 			providerID = ""
+		}
+	}
+	if ns == piAISettingsNamespace {
+		if catalog, ok := piAICatalog[providerID]; ok && len(catalog.Models) > 0 {
+			return discoveredModelsValue(piAIModelInfos(catalog.Models)), nil
+		}
+		if api != "" && api != "openai-completions" && api != "openai-responses" {
+			return nil, rpcError("model-discovery-failed", fmt.Sprintf("pi-ai protocol %q has no model listing this Go build can read", api), map[string]any{"settingsNs": ns, "baseURL": baseURL})
 		}
 	}
 	if strings.TrimSpace(baseURL) != "" {
@@ -122,11 +127,6 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 			return nil, rpcError("model-discovery-failed", err.Error(), map[string]any{"settingsNs": ns, "baseURL": baseURL})
 		}
 		return discoveredModelsValue(models), nil
-	}
-	if ns == piAISettingsNamespace {
-		if catalog, ok := piAICatalog[providerID]; ok {
-			return discoveredModelsValue(piAIModelInfos(catalog.Models)), nil
-		}
 	}
 	e.mu.RLock()
 	provider := e.providers[providerID]

@@ -46,6 +46,48 @@ func TestDiscoverModelsUsesDraftEndpointAndDoesNotEchoKey(t *testing.T) {
 	}
 }
 
+func TestDiscoverModelsSupportsOpenAIResponsesListing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"responses-model","display_name":"Responses Model","context_length":131072,"max_output_tokens":32768}]}`))
+	}))
+	defer server.Close()
+	e := newIntegrationEngine(t)
+	value, rpcErr := e.discoverModels(context.Background(), map[string]any{
+		"settingsNs": "llm-pi-ai",
+		"baseURL":    server.URL + "/v1",
+		"api":        "openai-responses",
+	})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	models := value.(map[string]any)["models"].([]map[string]any)
+	if len(models) != 1 || models[0]["id"] != "responses-model" || models[0]["name"] != "Responses Model" || models[0]["contextWindow"] != 131072 || models[0]["maxTokens"] != 32768 {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestDiscoverModelsPrefersInstalledPiAICatalog(t *testing.T) {
+	e := newIntegrationEngine(t)
+	value, rpcErr := e.discoverModels(context.Background(), map[string]any{
+		"settingsNs": "llm-pi-ai",
+		"provider":   "openai",
+		"baseURL":    "http://127.0.0.1:9/v1",
+		"api":        "openai-responses",
+	})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	models := value.(map[string]any)["models"].([]map[string]any)
+	if len(models) != len(piAICatalog["openai"].Models) {
+		t.Fatalf("models = %d, want catalog size %d", len(models), len(piAICatalog["openai"].Models))
+	}
+}
+
 func TestSettingsOpenDocumentPreparesAndInvokesOpener(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
