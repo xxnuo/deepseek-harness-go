@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,6 +46,30 @@ func TestVerifyOfficialClientBuildUsesUpstreamValidator(t *testing.T) {
 	t.Setenv("VERIFY_FAILURE", "stale client artifacts")
 	if err := verifyOfficialClientBuild(root); err == nil || !strings.Contains(err.Error(), "stale client artifacts") {
 		t.Fatalf("validator failure was not preserved: %v", err)
+	}
+}
+
+func TestBuildAssetBundleIsReproducible(t *testing.T) {
+	root := t.TempDir()
+	lock := filepath.Join(root, "upstream.lock")
+	source := filepath.Join(root, "asset.txt")
+	if err := os.WriteFile(lock, []byte("commit=test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("asset"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assets := []asset{{source: source, relative: "packages/example/asset.txt"}}
+	first, err := buildAssetBundle(lock, assets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := buildAssetBundle(lock, assets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("asset bundle is not reproducible")
 	}
 }
 

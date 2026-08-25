@@ -31,3 +31,4 @@ go.work.sum
 # .idea/
 # .vscode/
 /deepseek-harness
+/runtime-assets/

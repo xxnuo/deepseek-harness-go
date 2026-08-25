@@ -279,7 +279,11 @@ func TestPythonProtocolMirrorWithRealPython(t *testing.T) {
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv is unavailable")
 	}
-	pyDir := filepath.Join(moduleRoot(t), "runtime-assets", "deepseek-harness", "packages", "code-runtime", "code-runtime-python", "py")
+	assets, err := defaultAssetPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pyDir := filepath.Join(assets.UpstreamDir, "packages", "code-runtime", "code-runtime-python", "py")
 	pathJSON, _ := json.Marshal(pyDir)
 	ordered, err := EncodePythonJSONPlain(PythonJSONObject{
 		{Key: "b", Value: 1}, {Key: "10", Value: 10}, {Key: "2", Value: 2},

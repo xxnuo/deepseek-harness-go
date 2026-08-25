@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"errors"
 	"flag"
@@ -11,6 +12,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type asset struct {
@@ -18,7 +22,7 @@ type asset struct {
 	relative string
 }
 
-const assetDestination = "runtime-assets/deepseek-harness"
+const assetDestination = "internal/harness/embedded-assets.tar.zst"
 const testAssetDestination = "testdata/upstream"
 const clientBuildVerificationProgram = `import { officialClientBuildEnvironment, readClientBuildRecord } from './scripts/client-build-environment.ts'; const root = process.cwd(); readClientBuildRecord(root, officialClientBuildEnvironment(root));`
 
@@ -47,12 +51,12 @@ func main() {
 		if testErr != nil {
 			err = testErr
 		} else if *check {
-			err = verify(assetDestination, assets)
+			err = verifyAssetBundle(assetDestination, "upstream.lock", assets)
 			if err == nil {
 				err = verify(testAssetDestination, testAssets)
 			}
 		} else {
-			err = syncAssets(assetDestination, assets)
+			err = syncAssetBundle(assetDestination, "upstream.lock", assets)
 			if err == nil {
 				err = syncAssets(testAssetDestination, testAssets)
 			}
@@ -62,6 +66,79 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func syncAssetBundle(destination, lockPath string, assets []asset) error {
+	bundle, err := buildAssetBundle(lockPath, assets)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(destination, bundle, 0o644)
+}
+
+func verifyAssetBundle(destination, lockPath string, assets []asset) error {
+	want, err := buildAssetBundle(lockPath, assets)
+	if err != nil {
+		return err
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return errors.New("embedded runtime asset bundle is stale")
+	}
+	return nil
+}
+
+func buildAssetBundle(lockPath string, assets []asset) ([]byte, error) {
+	lock, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	encoder, err := zstd.NewWriter(&output, zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		return nil, err
+	}
+	archive := tar.NewWriter(encoder)
+	write := func(name string, data []byte) error {
+		header := &tar.Header{Name: filepath.ToSlash(name), Mode: 0o644, Size: int64(len(data)), ModTime: time.Unix(0, 0).UTC(), Typeflag: tar.TypeReg, Format: tar.FormatPAX}
+		if err := archive.WriteHeader(header); err != nil {
+			return err
+		}
+		_, err := archive.Write(data)
+		return err
+	}
+	if err := write("upstream.lock", lock); err != nil {
+		_ = archive.Close()
+		encoder.Close()
+		return nil, err
+	}
+	for _, asset := range assets {
+		data, err := os.ReadFile(asset.source)
+		if err != nil {
+			_ = archive.Close()
+			encoder.Close()
+			return nil, err
+		}
+		if err := write(filepath.Join("deepseek-harness", asset.relative), data); err != nil {
+			_ = archive.Close()
+			encoder.Close()
+			return nil, err
+		}
+	}
+	if err := archive.Close(); err != nil {
+		encoder.Close()
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
 }
 
 func verifyOfficialClientBuild(upstream string) error {
