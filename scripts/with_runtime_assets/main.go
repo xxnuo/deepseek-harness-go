@@ -59,6 +59,7 @@ func main() {
 	goArgs := append([]string{args[0], "-overlay", overlayPath}, args[1:]...)
 	command := exec.Command("go", goArgs...)
 	command.Dir = root
+	command.Env = targetGoEnvironment(os.Environ())
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -69,6 +70,27 @@ func main() {
 		}
 		fatal(err)
 	}
+}
+
+func targetGoEnvironment(environment []string) []string {
+	goos, goarch := os.Getenv("DSH_TARGET_GOOS"), os.Getenv("DSH_TARGET_GOARCH")
+	if goos == "" && goarch == "" {
+		return environment
+	}
+	result := make([]string, 0, len(environment)+2)
+	for _, entry := range environment {
+		if (goos != "" && len(entry) >= 5 && entry[:5] == "GOOS=") || (goarch != "" && len(entry) >= 7 && entry[:7] == "GOARCH=") {
+			continue
+		}
+		result = append(result, entry)
+	}
+	if goos != "" {
+		result = append(result, "GOOS="+goos)
+	}
+	if goarch != "" {
+		result = append(result, "GOARCH="+goarch)
+	}
+	return result
 }
 
 func hostGoEnvironment(environment []string) []string {

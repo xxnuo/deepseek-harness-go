@@ -12,11 +12,17 @@ GOFLAGS ?= -trimpath -buildvcs=false
 LDFLAGS ?= -s -w
 RELEASE_COMMANDS ?= dsh dsh-sdk dsh-landlock-run
 RELEASE_PLATFORMS ?= linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
-ASSET_GO = $(GO) run ./scripts/with_runtime_assets --upstream "$(UPSTREAM_DIR)" --
+HOST_GO = GOOS=$(shell $(GO) env GOHOSTOS) GOARCH=$(shell $(GO) env GOHOSTARCH) $(GO)
+ASSET_GO = $(HOST_GO) run ./scripts/with_runtime_assets --upstream "$(UPSTREAM_DIR)" --
 
-.PHONY: prepare check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test vet build build-all build-platform $(RELEASE_PLATFORMS) smoke-standalone smoke-clean-archive
+.PHONY: prepare prepare-upstream check-upstream-clean prepare-runtime-assets verify-upstream sync-runtime-assets verify-runtime-assets generate-pi-ai-catalog verify-pi-ai-catalog generate-dynamic-inspect-catalog verify-dynamic-inspect-catalog generate-upstream-inventory verify-upstream-inventory generate-public-facade verify-public-facade dev test race vet build build-all build-platform $(RELEASE_PLATFORMS) smoke-standalone smoke-clean-archive
 
 prepare:
+	@$(MAKE) prepare-upstream
+	@$(MAKE) prepare-runtime-assets
+	@$(MAKE) verify-upstream
+
+prepare-upstream:
 	@test -n "$(UPSTREAM_COMMIT)" && test -n "$(UPSTREAM_REPOSITORY)"
 	@if test -e "$(UPSTREAM_DIR)"; then \
 		git -C "$(UPSTREAM_DIR)" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "$(UPSTREAM_DIR) exists but is not a git checkout" >&2; exit 1; }; \
@@ -26,7 +32,6 @@ prepare:
 		git clone --filter=blob:none --no-checkout "$(UPSTREAM_REPOSITORY)" "$(UPSTREAM_DIR)"; \
 		git -C "$(UPSTREAM_DIR)" checkout --detach "$(UPSTREAM_COMMIT)"; \
 	fi
-	@$(MAKE) verify-upstream
 
 check-upstream-clean:
 	@test -d "$(UPSTREAM_DIR)/.git"
@@ -36,13 +41,13 @@ check-upstream-clean:
 
 prepare-runtime-assets: check-upstream-clean
 	@set -e; \
-		if go run ./scripts/sync_runtime_assets.go -verify-client-build-only -upstream "$(UPSTREAM_DIR)" >/dev/null 2>&1; then \
+		if $(HOST_GO) run ./scripts/sync_runtime_assets.go -verify-client-build-only -upstream "$(UPSTREAM_DIR)" >/dev/null 2>&1; then \
 			echo "official upstream client artifacts are current"; \
 		else \
 			echo "building official upstream client artifacts"; \
 			pnpm --dir "$(UPSTREAM_DIR)" install --frozen-lockfile; \
 			pnpm --dir "$(UPSTREAM_DIR)" run build:official; \
-			go run ./scripts/sync_runtime_assets.go -verify-client-build-only -upstream "$(UPSTREAM_DIR)"; \
+			$(HOST_GO) run ./scripts/sync_runtime_assets.go -verify-client-build-only -upstream "$(UPSTREAM_DIR)"; \
 		fi
 
 verify-upstream: check-upstream-clean
@@ -99,6 +104,9 @@ dev: prepare-runtime-assets
 test: prepare-runtime-assets
 	$(ASSET_GO) test -count=1 ./...
 
+race: prepare-runtime-assets
+	$(ASSET_GO) test -race -count=1 ./...
+
 vet: prepare-runtime-assets
 	$(ASSET_GO) vet ./...
 
@@ -116,15 +124,14 @@ build-platform: prepare-runtime-assets
 	@set -e; \
 		suffix=; \
 		if test "$(GOOS)" = windows; then suffix=.exe; fi; \
-		temporary="$(DIST_DIR)/.build-$(GOOS)-$(GOARCH)"; \
-		mkdir -p "$$temporary"; \
-		CGO_ENABLED=0 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(ASSET_GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o "$$temporary/" $(foreach command,$(RELEASE_COMMANDS),./cmd/$(command)); \
+		temporary=$$(mktemp -d "$(DIST_DIR)/.build-$(GOOS)-$(GOARCH)-XXXXXX"); \
+		trap 'rm -rf "$$temporary"' EXIT; \
+		CGO_ENABLED=0 DSH_TARGET_GOOS="$(GOOS)" DSH_TARGET_GOARCH="$(GOARCH)" $(ASSET_GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o "$$temporary/" $(foreach command,$(RELEASE_COMMANDS),./cmd/$(command)); \
 		for command in $(RELEASE_COMMANDS); do \
 			output="$(DIST_DIR)/$$command-$(VERSION)-$(GOOS)-$(GOARCH)$$suffix"; \
 			echo "building $$output"; \
 			mv -f "$$temporary/$$command$$suffix" "$$output"; \
-		done; \
-		rmdir "$$temporary"
+		done
 
 smoke-standalone: prepare-runtime-assets
 	$(ASSET_GO) test -count=1 -run TestStandaloneBinaryServesEmbeddedRuntime ./cmd/dsh

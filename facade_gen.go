@@ -1012,6 +1012,10 @@ func DomainDescriptor(spec DomainSpec) KVUnitDescriptor {
 	return core.DomainDescriptor(spec)
 }
 
+func EmbeddedAssetRevision() (string, error) {
+	return core.EmbeddedAssetRevision()
+}
+
 func EncodePythonJSONPlain(value any) (string, error) {
 	return core.EncodePythonJSONPlain(value)
 }
@@ -1090,6 +1094,10 @@ func MCPPublicToolName(serverName, rawName string) string {
 
 func MatchesHookMatcher(matcher *string, query string, dialect HookDialect) bool {
 	return core.MatchesHookMatcher(matcher, query, dialect)
+}
+
+func MaterializeEmbeddedAssets(dataDir string) (AssetPaths, error) {
+	return core.MaterializeEmbeddedAssets(dataDir)
 }
 
 func MergeHookOutputs(outputs []HookOutput) MergedHookOutcome {

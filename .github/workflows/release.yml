@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.1-rc.2
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.26.6'
+  NODE_VERSION: '22.19.0'
+  PNPM_VERSION: '11.7.0'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: Build release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: deepseek-harness/pnpm-lock.yaml
+
+      - name: Resolve and validate release tag
+        id: meta
+        shell: bash
+        env:
+          EVENT_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^tag=dsh-v//p' upstream.lock)"
+          expected="v${version}"
+          tag="${EVENT_TAG}"
+          if [[ "${tag}" != "${expected}" ]]; then
+            echo "release tag ${tag} does not match pinned upstream version ${expected}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare pinned upstream
+        run: make prepare-upstream
+
+      - name: Install and build upstream client
+        run: |
+          pnpm --dir deepseek-harness install --frozen-lockfile
+          pnpm --dir deepseek-harness run build:official
+
+      - name: Verify source before release
+        run: |
+          make verify-upstream
+          make test
+          make vet
+
+      - name: Build all release targets
+        run: make build-all VERSION=${{ steps.meta.outputs.version }}
+
+      - name: Package archives and checksums
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64; do
+            read -r goos goarch <<< "${target//-/ }"
+            suffix=""
+            if [[ "${goos}" == windows ]]; then suffix=".exe"; fi
+            archive="artifacts/deepseek-harness-go_${VERSION}_${goos}_${goarch}.tar.gz"
+            stage="$(mktemp -d)"
+            trap 'rm -rf "${stage}"' EXIT
+            for command in dsh dsh-sdk dsh-landlock-run; do
+              cp "dist/${command}-${VERSION}-${target}${suffix}" "${stage}/${command}${suffix}"
+            done
+            cp LICENSE README.md "${stage}/"
+            tar -C "${stage}" --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf "${archive}" .
+            rm -rf "${stage}"
+            trap - EXIT
+          done
+          (cd artifacts && sha256sum *.tar.gz > checksums.txt)
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/checksums.txt

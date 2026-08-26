@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26.6'
+  NODE_VERSION: '22.19.0'
+  PNPM_VERSION: '11.7.0'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  verify-and-build:
+    name: Verify and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: deepseek-harness/pnpm-lock.yaml
+
+      - name: Prepare pinned upstream
+        run: make prepare-upstream
+
+      - name: Install and build upstream client
+        run: |
+          pnpm --dir deepseek-harness install --frozen-lockfile
+          pnpm --dir deepseek-harness run build:official
+
+      - name: Verify synchronized upstream and generated surfaces
+        run: make verify-upstream
+
+      - name: Go tests
+        run: make test
+
+      - name: Go race tests
+        run: make race
+
+      - name: Go vet
+        run: make vet
+
+      - name: Build command packages
+        run: go run ./scripts/with_runtime_assets --upstream deepseek-harness -- build ./cmd/dsh ./cmd/dsh-sdk ./cmd/dsh-landlock-run
+
+      - name: Standalone smoke test
+        run: make smoke-standalone
+
+      - name: Build release targets
+        run: make build-all
+
+      - name: Verify release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^tag=dsh-v//p' upstream.lock)"
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64; do
+            suffix=""
+            if [[ "${target}" == windows-* ]]; then suffix=".exe"; fi
+            for command in dsh dsh-sdk dsh-landlock-run; do
+              path="dist/${command}-${version}-${target}${suffix}"
+              test -s "${path}"
+              file "${path}"
+            done
+          done
+
+      - name: Package release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^tag=dsh-v//p' upstream.lock)"
+          mkdir -p artifacts
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64; do
+            read -r goos goarch <<< "${target//-/ }"
+            suffix=""
+            if [[ "${goos}" == windows ]]; then suffix=".exe"; fi
+            archive="artifacts/deepseek-harness-go_${version}_${goos}_${goarch}.tar.gz"
+            stage="$(mktemp -d)"
+            trap 'rm -rf "${stage}"' EXIT
+            for command in dsh dsh-sdk dsh-landlock-run; do
+              cp "dist/${command}-${version}-${target}${suffix}" "${stage}/${command}${suffix}"
+            done
+            cp LICENSE README.md "${stage}/"
+            tar -C "${stage}" --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf "${archive}" .
+            rm -rf "${stage}"
+            trap - EXIT
+          done
+          (cd artifacts && sha256sum *.tar.gz > checksums.txt)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-go-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
