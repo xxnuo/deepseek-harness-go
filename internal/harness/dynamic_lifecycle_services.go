@@ -393,13 +393,18 @@ func (e *Engine) dynamicCordisDetachPrepared(run *dynamicCordisRun, prepared *dy
 		session.mu.Lock()
 		id := session.Header.ID
 		session.attached = false
+		activity := session.activity
 		cancel := session.Cancel
 		session.Cancel = nil
+		session.activity = nil
 		session.mu.Unlock()
-		if cancel != nil {
+		if activity != nil {
+			activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
+		} else if cancel != nil {
 			cancel()
 		}
 		e.releaseFileReferenceSearch(id)
+		_ = e.jobs.disposeOwner(id, "owner disposed")
 		prepared.entered = false
 		e.discardDynamicCordisPreparedSession(run, id)
 		e.mu.Lock()
@@ -486,6 +491,9 @@ func (e *Engine) dynamicCordisForkSession(run *dynamicCordisRun, sourceID string
 	}
 	e.dynamicCordisOwnPreparedSession(run, prepared)
 	prepared.announced = true
+	prepared.session.mu.Lock()
+	prepared.session.published = true
+	prepared.session.mu.Unlock()
 	if err := e.emitDynamicCordisEventFrom(run, "session/created", dynamicSessionView(prepared.session)); err != nil {
 		e.dynamicCordisDetachPrepared(run, prepared)
 		return nil, err
@@ -643,6 +651,9 @@ func (e *Engine) dynamicCordisSessionsFacade(run *dynamicCordisRun) *goja.Object
 			panic(vm.ToValue(fmt.Sprintf("session %q was already announced", id)))
 		}
 		prepared.announced, prepared.announcing = true, true
+		prepared.session.mu.Lock()
+		prepared.session.published = true
+		prepared.session.mu.Unlock()
 		if err := e.emitDynamicCordisEventFrom(run, "session/created", dynamicSessionView(prepared.session)); err != nil {
 			prepared.announcing = false
 			e.dynamicCordisDetachPrepared(run, prepared)
@@ -737,6 +748,9 @@ func (e *Engine) dynamicCordisCreateSession(run *dynamicCordisRun, id string, op
 	}
 	e.dynamicCordisOwnPreparedSession(run, prepared)
 	prepared.announced, prepared.announcing = true, true
+	prepared.session.mu.Lock()
+	prepared.session.published = true
+	prepared.session.mu.Unlock()
 	if err := e.emitDynamicCordisEventFrom(run, "session/created", dynamicSessionView(prepared.session)); err != nil {
 		prepared.announcing = false
 		e.dynamicCordisDetachPrepared(run, prepared)
@@ -1092,15 +1106,15 @@ func (e *Engine) dynamicCordisJobsFacade(run *dynamicCordisRun) *goja.Object {
 					return errors.New("dynamic Cordis runtime is closed")
 				}
 				return err
-			}, CancelInline: cancelInline, ReadOutput: func() (string, bool) {
+			}, CancelInline: cancelInline, ReadOutput: func() (string, bool, error) {
 				if readFn == nil {
-					return "", false
+					return "", false, nil
 				}
 				value, err := readFn(goja.Undefined())
 				if err != nil {
-					return "", false
+					return "", false, err
 				}
-				return value.String(), false
+				return value.String(), false, nil
 			}}, nil
 		})
 		if startErr != nil {
@@ -1113,7 +1127,7 @@ func (e *Engine) dynamicCordisJobsFacade(run *dynamicCordisRun) *goja.Object {
 		if !ok {
 			panic(vm.ToValue("jobs.onJobDone requires a function"))
 		}
-		dispose := e.jobs.onDone(func(row jobSnapshot) {
+		dispose := e.jobs.onDone(run.ownerSessionID(), func(row jobSnapshot) {
 			e.dynamicCordis.loop.post(func() {
 				var owner goja.Value = goja.Undefined()
 				if row.Owner != "" {
@@ -1134,7 +1148,7 @@ func (e *Engine) dynamicCordisJobsFacade(run *dynamicCordisRun) *goja.Object {
 		if !ok {
 			panic(vm.ToValue("jobs.onJobsChanged requires a function"))
 		}
-		dispose := e.jobs.onChanged(func(owner string) {
+		dispose := e.jobs.onChanged(run.ownerSessionID(), func(owner string) {
 			e.dynamicCordis.loop.post(func() {
 				if owner == "" {
 					_, _ = fn(goja.Undefined(), goja.Undefined())

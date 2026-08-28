@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -31,62 +32,76 @@ type LaunchEnvironmentSnapshot struct {
 }
 
 type Config struct {
-	DataDir                string
-	Workspace              string
-	FrontendDir            string
-	PluginDir              string
-	PluginDirs             []string
-	ClientPlugins          []string
-	ClientHMRPollInterval  time.Duration
-	PresetDir              string
-	SkillDir               string
-	BundledBadgeSkill      bool
-	AgentsHome             string
-	Host                   string
-	Port                   int
-	TrustedHosts           []string
-	Version                string
-	Provider               string
-	Model                  string
-	BaseURL                string
-	APIKey                 string
-	LaunchEnvironment      *LaunchEnvironmentSnapshot
-	WebSearchProvider      string
-	WebFetchProvider       string
-	WebTools               *WebToolConfig
-	HTTPWebFetch           HTTPWebFetchConfig
-	ToolPresentation       string
-	Persona                string
-	InstructionMaxBytes    int
-	ExaSearch              ExaSearchProviderOptions
-	PerplexitySearch       PerplexitySearchProviderOptions
-	SessionTitle           SessionTitleConfig
-	SessionTitleLLM        SessionTitleLLMConfig
-	SessionTelemetry       *SessionTelemetryConfig
-	Compaction             CompactionConfig
-	ToolResultPruner       ToolResultPruneConfig
-	Spill                  SpillConfig
-	RepeatToolReminder     RepeatToolReminderConfig
-	FileReference          FileReferenceConfig
-	SessionReference       SessionReferenceConfig
-	SessionProjectionCache *SessionProjectionCacheConfig
-	Storage                *StorageRuntimeConfig
-	DynamicCordisVMTimeout time.Duration
-	RuntimeInvariants      *RuntimeInvariantConfig
-	TimeContext            *TimeContextConfig
-	TmuxContext            *TmuxContextConfig
-	ScheduleEnabled        bool
-	LSPServers             map[string]LSPStdioConfig
-	LSPTool                LSPToolConfig
-	MCPServers             []MCPConfig
-	Hooks                  []HookBridgeConfig
-	SubagentProviders      []SubagentProvider
-	SubagentTools          []SubagentToolConfig
-	SubagentReportDelivery string
-	AgentTeams             *AgentTeamConfig
-	Terminal               TerminalConfig
-	TerminalTool           TerminalToolConfig
-	E2B                    *E2BConfig
+	DataDir       string
+	Workspace     string
+	FrontendDir   string
+	PluginDir     string
+	PluginDirs    []string
+	ClientPlugins []string
+	// PluginInventory carries the composed Host Loader entry metadata. It is
+	// deliberately separate from ClientPlugins: the web boot graph is a
+	// client-module roster, while pluginInventory/list projects Host Loader
+	// entries and their live Fiber state.
+	PluginInventory       []PluginInventoryEntry
+	ClientHMRPollInterval time.Duration
+	PresetDir             string
+	SkillDir              string
+	BundledBadgeSkill     bool
+	AgentsHome            string
+	Host                  string
+	Port                  int
+	TrustedHosts          []string
+	Version               string
+	Provider              string
+	Model                 string
+	BaseURL               string
+	APIKey                string
+	LaunchEnvironment     *LaunchEnvironmentSnapshot
+	WebSearchProvider     string
+	WebFetchProvider      string
+	WebTools              *WebToolConfig
+	HTTPWebFetch          HTTPWebFetchConfig
+	ToolPresentation      string
+	// ToolTimeoutPolicyEnabled controls the optional timeout-policy plugin.
+	// A nil value is normalized to enabled for library callers that do not
+	// provide a profile composition.
+	ToolTimeoutPolicyEnabled *bool
+	// TodoAllowParallelInProgress mirrors dsh-tool-todo's deployment policy.
+	// Nil keeps the historical permissive behavior for library callers.
+	TodoAllowParallelInProgress *bool
+	Persona                     string
+	InstructionMaxBytes         int
+	DeepSeekWebSearch           DeepSeekWebSearchConfig
+	ExaSearch                   ExaSearchProviderOptions
+	PerplexitySearch            PerplexitySearchProviderOptions
+	SessionTitle                SessionTitleConfig
+	SessionTitleLLM             SessionTitleLLMConfig
+	SessionTelemetry            *SessionTelemetryConfig
+	Compaction                  CompactionConfig
+	ToolResultPruner            ToolResultPruneConfig
+	Spill                       SpillConfig
+	RepeatToolReminder          RepeatToolReminderConfig
+	Jobs                        JobsConfig
+	FileReference               FileReferenceConfig
+	SessionReference            SessionReferenceConfig
+	SessionProjectionCache      *SessionProjectionCacheConfig
+	Storage                     *StorageRuntimeConfig
+	DynamicCordisVMTimeout      time.Duration
+	RuntimeInvariants           *RuntimeInvariantConfig
+	TimeContext                 *TimeContextConfig
+	TmuxContext                 *TmuxContextConfig
+	ScheduleEnabled             bool
+	LSPServers                  map[string]LSPStdioConfig
+	LSPTool                     LSPToolConfig
+	MCPServers                  []MCPConfig
+	Hooks                       []HookBridgeConfig
+	SubagentProviders           []SubagentProvider
+	SubagentTools               []SubagentToolConfig
+	SubagentReportDelivery      string
+	AgentTeams                  *AgentTeamConfig
+	Terminal                    TerminalConfig
+	TerminalTool                TerminalToolConfig
+	E2B                         *E2BConfig
 	// RetryPolicy is the default for providers that do not expose a route-
 	// specific policy. A provider may override it by implementing
 	// RetryPolicyProvider.
@@ -94,6 +109,109 @@ type Config struct {
 	Persist      bool
 	SessionStore SessionStore
 	MaxBodyBytes int64
+	// ImageCompressionConcurrency bounds normalization and request-image
+	// transformations owned by this engine. Zero uses the default.
+	ImageCompressionConcurrency int
+	// MaxParallelToolCalls bounds concurrently running tool bodies. Zero uses
+	// the default; negative values are rejected by New.
+	MaxParallelToolCalls int
+}
+
+// JobsConfig mirrors dsh-tool-jobs' bounded wait and completion delivery
+// policy. It is deployment state, so profile reloads update future calls while
+// existing jobs retain their ownership and output buffers.
+type JobsConfig struct {
+	WaitTimeoutMs       time.Duration
+	MaxWaitTimeoutMs    time.Duration
+	CompletionDelivery  string
+	MaxConsecutiveWakes int
+}
+
+// PluginInventoryEntry is the host-side Loader projection used by the
+// pluginInventory/list remote. A nil FiberPhase represents a disposed or
+// disabled entry, matching the upstream null phase.
+type PluginInventoryEntry struct {
+	EntryID    string
+	ModuleName string
+	Enabled    bool
+	FiberPhase *string
+	Group      bool
+}
+
+func clonePluginInventory(entries []PluginInventoryEntry) []PluginInventoryEntry {
+	if entries == nil {
+		return nil
+	}
+	cloned := make([]PluginInventoryEntry, len(entries))
+	copy(cloned, entries)
+	for i := range cloned {
+		if entries[i].FiberPhase != nil {
+			phase := *entries[i].FiberPhase
+			cloned[i].FiberPhase = &phase
+		}
+	}
+	return cloned
+}
+
+// SetPluginInventory replaces the live Host Loader projection. Callers that
+// own profile reloads should publish the complete ordered snapshot after the
+// composition generation is mounted.
+func (e *Engine) SetPluginInventory(entries []PluginInventoryEntry) {
+	e.pluginInventoryMu.Lock()
+	e.pluginInventory = clonePluginInventory(entries)
+	e.pluginInventoryMu.Unlock()
+}
+
+// SetPluginInventoryEntryState updates one entry without changing Loader
+// order. It returns false when the published composition has no such entry.
+func (e *Engine) SetPluginInventoryEntryState(entryID string, enabled bool, phase *string) bool {
+	e.pluginInventoryMu.Lock()
+	defer e.pluginInventoryMu.Unlock()
+	for i := range e.pluginInventory {
+		if e.pluginInventory[i].EntryID != entryID {
+			continue
+		}
+		e.pluginInventory[i].Enabled = enabled
+		if phase == nil {
+			e.pluginInventory[i].FiberPhase = nil
+		} else {
+			value := *phase
+			e.pluginInventory[i].FiberPhase = &value
+		}
+		return true
+	}
+	return false
+}
+
+func (e *Engine) pluginInventorySnapshot() []PluginInventoryEntry {
+	e.pluginInventoryMu.RLock()
+	defer e.pluginInventoryMu.RUnlock()
+	return clonePluginInventory(e.pluginInventory)
+}
+
+// hostPluginActive reports whether a configured Host Loader module has at
+// least one enabled entry. A nil inventory means the library caller did not
+// provide a profile composition, so all built-in capabilities remain enabled.
+func (e *Engine) hostPluginActive(module string) bool {
+	e.pluginInventoryMu.RLock()
+	defer e.pluginInventoryMu.RUnlock()
+	if e.pluginInventory == nil {
+		return true
+	}
+	for _, entry := range e.pluginInventory {
+		if entry.ModuleName != module || !entry.Enabled {
+			continue
+		}
+		// Loader enablement and Fiber lifecycle are separate facts. A nil
+		// phase is accepted for library callers that provide only composition
+		// metadata; an explicit non-active phase means the plugin has not
+		// contributed its services yet (or is already being torn down).
+		if entry.FiberPhase != nil && *entry.FiberPhase != "active" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func DefaultConfig() Config {
@@ -130,6 +248,8 @@ func DefaultConfig() Config {
 	if toolPresentation == "" {
 		toolPresentation = "native"
 	}
+	timeoutPolicyEnabled := true
+	todoAllowParallel := true
 	return Config{
 		DataDir: data, Workspace: cwd, AgentsHome: agentsHome, Host: "127.0.0.1", Port: 3080,
 		ClientHMRPollInterval: 500 * time.Millisecond,
@@ -138,20 +258,42 @@ func DefaultConfig() Config {
 		WebSearchProvider: webSearchProvider, WebFetchProvider: webFetchProvider,
 		WebTools: webTools, HTTPWebFetch: defaultHTTPWebFetchConfig(),
 		ToolPresentation: toolPresentation, Persona: defaultCodingPersona,
-		InstructionMaxBytes: defaultInstructionMaxBytes,
-		SessionTitle:        defaultSessionTitleConfig(), SessionTitleLLM: defaultSessionTitleLLMConfig(),
+		ToolTimeoutPolicyEnabled:    &timeoutPolicyEnabled,
+		TodoAllowParallelInProgress: &todoAllowParallel,
+		InstructionMaxBytes:         defaultInstructionMaxBytes,
+		SessionTitle:                defaultSessionTitleConfig(), SessionTitleLLM: defaultSessionTitleLLMConfig(),
 		Compaction: defaultCompactionConfig(), ToolResultPruner: defaultToolResultPruneConfig(),
 		Spill: defaultSpillConfig(), RepeatToolReminder: defaultRepeatToolReminderConfig(),
-		FileReference:          defaultFileReferenceConfig(),
-		SubagentReportDelivery: "next-step",
-		DynamicCordisVMTimeout: 5 * time.Second,
-		RetryPolicy:            defaultRetryPolicy(),
-		MaxBodyBytes:           140 << 20,
+		Jobs:                        JobsConfig{WaitTimeoutMs: 30 * time.Second, MaxWaitTimeoutMs: 10 * time.Minute, CompletionDelivery: "wakeup", MaxConsecutiveWakes: 3},
+		FileReference:               defaultFileReferenceConfig(),
+		SubagentReportDelivery:      "next-step",
+		DynamicCordisVMTimeout:      5 * time.Second,
+		RetryPolicy:                 defaultRetryPolicy(),
+		MaxBodyBytes:                140 << 20,
+		ImageCompressionConcurrency: 2,
+		MaxParallelToolCalls:        10,
 	}
 }
 
 func normalizeConfig(c Config) Config {
 	d := DefaultConfig()
+	if c.ToolTimeoutPolicyEnabled == nil {
+		value := true
+		if d.ToolTimeoutPolicyEnabled != nil {
+			value = *d.ToolTimeoutPolicyEnabled
+		}
+		c.ToolTimeoutPolicyEnabled = &value
+	} else {
+		value := *c.ToolTimeoutPolicyEnabled
+		c.ToolTimeoutPolicyEnabled = &value
+	}
+	if c.TodoAllowParallelInProgress == nil {
+		value := true
+		c.TodoAllowParallelInProgress = &value
+	} else {
+		value := *c.TodoAllowParallelInProgress
+		c.TodoAllowParallelInProgress = &value
+	}
 	if c.DataDir == "" {
 		c.DataDir = d.DataDir
 	}
@@ -180,12 +322,6 @@ func normalizeConfig(c Config) Config {
 		c.APIKey = d.APIKey
 	}
 	c.LaunchEnvironment = cloneLaunchEnvironment(c.LaunchEnvironment)
-	if c.WebSearchProvider == "" {
-		c.WebSearchProvider = d.WebSearchProvider
-	}
-	if c.WebFetchProvider == "" {
-		c.WebFetchProvider = d.WebFetchProvider
-	}
 	c.WebTools = normalizeWebToolConfig(c.WebTools)
 	c.HTTPWebFetch = normalizeHTTPWebFetchConfig(c.HTTPWebFetch)
 	if c.ToolPresentation == "" {
@@ -197,11 +333,17 @@ func normalizeConfig(c Config) Config {
 	if c.InstructionMaxBytes == 0 {
 		c.InstructionMaxBytes = d.InstructionMaxBytes
 	}
+	if c.ImageCompressionConcurrency == 0 {
+		c.ImageCompressionConcurrency = d.ImageCompressionConcurrency
+	}
 	if c.ClientHMRPollInterval <= 0 {
 		c.ClientHMRPollInterval = d.ClientHMRPollInterval
 	}
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = d.MaxBodyBytes
+	}
+	if c.MaxParallelToolCalls == 0 {
+		c.MaxParallelToolCalls = d.MaxParallelToolCalls
 	}
 	c.SessionTitle = normalizeSessionTitleConfig(c.SessionTitle)
 	c.SessionTitleLLM = normalizeSessionTitleLLMConfig(c.SessionTitleLLM)
@@ -210,6 +352,18 @@ func normalizeConfig(c Config) Config {
 	c.ToolResultPruner = normalizeToolResultPruneConfig(c.ToolResultPruner)
 	c.Spill = normalizeSpillConfig(c.Spill)
 	c.RepeatToolReminder = normalizeRepeatToolReminderConfig(c.RepeatToolReminder)
+	if c.Jobs.WaitTimeoutMs <= 0 {
+		c.Jobs.WaitTimeoutMs = d.Jobs.WaitTimeoutMs
+	}
+	if c.Jobs.MaxWaitTimeoutMs <= 0 {
+		c.Jobs.MaxWaitTimeoutMs = d.Jobs.MaxWaitTimeoutMs
+	}
+	if c.Jobs.CompletionDelivery == "" {
+		c.Jobs.CompletionDelivery = d.Jobs.CompletionDelivery
+	}
+	if c.Jobs.MaxConsecutiveWakes <= 0 {
+		c.Jobs.MaxConsecutiveWakes = d.Jobs.MaxConsecutiveWakes
+	}
 	c.FileReference = normalizeFileReferenceConfig(c.FileReference)
 	c.Storage = cloneStorageRuntimeConfig(c.Storage)
 	if c.SubagentReportDelivery == "" {
@@ -354,6 +508,7 @@ type ContentBlock struct {
 	ToolCallID string              `json:"toolCallId,omitempty"`
 	Content    []ContentBlock      `json:"content,omitempty"`
 	IsError    bool                `json:"isError,omitempty"`
+	Extra      map[string]any      `json:"-"`
 }
 
 type PromptContentPart struct {
@@ -362,17 +517,19 @@ type PromptContentPart struct {
 	MediaType string `json:"mediaType,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Name      string `json:"name,omitempty"`
+	decoded   []byte
 }
 
 type PromptRequest struct {
-	SessionID      string                  `json:"sessionId,omitempty"`
-	Mode           string                  `json:"mode,omitempty"`
-	Content        []PromptContentPart     `json:"content"`
-	ClientTimeZone string                  `json:"clientTimeZone,omitempty"`
-	References     []SessionReferenceInput `json:"references,omitempty"`
-	Literal        bool                    `json:"-"`
-	RPCID          string                  `json:"-"`
-	Source         map[string]any          `json:"-"`
+	SessionID       string                  `json:"sessionId,omitempty"`
+	Mode            string                  `json:"mode,omitempty"`
+	Content         []PromptContentPart     `json:"content"`
+	ClientTimeZone  string                  `json:"clientTimeZone,omitempty"`
+	References      []SessionReferenceInput `json:"references,omitempty"`
+	Literal         bool                    `json:"-"`
+	RPCID           string                  `json:"-"`
+	Source          map[string]any          `json:"-"`
+	preparedContent []ContentBlock
 }
 
 type ModelSelection struct {
@@ -403,6 +560,7 @@ type ChatMessage struct {
 	ReasoningSignature string            `json:"reasoning_signature,omitempty"`
 	ToolCalls          []ToolCall        `json:"tool_calls,omitempty"`
 	ToolCallID         string            `json:"tool_call_id,omitempty"`
+	Source             map[string]any    `json:"-"`
 }
 
 type ChatImage struct {
@@ -495,11 +653,19 @@ type ToolError struct {
 }
 
 type ToolResult struct {
-	Content []ContentBlock `json:"content,omitempty"`
-	IsError bool           `json:"isError,omitempty"`
-	Error   *ToolError     `json:"error,omitempty"`
-	Value   any            `json:"-"`
-	Meta    any            `json:"-"`
+	Content            []ContentBlock `json:"content,omitempty"`
+	IsError            bool           `json:"isError,omitempty"`
+	Error              *ToolError     `json:"error,omitempty"`
+	Value              any            `json:"-"`
+	Meta               any            `json:"-"`
+	AdditionalContexts []ToolContext  `json:"-"`
+	ConcludesTurn      bool           `json:"-"`
+}
+
+// ToolContext is a model-visible user message deferred until the next step.
+type ToolContext struct {
+	Content []ContentBlock
+	Source  map[string]any
 }
 
 type TodoItem struct {
@@ -511,10 +677,26 @@ type TodoItem struct {
 // CLIs. Arguments remain raw JSON so a tool can apply its own schema policy.
 type ToolExecutor func(context.Context, ToolCall) (ToolResult, error)
 
+type ToolRuntimeExecutor func(*ToolRunContext) (ToolResult, error)
+type ToolOutputRenderer func(ToolCall, any) ([]ContentBlock, error)
+type ToolPresentationMeta func(ToolCall, any) (any, error)
+type ToolContentFinalizer func(ToolCall, ToolResult) ([]ContentBlock, error)
+
 type Tool struct {
 	Schema  ToolSchema
 	Timeout time.Duration
-	Execute ToolExecutor
+	// TimeoutPolicyEnabled is normally populated by Engine registration from
+	// Config.ToolTimeoutPolicyEnabled. A nil value keeps direct library tools
+	// compatible with the historical default (policy enabled).
+	TimeoutPolicyEnabled *bool
+	Execute              ToolExecutor
+	ExecuteRuntime       ToolRuntimeExecutor
+	RenderOutput         ToolOutputRenderer
+	PresentationMeta     ToolPresentationMeta
+	FinalizeContent      ToolContentFinalizer
+	// IsConcurrencySafe opts a call into bounded parallel dispatch. Missing,
+	// false, and panicking classifiers all fail closed to exclusive execution.
+	IsConcurrencySafe func(ToolCall) bool
 }
 
 type Provider interface {
@@ -522,6 +704,12 @@ type Provider interface {
 	Name() string
 	Models(context.Context) ([]ModelInfo, error)
 	Complete(context.Context, ChatRequest, func(Delta) error) (Completion, error)
+}
+
+// ExactModelInfoResolver resolves the exact configured route independently of
+// advisory model-list discovery.
+type ExactModelInfoResolver interface {
+	ResolveModelInfo(context.Context, string) (ModelInfo, error)
 }
 
 type SessionHeader struct {
@@ -593,10 +781,15 @@ type Session struct {
 	// It is intentionally private: callers use the host/session APIs rather than
 	// mutating lifecycle state behind the Engine registry.
 	attached          bool
+	published         bool
 	draining          bool
 	firstLiveSeq      int
 	Running           bool
 	Cancel            context.CancelFunc
+	activity          *sessionActivity
+	claimed           *queuedPrompt
+	activePrompt      *queuedPrompt
+	parked            bool
 	maintenance       bool
 	maintenanceWake   bool
 	maintenanceCancel context.CancelFunc
@@ -605,15 +798,44 @@ type Session struct {
 	steering          []*queuedPrompt
 	// requestHeaderLogged belongs to the live agent attachment. A cold session
 	// logs one resume snapshot before its first provider request.
-	requestHeaderLogged bool
-	repeatToolKey       string
-	repeatToolCount     int
-	personaOverride     string
-	toolRestriction     *sessionToolRestriction
-	scheduleMu          sync.Mutex
-	mu                  sync.Mutex
-	store               SessionStore
-	invariants          *InvariantRegistry
+	requestHeaderLogged       bool
+	repeatToolKey             string
+	repeatToolCount           int
+	personaOverride           string
+	toolRestriction           *sessionToolRestriction
+	presetRuntime             *presetRuntimeGeneration
+	initialSubagentDescriptor *SubagentDescriptorData
+	planIntent                *planModeIntent
+	scheduleMu                sync.Mutex
+	mu                        sync.Mutex
+	store                     SessionStore
+	invariants                *InvariantRegistry
+}
+
+type AgentCancelCause struct {
+	Kind   string `json:"kind"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type CancelAgentOptions struct {
+	KeepInbox bool
+	ParkInbox bool
+}
+
+type agentCancelError struct {
+	cause AgentCancelCause
+}
+
+func (e *agentCancelError) Error() string {
+	if e.cause.Kind == "hook" && e.cause.Reason != "" {
+		return "agent cancelled by hook: " + e.cause.Reason
+	}
+	return "agent cancelled: " + e.cause.Kind
+}
+
+type sessionActivity struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 }
 
 type Workspace struct {
@@ -662,53 +884,79 @@ func (e *AgentPresetConflictError) Error() string {
 }
 
 type Engine struct {
-	cfg                   Config
-	mu                    sync.RWMutex
-	sessions              map[string]*Session
-	providers             map[string]Provider
-	subagentProviders     map[string]SubagentProvider
-	piAIProviders         map[string]*managedPiAIProvider
-	retryPolicies         map[string]RetryPolicy
-	webSearchProviders    map[string]WebSearchProvider
-	webFetchProviders     map[string]WebFetchProvider
-	tools                 map[string]Tool
-	toolOwners            map[string]string
-	workspaces            map[string]*Workspace
-	workspaceOrder        []string
-	archived              map[string]bool
-	goals                 map[string]goalState
-	settings              map[string]map[string]any
-	settingsRev           map[string]int
-	credentials           map[string]string
-	credentialRecords     map[CredentialKey]CredentialRecord
-	credentialRecordOrder []CredentialKey
-	credentialService     *CredentialService
-	authorizationService  *AuthorizationService
-	subs                  map[string]map[chan Event]struct{}
-	hostSubs              map[chan map[string]any]struct{}
-	muxSubs               map[chan map[string]any]struct{}
-	pendingMu             sync.Mutex
-	pending               map[string]*pendingInteraction
-	scheduleRuntimeMu     sync.Mutex
-	scheduleRuntimes      map[string]*scheduleRuntime
-	dynamicCordis         *dynamicCordisState
-	fsState               *fsObservationState
-	fileReferenceMu       sync.Mutex
-	fileReferenceSearches map[string]*WorkspaceFileSearch
-	jobs                  *jobRegistry
-	shells                *persistentShellRegistry
-	terminals             *terminalRegistry
-	e2b                   *E2BRuntime
-	lsp                   *lspRegistry
-	telemetry             *sessionTelemetryCoordinator
-	agentTeams            *TeamService
-	sessionStore          SessionStore
-	sessionProjections    *SessionProjectionRegistry
-	projectionCache       *sessionProjectionCache
-	storage               *StorageHub
-	storageBackends       []StorageBackend
-	storageDisposers      []func()
-	storageDomain         *DomainFacility
+	cfg                       Config
+	mu                        sync.RWMutex
+	pluginInventoryMu         sync.RWMutex
+	pluginInventory           []PluginInventoryEntry
+	presetRuntimeMu           sync.Mutex
+	presetRuntimes            map[string]*presetRuntimeGeneration
+	sessions                  map[string]*Session
+	providers                 map[string]Provider
+	subagentProviders         map[string]SubagentProvider
+	subagentProviderOrder     []string
+	subagentProviderTokens    map[string]uint64
+	nextSubagentProviderToken uint64
+	piAIProviders             map[string]*managedPiAIProvider
+	retryPolicies             map[string]RetryPolicy
+	webSearchProviders        map[string]WebSearchProvider
+	webSearchProviderOrder    []string
+	webSearchProviderTokens   map[string]*byte
+	webFetchProviders         map[string]WebFetchProvider
+	webFetchProviderOrder     []string
+	webFetchProviderTokens    map[string]*byte
+	hostWebSearchDisposers    map[string]func()
+	hostWebFetchDisposers     map[string]func()
+	tools                     map[string]Tool
+	toolOwners                map[string]string
+	hostToolModules           map[string]string
+	scopedTools               map[string]map[string]Tool
+	structuredOutputs         map[string]*structuredOutputRuntime
+	workspaces                map[string]*Workspace
+	workspaceOrder            []string
+	archived                  map[string]bool
+	goals                     map[string]goalState
+	settings                  map[string]map[string]any
+	settingsRev               map[string]int
+	credentials               map[string]string
+	credentialRecords         map[CredentialKey]CredentialRecord
+	credentialRecordOrder     []CredentialKey
+	credentialService         *CredentialService
+	authorizationService      *AuthorizationService
+	subs                      map[string]map[chan Event]struct{}
+	hostSubs                  map[chan map[string]any]struct{}
+	muxSubs                   map[chan map[string]any]struct{}
+	pendingMu                 sync.Mutex
+	pending                   map[string]*pendingInteraction
+	scheduleRuntimeMu         sync.Mutex
+	scheduleRuntimes          map[string]*scheduleRuntime
+	dynamicCordis             *dynamicCordisState
+	fsState                   *fsObservationState
+	fileReferenceMu           sync.Mutex
+	fileReferenceSearches     map[string]*WorkspaceFileSearch
+	attachmentRequestMu       sync.Mutex
+	attachmentRequestInflight map[string]*sharedRequestImage
+	imageCompression          chan struct{}
+	jobs                      *jobRegistry
+	shellEnv                  *shellEnvironmentRegistry
+	shells                    *persistentShellRegistry
+	terminals                 *terminalRegistry
+	e2b                       *E2BRuntime
+	lsp                       *lspRegistry
+	telemetry                 *sessionTelemetryCoordinator
+	agentTeams                *TeamService
+	modelSubagentMu           sync.Mutex
+	modelSubagentActivations  map[string]*modelSubagentActivation
+	modelSubagentLocks        sync.Map
+	jobWakeMu                 sync.Mutex
+	jobWakes                  map[string]int
+	subagentActivationSetups  *subagentActivationSetupRegistry
+	sessionStore              SessionStore
+	sessionProjections        *SessionProjectionRegistry
+	projectionCache           *sessionProjectionCache
+	storage                   *StorageHub
+	storageBackends           []StorageBackend
+	storageDisposers          []func()
+	storageDomain             *DomainFacility
 	// DeepSeek Files uploads are shared by every provider snapshot in this
 	// process. The provider endpoint/key remain request-scoped; only the
 	// owner-private index and in-flight upload coordination are shared.
@@ -795,6 +1043,12 @@ func New(opts ...Option) (*Engine, error) {
 	if cfg.InstructionMaxBytes < 0 {
 		return nil, errors.New("agent-instructions: maxBytes must be non-negative")
 	}
+	if cfg.MaxParallelToolCalls < 1 {
+		return nil, errors.New("agent-loop: maxParallelToolCalls must be a positive integer")
+	}
+	if cfg.ImageCompressionConcurrency < 1 || cfg.ImageCompressionConcurrency > 8 {
+		return nil, errors.New("attachment-local: imageCompressionConcurrency must be an integer from 1 through 8")
+	}
 	if err := validateWebServerConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -804,6 +1058,9 @@ func New(opts ...Option) (*Engine, error) {
 		}
 	}
 	if cfg.AgentTeams != nil {
+		if !cfg.Persist {
+			return nil, &TeamError{Code: "TEAM_PERSISTENCE_UNAVAILABLE", Message: "Agent Teams requires session persistence"}
+		}
 		normalized, err := normalizeAgentTeamConfig(*cfg.AgentTeams)
 		if err != nil {
 			return nil, err
@@ -824,7 +1081,7 @@ func New(opts ...Option) (*Engine, error) {
 		return nil, err
 	}
 	titleCtx, titleCancel := context.WithCancel(context.Background())
-	e := &Engine{cfg: cfg, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webFetchProviders: map[string]WebFetchProvider{}, tools: map[string]Tool{}, toolOwners: map[string]string{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, jobs: newJobRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, storage: NewStorageHub()}
+	e := &Engine{cfg: cfg, pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, modelSubagentActivations: map[string]*modelSubagentActivation{}, subagentActivationSetups: newSubagentActivationSetupRegistry(), storage: NewStorageHub(), jobWakes: map[string]int{}}
 	sessionProjections.setRuntimeExecutor(func(job func()) error {
 		if !e.dynamicCordis.loop.call(job) {
 			return errors.New("dynamic Cordis runtime is closed")
@@ -838,6 +1095,7 @@ func New(opts ...Option) (*Engine, error) {
 		})
 	})
 	e.credentialService = newCredentialService(e)
+	e.jobs.onDone("", func(snapshot jobSnapshot) { e.deliverJobCompletion(snapshot) })
 	e.authorizationService = newAuthorizationService(e.credentialService)
 	e.authorizationService.Subscribe(func(key CredentialKey, settlement AuthorizationSettlement) error {
 		return e.dispatchDynamicCordisEvent(nil, "", true, "authorization/settled", string(key), string(settlement))
@@ -890,19 +1148,8 @@ func New(opts ...Option) (*Engine, error) {
 	// The provider resolves its key and endpoint per request, so onboarding can
 	// write credentials and become usable without restarting the host.
 	e.RegisterProvider(&managedDeepSeekProvider{engine: e})
-	if err := e.RegisterWebSearchProvider(&deepSeekWebSearchProvider{engine: e}); err != nil {
+	if err := e.reconcileHostWebProviderRegistry(); err != nil {
 		return nil, err
-	}
-	if err := e.RegisterWebSearchProvider(NewExaSearchProvider(cfg.ExaSearch)); err != nil {
-		return nil, err
-	}
-	if err := e.RegisterWebSearchProvider(NewPerplexitySearchProvider(cfg.PerplexitySearch)); err != nil {
-		return nil, err
-	}
-	if cfg.WebFetchProvider == "http" {
-		if err := e.RegisterWebFetchProvider(NewHTTPWebFetchProvider(cfg.HTTPWebFetch)); err != nil {
-			return nil, err
-		}
 	}
 	if cfg.APIKey != "" && cfg.Provider != "deepseek-official" {
 		p := NewOpenAIProvider(cfg.Provider, cfg.BaseURL, cfg.APIKey, cfg.Model)
@@ -984,6 +1231,12 @@ func New(opts ...Option) (*Engine, error) {
 		}
 		e.sessionStore = store
 		e.cfg.SessionStore = store
+		if e.agentTeams != nil {
+			if _, ok := store.(SessionPersistenceFlusher); !ok {
+				_ = e.Close()
+				return nil, &TeamError{Code: "TEAM_PERSISTENCE_UNAVAILABLE", Message: "Agent Teams requires durable session flush support"}
+			}
+		}
 		if cfg.SessionProjectionCache != nil {
 			e.projectionCache, err = newSessionProjectionCache(cfg.DataDir, *cfg.SessionProjectionCache, e.sessionProjections)
 			if err != nil {
@@ -1020,7 +1273,385 @@ func New(opts ...Option) (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) Config() Config { return e.cfg }
+func (e *Engine) Config() Config {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg
+}
+
+// ApplyRuntimeConfig updates configuration-derived runtime projections while
+// keeping this Engine and its live sessions intact. Profile patch reloads use
+// this boundary instead of replacing the whole Engine, matching Cordis' in
+// place Loader update semantics.
+func (e *Engine) ApplyRuntimeConfig(cfg Config) error {
+	if e == nil {
+		return errors.New("engine is nil")
+	}
+	if err := validateRuntimePolicies(cfg); err != nil {
+		return err
+	}
+	if err := validateSessionTitleLLMConfig(cfg.SessionTitleLLM); err != nil {
+		return err
+	}
+	seenProviders := make(map[string]struct{}, len(cfg.SubagentProviders))
+	for _, provider := range cfg.SubagentProviders {
+		if provider == nil {
+			return errors.New("subagent provider is required")
+		}
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			return errors.New("subagent provider name is required")
+		}
+		if _, exists := seenProviders[name]; exists {
+			return subagentServiceError("DUPLICATE_PROVIDER", fmt.Sprintf("a subagent provider named %q is declared more than once", name), nil)
+		}
+		seenProviders[name] = struct{}{}
+	}
+	previousConfig := e.Config()
+	// Inventory phases are live state (pending/active/failed/unloading), not
+	// merely the config snapshot. Capture the current projection before a
+	// reload so rollback preserves what clients could actually observe.
+	previousInventory := e.pluginInventorySnapshot()
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return errors.New("engine is closed")
+	}
+	previousProviders := make(map[string]SubagentProvider, len(e.subagentProviders))
+	for name, provider := range e.subagentProviders {
+		previousProviders[name] = provider
+	}
+	previousProviderOrder := append([]string(nil), e.subagentProviderOrder...)
+	terminalChanged := !reflect.DeepEqual(previousConfig.TerminalTool, cfg.TerminalTool)
+	e.cfg = cfg
+	e.mu.Unlock()
+	e.setToolTimeoutPolicyEnabled(cfg.ToolTimeoutPolicyEnabled)
+	e.SetPluginInventory(cfg.PluginInventory)
+	if terminalChanged {
+		for _, name := range []string{"terminal_open", "terminal_send", "terminal_read", "terminal_signal", "terminal_close", "terminal_list"} {
+			e.unregisterToolFrom(nil, name)
+		}
+	}
+	if err := e.reconcileMCPServers(context.Background(), cfg.MCPServers); err != nil {
+		return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, false, false, false, terminalChanged, false, err)
+	}
+	telemetryChanged := !equivalentSessionTelemetryConfig(previousConfig.SessionTelemetry, cfg.SessionTelemetry)
+	if telemetryChanged {
+		if err := e.replaceSessionTelemetryCoordinator(cfg.SessionTelemetry); err != nil {
+			return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, false, false, false, terminalChanged, false, err)
+		}
+	}
+	titleChanged := !reflect.DeepEqual(previousConfig.SessionTitleLLM, cfg.SessionTitleLLM)
+	if titleChanged {
+		if err := e.replaceSessionTitleProvider(cfg.SessionTitleLLM); err != nil {
+			return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, true, false, terminalChanged, false, err)
+		}
+	}
+	todoPolicyChanged := boolConfigValue(previousConfig.TodoAllowParallelInProgress, true) != boolConfigValue(cfg.TodoAllowParallelInProgress, true)
+	hostRegistryChanged := !reflect.DeepEqual(previousConfig.PluginInventory, cfg.PluginInventory) ||
+		!reflect.DeepEqual(previousConfig.WebTools, cfg.WebTools) ||
+		!reflect.DeepEqual(previousConfig.ExaSearch, cfg.ExaSearch) ||
+		!reflect.DeepEqual(previousConfig.PerplexitySearch, cfg.PerplexitySearch) ||
+		!reflect.DeepEqual(previousConfig.HTTPWebFetch, cfg.HTTPWebFetch) ||
+		previousConfig.WebSearchProvider != cfg.WebSearchProvider ||
+		previousConfig.WebFetchProvider != cfg.WebFetchProvider ||
+		!reflect.DeepEqual(previousConfig.LSPTool, cfg.LSPTool) ||
+		previousConfig.ScheduleEnabled != cfg.ScheduleEnabled || terminalChanged || todoPolicyChanged
+	if hostRegistryChanged {
+		if err := e.reconcileHostWebProviderRegistry(); err != nil {
+			return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, titleChanged, true, terminalChanged, false, err)
+		}
+		if err := e.reconcileHostToolRegistry(); err != nil {
+			return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, titleChanged, true, terminalChanged, false, err)
+		}
+	}
+	if terminalChanged {
+		if err := e.reconcileTerminalToolRegistry(); err != nil {
+			return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, titleChanged, hostRegistryChanged, terminalChanged, true, err)
+		}
+	}
+	for name := range previousProviders {
+		if !containsSubagentProvider(cfg.SubagentProviders, name) {
+			e.UnregisterSubagentProvider(name)
+		}
+	}
+	for _, provider := range cfg.SubagentProviders {
+		if provider == nil {
+			continue
+		}
+		if err := e.RegisterSubagentProvider(provider); err != nil {
+			// Existing names are intentionally replaced so a changed profile
+			// config takes effect for subsequent starts.
+			if !e.UnregisterSubagentProvider(provider.Name()) {
+				return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, titleChanged, hostRegistryChanged, terminalChanged, true, err)
+			}
+			if err := e.RegisterSubagentProvider(provider); err != nil {
+				return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, telemetryChanged, titleChanged, hostRegistryChanged, terminalChanged, true, err)
+			}
+		}
+	}
+	return nil
+}
+
+func boolConfigValue(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+// rollbackRuntimeConfig restores every runtime projection that may have been
+// touched by an in-place update. Errors from each restoration stage are
+// joined with the original failure so callers can distinguish partial rollback.
+func (e *Engine) rollbackRuntimeConfig(previous Config, inventory []PluginInventoryEntry, providers map[string]SubagentProvider, order []string, telemetry, title, host, terminal, providerRoster bool, cause error) error {
+	e.mu.Lock()
+	e.cfg = previous
+	e.mu.Unlock()
+	e.setToolTimeoutPolicyEnabled(previous.ToolTimeoutPolicyEnabled)
+	e.SetPluginInventory(inventory)
+	errs := []error{cause}
+	if err := e.reconcileMCPServers(context.Background(), previous.MCPServers); err != nil {
+		errs = append(errs, err)
+	}
+	if telemetry {
+		if err := e.replaceSessionTelemetryCoordinator(previous.SessionTelemetry); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if title {
+		if err := e.replaceSessionTitleProvider(previous.SessionTitleLLM); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if host {
+		if err := e.reconcileHostWebProviderRegistry(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := e.reconcileHostToolRegistry(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if terminal {
+		if err := e.reconcileTerminalToolRegistry(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if providerRoster {
+		if err := e.restoreSubagentProviders(providers, order); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// setToolTimeoutPolicyEnabled updates all registered tools in place when the
+// profile mounts or unmounts the timeout-policy plugin. The plugin is global
+// to tools/execute, so agent-owned tools must follow the same switch as Host
+// tools and cannot be limited to registry rebuilds.
+func (e *Engine) setToolTimeoutPolicyEnabled(value *bool) {
+	enabled := true
+	if value != nil {
+		enabled = *value
+	}
+	e.mu.Lock()
+	for name, tool := range e.tools {
+		if tool.Timeout <= 0 {
+			continue
+		}
+		flag := enabled
+		tool.TimeoutPolicyEnabled = &flag
+		e.tools[name] = tool
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) reconcileTerminalToolRegistry() error {
+	var failures []error
+	for _, name := range []string{"terminal_open", "terminal_send", "terminal_read", "terminal_signal", "terminal_close", "terminal_list"} {
+		if _, err := e.unregisterToolFrom(nil, name); err != nil {
+			failures = append(failures, fmt.Errorf("remove terminal tool %q: %w", name, err))
+		}
+	}
+	if e.cfg.TerminalTool.Disabled {
+		return errors.Join(failures...)
+	}
+	for _, tool := range builtinTerminalTools(e) {
+		if err := e.RegisterTool(tool); err != nil {
+			failures = append(failures, fmt.Errorf("register terminal tool %q: %w", tool.Schema.Name, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// restoreSubagentProviders restores the exact previous provider roster after
+// a failed runtime update. Registrations are replayed in their original order
+// so provider discovery remains deterministic; every teardown/registration
+// error is retained for the caller instead of silently losing rollback data.
+func (e *Engine) restoreSubagentProviders(previous map[string]SubagentProvider, order []string) error {
+	e.mu.RLock()
+	current := make([]string, 0, len(e.subagentProviders))
+	for name := range e.subagentProviders {
+		current = append(current, name)
+	}
+	e.mu.RUnlock()
+	sort.Strings(current)
+	var failures []error
+	for _, name := range current {
+		if e.UnregisterSubagentProvider(name) {
+			continue
+		}
+	}
+	for _, name := range order {
+		provider := previous[name]
+		if provider == nil {
+			continue
+		}
+		if err := e.RegisterSubagentProvider(provider); err != nil {
+			failures = append(failures, fmt.Errorf("restore subagent provider %q: %w", name, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (e *Engine) hasRegisteredTool(name string) bool {
+	e.mu.RLock()
+	_, ok := e.tools[name]
+	e.mu.RUnlock()
+	return ok
+}
+
+func (e *Engine) replaceSessionTelemetryCoordinator(config *SessionTelemetryConfig) error {
+	coordinator, err := newSessionTelemetryCoordinator(config, e.cfg.DataDir, e.cfg.Version)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	previous := e.telemetry
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
+	}
+	e.telemetry = coordinator
+	e.mu.Unlock()
+	if previous != nil {
+		previous.close(sessions)
+	}
+	return nil
+}
+
+// reconcileHostToolRegistry mirrors Loader disposal for the Host-owned tool
+// plugins. Agent-preset tools are intentionally excluded: they remain in the
+// process-wide registry and are filtered per session by their pinned preset
+// generation. Dynamic Cordis tools are also excluded from this reset.
+func (e *Engine) reconcileHostToolRegistry() error {
+	e.mu.RLock()
+	names := make([]string, 0, len(e.hostToolModules))
+	for name := range e.hostToolModules {
+		names = append(names, name)
+	}
+	e.mu.RUnlock()
+	sort.Strings(names)
+	var failures []error
+	for _, name := range names {
+		if _, err := e.unregisterToolFrom(nil, name); err != nil {
+			failures = append(failures, fmt.Errorf("remove host tool %q: %w", name, err))
+		}
+	}
+	if err := registerBuiltinTools(e); err != nil {
+		failures = append(failures, err)
+	}
+	if err := registerWebTools(e); err != nil {
+		failures = append(failures, err)
+	}
+	if err := registerWorkflowTools(e); err != nil {
+		failures = append(failures, err)
+	}
+	if e.cfg.ScheduleEnabled {
+		if err := registerScheduleTools(e); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if e.cfg.LSPTool.Enabled {
+		if err := e.EnableLSPTool(e.cfg.LSPTool); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// reconcileHostWebProviderRegistry mirrors Cordis provider plugin fibers. A
+// provider exists only while its owning Host plugin entry is enabled; config
+// changes replace the registration so endpoint and limits take effect without
+// replacing the Engine or its sessions.
+func (e *Engine) reconcileHostWebProviderRegistry() error {
+	e.mu.Lock()
+	searchDisposers := make([]func(), 0, len(e.hostWebSearchDisposers))
+	for id, dispose := range e.hostWebSearchDisposers {
+		searchDisposers = append(searchDisposers, dispose)
+		delete(e.hostWebSearchDisposers, id)
+	}
+	fetchDisposers := make([]func(), 0, len(e.hostWebFetchDisposers))
+	for id, dispose := range e.hostWebFetchDisposers {
+		fetchDisposers = append(fetchDisposers, dispose)
+		delete(e.hostWebFetchDisposers, id)
+	}
+	cfg := e.cfg
+	e.mu.Unlock()
+	for _, dispose := range searchDisposers {
+		dispose()
+	}
+	for _, dispose := range fetchDisposers {
+		dispose()
+	}
+	active := func(module string) bool { return e.hostPluginActive(module) }
+	var failures []error
+	if active("@deepseek-ai/dsh-web-search-deepseek") {
+		if dispose, err := e.RegisterWebSearchProvider(&deepSeekWebSearchProvider{engine: e}); err != nil {
+			failures = append(failures, err)
+		} else {
+			e.mu.Lock()
+			e.hostWebSearchDisposers["deepseek-official"] = dispose
+			e.mu.Unlock()
+		}
+	}
+	if active("@deepseek-ai/dsh-web-search-exa") {
+		if dispose, err := e.RegisterWebSearchProvider(NewExaSearchProvider(cfg.ExaSearch)); err != nil {
+			failures = append(failures, err)
+		} else {
+			e.mu.Lock()
+			e.hostWebSearchDisposers["exa"] = dispose
+			e.mu.Unlock()
+		}
+	}
+	if active("@deepseek-ai/dsh-web-search-perplexity") {
+		if dispose, err := e.RegisterWebSearchProvider(NewPerplexitySearchProvider(cfg.PerplexitySearch)); err != nil {
+			failures = append(failures, err)
+		} else {
+			e.mu.Lock()
+			e.hostWebSearchDisposers["perplexity"] = dispose
+			e.mu.Unlock()
+		}
+	}
+	if active("@deepseek-ai/dsh-web-fetch-http") {
+		if dispose, err := e.RegisterWebFetchProvider(NewHTTPWebFetchProvider(cfg.HTTPWebFetch)); err != nil {
+			failures = append(failures, err)
+		} else {
+			e.mu.Lock()
+			e.hostWebFetchDisposers["http"] = dispose
+			e.mu.Unlock()
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func containsSubagentProvider(providers []SubagentProvider, name string) bool {
+	for _, provider := range providers {
+		if provider != nil && provider.Name() == name {
+			return true
+		}
+	}
+	return false
+}
 
 // SessionProjections exposes the engine's projection registry for Go library
 // integrations and custom transports.
@@ -1096,35 +1727,19 @@ func (e *Engine) registerTool(tool Tool, ownerSessionID string) error {
 }
 
 func (e *Engine) registerToolFrom(origin *dynamicCordisRun, tool Tool, ownerSessionID string) error {
-	tool.Schema.Name = strings.TrimSpace(tool.Schema.Name)
-	if tool.Schema.Name == "" {
-		return errors.New("tool name is required")
-	}
-	if tool.Execute == nil {
-		return fmt.Errorf("tool %q has no executor", tool.Schema.Name)
-	}
-	if tool.Timeout < 0 {
-		return fmt.Errorf("tool %q timeout must be non-negative", tool.Schema.Name)
-	}
-	if tool.Schema.Parameters == nil {
-		tool.Schema.Parameters = map[string]any{"type": "object"}
-	}
-	data, err := json.Marshal(tool.Schema.Parameters)
+	var err error
+	tool, err = normalizeRegisteredTool(tool)
 	if err != nil {
-		return fmt.Errorf("tool %q parameters: %w", tool.Schema.Name, err)
+		return err
 	}
-	if err := json.Unmarshal(data, &tool.Schema.Parameters); err != nil {
-		return fmt.Errorf("tool %q parameters: %w", tool.Schema.Name, err)
-	}
-	if tool.Schema.Output != nil {
-		output, ok := cloneJSON(tool.Schema.Output).(map[string]any)
-		if !ok {
-			return fmt.Errorf("tool %q output schema must be a JSON object", tool.Schema.Name)
+	if tool.Timeout > 0 && tool.TimeoutPolicyEnabled == nil {
+		e.mu.RLock()
+		enabled := true
+		if e.cfg.ToolTimeoutPolicyEnabled != nil {
+			enabled = *e.cfg.ToolTimeoutPolicyEnabled
 		}
-		if err := validateWorkflowSchema(output, false); err != nil {
-			return fmt.Errorf("tool %q output schema: %w", tool.Schema.Name, err)
-		}
-		tool.Schema.Output = output
+		e.mu.RUnlock()
+		tool.TimeoutPolicyEnabled = &enabled
 	}
 	e.mu.Lock()
 	if _, exists := e.tools[tool.Schema.Name]; exists {
@@ -1132,6 +1747,9 @@ func (e *Engine) registerToolFrom(origin *dynamicCordisRun, tool Tool, ownerSess
 		return fmt.Errorf("tool already registered: %s", tool.Schema.Name)
 	}
 	e.tools[tool.Schema.Name] = tool
+	if module := hostToolModuleByName[tool.Schema.Name]; module != "" {
+		e.hostToolModules[tool.Schema.Name] = module
+	}
 	if ownerSessionID != "" {
 		e.toolOwners[tool.Schema.Name] = ownerSessionID
 	}
@@ -1144,6 +1762,40 @@ func (e *Engine) registerToolFrom(origin *dynamicCordisRun, tool Tool, ownerSess
 		return err
 	}
 	return nil
+}
+
+func normalizeRegisteredTool(tool Tool) (Tool, error) {
+	tool.Schema.Name = strings.TrimSpace(tool.Schema.Name)
+	if tool.Schema.Name == "" {
+		return Tool{}, errors.New("tool name is required")
+	}
+	if tool.Execute == nil && tool.ExecuteRuntime == nil {
+		return Tool{}, fmt.Errorf("tool %q has no executor", tool.Schema.Name)
+	}
+	if tool.Timeout < 0 {
+		return Tool{}, fmt.Errorf("tool %q timeout must be non-negative", tool.Schema.Name)
+	}
+	if tool.Schema.Parameters == nil {
+		tool.Schema.Parameters = map[string]any{"type": "object"}
+	}
+	data, err := json.Marshal(tool.Schema.Parameters)
+	if err != nil {
+		return Tool{}, fmt.Errorf("tool %q parameters: %w", tool.Schema.Name, err)
+	}
+	if err := json.Unmarshal(data, &tool.Schema.Parameters); err != nil {
+		return Tool{}, fmt.Errorf("tool %q parameters: %w", tool.Schema.Name, err)
+	}
+	if tool.Schema.Output != nil {
+		output, ok := cloneJSON(tool.Schema.Output).(map[string]any)
+		if !ok {
+			return Tool{}, fmt.Errorf("tool %q output schema must be a JSON object", tool.Schema.Name)
+		}
+		if err := validateWorkflowSchema(output, false); err != nil {
+			return Tool{}, fmt.Errorf("tool %q output schema: %w", tool.Schema.Name, err)
+		}
+		tool.Schema.Output = output
+	}
+	return tool, nil
 }
 
 // UnregisterTool removes a tool and reports whether it was present.
@@ -1160,6 +1812,7 @@ func (e *Engine) unregisterToolFrom(origin *dynamicCordisRun, name string) (bool
 	}
 	delete(e.tools, name)
 	delete(e.toolOwners, name)
+	delete(e.hostToolModules, name)
 	e.mu.Unlock()
 	return true, e.emitDynamicCordisEventFrom(origin, "tools/change")
 }
@@ -1206,7 +1859,7 @@ var shippedToolNames = map[string]bool{
 	"send_message": true, "interrupt_agent": true, "list_agents": true, "report": true,
 	"spawn_teammate": true, "followup_task": true, "wait_agent": true,
 	"team_task_create": true, "team_task_list": true, "team_task_get": true, "team_task_update": true,
-	"subagent": true, "subagent_fork": true, "ask_user_question": true,
+	"subagent": true, "subagent_fork": true, "ask_user_question": true, "exit_plan_mode": true,
 	"subagent_codex": true, "subagent_claude_code": true,
 	"todo_write": true, "web_search": true, "web_fetch": true,
 	"workflow": true, "ralph": true, "run_code": true,
@@ -1220,6 +1873,40 @@ var shippedToolNames = map[string]bool{
 	"terminal_signal": true, "terminal_close": true, "terminal_list": true,
 }
 
+// hostToolModuleByName records only tools whose lifetime is owned by a Host
+// Loader plugin. Agent-preset tools remain globally registered and are filtered
+// by toolsForSession, so they deliberately do not appear here.
+var hostToolModuleByName = map[string]string{
+	"bash":                 "@deepseek-ai/dsh-tool-bash",
+	"pwsh":                 "@deepseek-ai/dsh-tool-pwsh",
+	"read":                 "@deepseek-ai/dsh-tool-fs",
+	"read_image":           "@deepseek-ai/dsh-tool-fs",
+	"write":                "@deepseek-ai/dsh-tool-fs",
+	"edit":                 "@deepseek-ai/dsh-tool-fs",
+	"glob":                 "@deepseek-ai/dsh-tool-fs-search",
+	"grep":                 "@deepseek-ai/dsh-tool-fs-search",
+	"str_replace_editor":   "@deepseek-ai/dsh-tool-str-replace-editor",
+	"job_output":           "@deepseek-ai/dsh-tool-jobs",
+	"job_list":             "@deepseek-ai/dsh-tool-jobs",
+	"job_kill":             "@deepseek-ai/dsh-tool-jobs",
+	"todo_write":           "@deepseek-ai/dsh-tool-todo",
+	"skill":                "@deepseek-ai/dsh-tool-skill",
+	"session_event_read":   "@deepseek-ai/dsh-tool-session-query",
+	"session_event_search": "@deepseek-ai/dsh-tool-session-query",
+	"session_event_trace":  "@deepseek-ai/dsh-tool-session-query",
+	"session_search":       "@deepseek-ai/dsh-tool-session-query",
+	"session_trace":        "@deepseek-ai/dsh-tool-session-query",
+	"web_search":           "@deepseek-ai/dsh-tool-web",
+	"web_fetch":            "@deepseek-ai/dsh-tool-web",
+	"workflow":             "@deepseek-ai/dsh-tool-workflow",
+	"ralph":                "@deepseek-ai/dsh-tool-ralph",
+	"run_code":             "@deepseek-ai/dsh-tools",
+	"schedule_create":      "@deepseek-ai/dsh-schedule",
+	"schedule_list":        "@deepseek-ai/dsh-schedule",
+	"schedule_delete":      "@deepseek-ai/dsh-schedule",
+	"lsp":                  "@deepseek-ai/dsh-tool-lsp",
+}
+
 func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 	runtimeConfig, err := e.runtimeForSession(s)
 	if err != nil {
@@ -1228,8 +1915,21 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 	s.mu.Lock()
 	sessionID, restriction := s.Header.ID, s.toolRestriction
 	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached
+	scheduleVisible := s.Header.Origin != "subagent"
 	s.mu.Unlock()
-	allowed := func(name, owner string) bool {
+	agentTeamModes := e.agentTeamToolModes(s, runtimeConfig)
+	allowed := func(name, owner string, scoped bool) bool {
+		if isScheduleToolName(name) && !scheduleVisible {
+			return false
+		}
+		if isAgentTeamToolName(name) {
+			if agentTeamModes[name] == "" {
+				return false
+			}
+		}
+		if scoped {
+			return true
+		}
 		if name == "report" {
 			return owner == "" && reportVisible && restriction.allows(name)
 		}
@@ -1238,26 +1938,60 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 		}
 		return restriction.allows(name)
 	}
-	if runtimeConfig.toolPresentation == "code" {
-		return e.listToolSchemas(func(name string) bool {
-			return name == "run_code" && (e.toolOwners[name] == "" || e.toolOwners[name] == sessionID)
-		}), nil
+	e.mu.RLock()
+	combined := make(map[string]Tool, len(e.tools)+len(e.scopedTools[sessionID]))
+	owners := make(map[string]string, len(e.tools))
+	scoped := make(map[string]bool, len(e.scopedTools[sessionID]))
+	for name, tool := range e.tools {
+		combined[name] = tool
+		owners[name] = e.toolOwners[name]
 	}
-	if runtimeConfig.toolNames == nil {
-		return e.listToolSchemas(func(name string) bool {
-			return allowed(name, e.toolOwners[name]) &&
-				(name != "run_code" || runtimeConfig.toolPresentation == "both")
-		}), nil
+	for name, tool := range e.scopedTools[sessionID] {
+		combined[name] = tool
+		scoped[name] = true
 	}
-	rows := e.listToolSchemas(func(name string) bool {
-		if !allowed(name, e.toolOwners[name]) {
-			return false
+	e.mu.RUnlock()
+	visible := make(map[string]Tool, len(combined))
+	for name, tool := range combined {
+		if runtimeConfig.toolPresentation == "code" {
+			if name == "run_code" && allowed(name, owners[name], scoped[name]) {
+				visible[name] = tool
+			}
+			continue
+		}
+		if !allowed(name, owners[name], scoped[name]) {
+			continue
 		}
 		if name == "run_code" {
-			return runtimeConfig.toolPresentation == "both"
+			if runtimeConfig.toolPresentation == "both" {
+				visible[name] = tool
+			}
+			continue
 		}
-		return !shippedToolNames[name] || runtimeConfig.toolNames[name]
-	})
+		if scoped[name] || runtimeConfig.toolNames == nil || !shippedToolNames[name] || runtimeConfig.toolNames[name] {
+			visible[name] = tool
+		}
+	}
+	if runtimeConfig.webTools != nil {
+		for _, name := range []string{"web_search", "web_fetch"} {
+			if _, exists := visible[name]; !exists {
+				continue
+			}
+			if tool, enabled := sessionWebTool(e, name, runtimeConfig.webTools); enabled {
+				visible[name] = tool
+			} else {
+				delete(visible, name)
+			}
+		}
+	}
+	if runtimeConfig.workflowToolName != "" && runtimeConfig.workflowToolName != "workflow" && runtimeConfig.toolNames[runtimeConfig.workflowToolName] {
+		if workflow, ok := combined["workflow"]; ok && allowed(runtimeConfig.workflowToolName, owners["workflow"], false) {
+			workflow.Schema.Name = runtimeConfig.workflowToolName
+			delete(visible, "workflow")
+			visible[runtimeConfig.workflowToolName] = workflow
+		}
+	}
+	rows := sortedToolSchemas(visible)
 	if runtimeConfig.persistentBash {
 		for index := range rows {
 			if rows[index].Name != shellToolName {
@@ -1271,7 +2005,89 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 			rows[index].Output = map[string]any{"type": "string"}
 		}
 	}
-	return rows, nil
+	for index := range rows {
+		switch rows[index].Name {
+		case "read":
+			if runtimeConfig.readLimit > 0 || runtimeConfig.readMaxLineLength > 0 {
+				params := rows[index].Parameters
+				if properties, ok := params["properties"].(map[string]any); ok {
+					if runtimeConfig.readLimit > 0 {
+						if limit, ok := properties["limit"].(map[string]any); ok {
+							limit["maximum"] = runtimeConfig.readLimit
+						}
+					}
+				}
+			}
+		case "glob":
+			if runtimeConfig.globMaxResults > 0 { /* result cap is runtime-only; schema has no cap */
+			}
+		case "grep":
+			if runtimeConfig.grepMaxMatches > 0 { /* result cap is runtime-only; schema has no cap */
+			}
+		case "bash", "pwsh":
+			if !runtimeConfig.bashEnableRunInBackground {
+				params := rows[index].Parameters
+				if properties, ok := params["properties"].(map[string]any); ok {
+					delete(properties, "run_in_background")
+				}
+			}
+		}
+	}
+	if runtimeConfig.editorDescription != "" || runtimeConfig.editorMaxOutputChars > 0 {
+		for index := range rows {
+			if rows[index].Name != "str_replace_editor" {
+				continue
+			}
+			if runtimeConfig.editorDescription != "" {
+				rows[index].Description = runtimeConfig.editorDescription
+			}
+		}
+	}
+	return e.adjustAgentTeamSchemas(rows, agentTeamModes), nil
+}
+
+func (e *Engine) adjustAgentTeamSchemas(rows []ToolSchema, modes map[string]string) []ToolSchema {
+	for index := range rows {
+		if modes[rows[index].Name] != "legacy" {
+			continue
+		}
+		if legacy, ok := legacyToolShadowedByAgentTeam(e, rows[index].Name); ok {
+			rows[index] = legacy.Schema
+		}
+	}
+	return rows
+}
+
+func (e *Engine) agentTeamToolModes(s *Session, runtimeConfig agentRuntime) map[string]string {
+	modes := map[string]string{}
+	if e.agentTeams == nil {
+		return modes
+	}
+	s.mu.Lock()
+	sessionID := s.Header.ID
+	s.mu.Unlock()
+	if runtimeConfig.teamTools {
+		if _, err := e.agentTeams.membership(sessionID); err == nil {
+			for name := range agentTeamToolNames {
+				modes[name] = "team"
+			}
+			return modes
+		}
+	}
+	if runtimeConfig.legacySubagentControl {
+		modes["send_message"], modes["interrupt_agent"] = "legacy", "legacy"
+	}
+	if runtimeConfig.legacyListAgents {
+		modes["list_agents"] = "legacy"
+	}
+	return modes
+}
+
+func (e *Engine) agentTeamToolMode(s *Session, runtimeConfig agentRuntime, name string) string {
+	if !isAgentTeamToolName(name) {
+		return ""
+	}
+	return e.agentTeamToolModes(s, runtimeConfig)[name]
 }
 
 func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
@@ -1279,10 +2095,26 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	lookupName := name
+	if name == runtimeConfig.workflowToolName && name != "workflow" {
+		lookupName = "workflow"
+	}
 	s.mu.Lock()
 	sessionID, restriction := s.Header.ID, s.toolRestriction
 	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached
+	scheduleVisible := s.Header.Origin != "subagent"
 	s.mu.Unlock()
+	e.mu.RLock()
+	_, sessionScoped := e.scopedTools[sessionID][lookupName]
+	e.mu.RUnlock()
+	if isScheduleToolName(name) && !scheduleVisible {
+		return false, nil
+	}
+	if isAgentTeamToolName(name) {
+		if e.agentTeamToolMode(s, runtimeConfig, name) == "" {
+			return false, nil
+		}
+	}
 	if runtimeConfig.toolPresentation == "code" {
 		if name != "run_code" {
 			return false, nil
@@ -1292,8 +2124,11 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 		e.mu.RUnlock()
 		return owner == "" || owner == sessionID, nil
 	}
+	if sessionScoped {
+		return true, nil
+	}
 	e.mu.RLock()
-	owner := e.toolOwners[name]
+	owner := e.toolOwners[lookupName]
 	e.mu.RUnlock()
 	if owner != "" && owner != sessionID {
 		return false, nil
@@ -1308,7 +2143,7 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 	if name == "run_code" {
 		return runtimeConfig.toolPresentation == "both", nil
 	}
-	if !shippedToolNames[name] {
+	if !shippedToolNames[lookupName] {
 		return true, nil
 	}
 	return runtimeConfig.toolNames == nil || runtimeConfig.toolNames[name], nil
@@ -1339,7 +2174,7 @@ func (e *Engine) load() error {
 		s := &Session{
 			Header: inspection.Meta, Title: sessionTitleFromEvents(inspection.Events),
 			Events: append([]Event(nil), inspection.Events...), firstLiveSeq: len(inspection.Events),
-			pending: pending, steering: steering, store: e.sessionStore, invariants: e.invariants,
+			pending: pending, steering: steering, published: true, store: e.sessionStore, invariants: e.invariants,
 		}
 		if err := e.invariants.ValidateSession(s.Header, s.Events); err != nil {
 			return fmt.Errorf("session %q: %w", s.Header.ID, err)
@@ -1614,7 +2449,7 @@ func readSession(r io.Reader) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, firstLiveSeq: len(events), pending: pending, steering: steering}, nil
+	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, firstLiveSeq: len(events), pending: pending, steering: steering, published: true}, nil
 }
 
 func (e *Engine) CreateSession(ctx context.Context, cwd, id, preset string) (string, error) {
@@ -1636,7 +2471,8 @@ func (e *Engine) createSession(ctx context.Context, meta SessionHeader, pinPermi
 	return e.createSessionWithPresetAdoption(ctx, meta, pinPermission, false)
 }
 
-func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta SessionHeader, pinPermission, adoptExistingPreset bool) (string, error) {
+func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta SessionHeader, pinPermission, adoptExistingPreset bool, publish ...bool) (string, error) {
+	deferPublish := len(publish) > 0 && !publish[0]
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -1651,6 +2487,11 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		id = newID("ses")
 	}
 	meta.CWD, meta.ID, meta.AgentPreset = cwd, id, preset
+	var presetRuntime *presetRuntimeGeneration
+	var presetRuntimeErr error
+	if preset != "" {
+		presetRuntime, presetRuntimeErr = e.presetRuntimeForCreation(preset, meta.ParentSession, nil)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if existing := e.sessions[id]; existing != nil {
@@ -1682,6 +2523,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		}
 		wasAttached := existing.attached
 		existing.attached = true
+		existing.published = true
 		startWorker := !existing.Running && (len(existing.pending) > 0 || len(existing.steering) > 0)
 		if startWorker {
 			existing.Running = true
@@ -1714,9 +2556,12 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		}
 		return id, nil
 	}
+	if presetRuntimeErr != nil {
+		return "", presetRuntimeErr
+	}
 	now := time.Now().UnixMilli()
 	meta.Version, meta.CreatedAt = SessionFormatVersion, now
-	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, attached: true, store: e.sessionStore, invariants: e.invariants}
+	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, attached: true, published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants}
 	if s.store != nil {
 		if err := s.store.Create(ctx, meta); err != nil {
 			return "", err
@@ -1747,14 +2592,33 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	s.mu.Unlock()
 	e.sessions[id] = s
 	e.mu.Unlock()
-	e.emitHost(map[string]any{"type": "host/session-added", "sessionId": id, "blank": true, "cwd": cwd, "agentPreset": preset})
-	e.emitDynamicCordisScopedContained(id, "session/created", dynamicSessionView(s))
+	if !deferPublish {
+		e.emitHost(map[string]any{"type": "host/session-added", "sessionId": id, "blank": true, "cwd": cwd, "agentPreset": preset})
+		e.emitDynamicCordisScopedContained(id, "session/created", dynamicSessionView(s))
+		e.startSessionHooks(s, "startup")
+		if e.cfg.ScheduleEnabled {
+			e.startScheduleRuntime(s)
+		}
+	}
+	e.mu.Lock()
+	return id, nil
+}
+
+func (e *Engine) publishDeferredSession(s *Session) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.attached = true
+	s.published = true
+	s.firstLiveSeq = len(s.Events)
+	s.mu.Unlock()
+	e.emitHost(map[string]any{"type": "host/session-added", "sessionId": s.Header.ID, "blank": true, "cwd": s.Header.CWD, "agentPreset": s.Header.AgentPreset})
+	e.emitDynamicCordisScopedContained(s.Header.ID, "session/created", dynamicSessionView(s))
 	e.startSessionHooks(s, "startup")
 	if e.cfg.ScheduleEnabled {
 		e.startScheduleRuntime(s)
 	}
-	e.mu.Lock()
-	return id, nil
 }
 
 func writeJSONLine(w io.Writer, value any) error {
@@ -1910,9 +2774,24 @@ func (e *Engine) publishEventFrom(origin *dynamicCordisRun, id string, event Eve
 			log.Printf("deepseek-harness: drive session projections for %q at seq %d: %v", id, event.Seq, projectionErr)
 		}
 	}
-	e.emitEvent(id, event)
 	if sessionErr == nil {
-		_ = e.dispatchDynamicCordisEvent(origin, id, true, "session/event", dynamicSessionView(s), event)
+		s.mu.Lock()
+		published := s.published
+		s.mu.Unlock()
+		if published {
+			e.emitEvent(id, event)
+		}
+	}
+	if sessionErr == nil {
+		s.mu.Lock()
+		published := s.published
+		s.mu.Unlock()
+		if published {
+			_ = e.dispatchDynamicCordisEvent(origin, id, true, "session/event", dynamicSessionView(s), event)
+		}
+		if e.agentTeams != nil {
+			e.agentTeams.observeSessionEvent(s, event)
+		}
 	}
 	if sessionErr == nil && e.projectionCache != nil {
 		e.projectionCache.observe(s, event)
@@ -2124,6 +3003,11 @@ func (e *Engine) ListSessions() []SessionSummary {
 	rows := make([]SessionSummary, 0, len(list))
 	for _, s := range list {
 		s.mu.Lock()
+		published := s.published
+		if !published {
+			s.mu.Unlock()
+			continue
+		}
 		id := s.Header.ID
 		parentID := s.Header.ParentSession
 		origin := s.Header.Origin
@@ -2262,22 +3146,94 @@ func (e *Engine) SelectModel(id string, selection ModelSelection) error {
 	return nil
 }
 
-func (e *Engine) CancelSession(id string) error {
+func normalizeAgentCancelCause(cause AgentCancelCause) (AgentCancelCause, error) {
+	switch cause.Kind {
+	case "user", "parent", "disposed":
+		cause.Reason = ""
+		return cause, nil
+	case "hook":
+		cause.Reason = strings.TrimSpace(cause.Reason)
+		if cause.Reason == "" {
+			return AgentCancelCause{}, errors.New("bad-request: hook cancellation requires reason")
+		}
+		return cause, nil
+	default:
+		return AgentCancelCause{}, errors.New("bad-request: cancellation kind must be user, parent, hook, or disposed")
+	}
+}
+
+func (e *Engine) CancelAgent(id string, cause AgentCancelCause, options CancelAgentOptions) error {
 	s, err := e.getSession(id)
 	if err != nil {
 		return err
 	}
+	cause, err = normalizeAgentCancelCause(cause)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
+	events := make([]Event, 0, 2)
+	dropped := make([]*queuedPrompt, 0)
+	if !options.KeepInbox && len(s.pending) > 0 {
+		event, appendErr := appendEventLocked(s, "agent/inbox/spliced", map[string]any{
+			"target": "next-turn", "start": 0, "removedCount": len(s.pending), "inserted": []any{}, "outcome": "canceled",
+		}, nil, nil, false)
+		if appendErr != nil {
+			s.mu.Unlock()
+			return appendErr
+		}
+		events = append(events, event)
+		dropped = append(dropped, s.pending...)
+		s.pending = nil
+	}
+	if !options.KeepInbox && len(s.steering) > 0 {
+		event, appendErr := appendEventLocked(s, "agent/inbox/spliced", map[string]any{
+			"target": "next-step", "start": 0, "removedCount": len(s.steering), "inserted": []any{}, "outcome": "canceled",
+		}, nil, nil, false)
+		if appendErr != nil {
+			s.mu.Unlock()
+			return appendErr
+		}
+		events = append(events, event)
+		dropped = append(dropped, s.steering...)
+		s.steering = nil
+	}
+	activity := s.activity
 	cancel := s.Cancel
 	maintenanceCancel := s.maintenanceCancel
+	if options.KeepInbox && (cause.Kind == "parent" || options.ParkInbox) && (activity != nil || cancel != nil) {
+		s.parked = true
+	}
 	s.mu.Unlock()
-	if cancel != nil {
+	for _, event := range events {
+		e.publishEvent(id, event)
+	}
+	if len(events) > 0 {
+		e.emitQueue(s)
+	}
+	for _, item := range dropped {
+		if item.done != nil {
+			select {
+			case item.done <- promptOutcome{err: context.Canceled}:
+			default:
+			}
+		}
+	}
+	if activity != nil {
+		activity.cancel(&agentCancelError{cause: cause})
+	} else if cancel != nil {
 		cancel()
 	}
 	if maintenanceCancel != nil {
 		maintenanceCancel()
 	}
 	return nil
+}
+
+// CancelSession is the public host/API cancellation contract: abort the active
+// user turn while preserving unclaimed inbox work for later execution.
+func (e *Engine) CancelSession(id string) error {
+	return e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{KeepInbox: true})
 }
 
 func (e *Engine) Close() error {
@@ -2317,6 +3273,7 @@ func (e *Engine) Close() error {
 	if e.agentTeams != nil {
 		teamErr = e.agentTeams.close()
 	}
+	activationErr := e.closeModelSubagentActivations()
 	e.closeFileReferenceSearches()
 	e.authorizationService.close()
 	e.credentialService.close()
@@ -2325,12 +3282,17 @@ func (e *Engine) Close() error {
 	closeMCPConnections(e)
 	e.closeSessionTitles()
 	e.closeScheduleRuntimes()
+	e.closeAttachmentRequests()
 	for _, s := range sessions {
 		s.mu.Lock()
-		if s.Cancel != nil {
-			s.Cancel()
-		}
+		activity := s.activity
+		cancel := s.Cancel
 		s.mu.Unlock()
+		if activity != nil {
+			activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
+		} else if cancel != nil {
+			cancel()
+		}
 	}
 	e.workerMu.Lock()
 	e.workersClosing = true
@@ -2371,5 +3333,5 @@ func (e *Engine) Close() error {
 	for _, ch := range eventSubs {
 		close(ch)
 	}
-	return errors.Join(teamErr, terminalErr, lspErr, projectionCacheErr, sessionStoreErr, e2bErr, invariantErr, storageErr)
+	return errors.Join(teamErr, activationErr, terminalErr, lspErr, projectionCacheErr, sessionStoreErr, e2bErr, invariantErr, storageErr)
 }

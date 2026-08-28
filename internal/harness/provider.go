@@ -42,8 +42,20 @@ func (p *EchoProvider) Complete(ctx context.Context, req ChatRequest, onDelta fu
 		return Completion{}, err
 	}
 	var text string
+	fallback := ""
 	if len(req.Messages) > 0 {
-		text = req.Messages[len(req.Messages)-1].Content
+		fallback = req.Messages[len(req.Messages)-1].Content
+	}
+	for index := len(req.Messages) - 1; index >= 0; index-- {
+		kind, _ := req.Messages[index].Source["kind"].(string)
+		if kind == "plugin" {
+			continue
+		}
+		text = req.Messages[index].Content
+		break
+	}
+	if text == "" {
+		text = fallback
 	}
 	if err := onDelta(Delta{Text: text, Finish: "stop"}); err != nil {
 		return Completion{}, err
@@ -899,6 +911,25 @@ func isContextWindowExceeded(detail string) bool {
 
 func (p *OpenAIProvider) ID() string   { return p.id }
 func (p *OpenAIProvider) Name() string { return p.id }
+func (p *OpenAIProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, err
+	}
+	if model != p.model && model != p.modelSpec.ID {
+		return ModelInfo{}, fmt.Errorf("model %q is unavailable", model)
+	}
+	if len(p.modelSpec.Input) == 0 {
+		return ModelInfo{}, fmt.Errorf("model %q has no exact capability declaration", model)
+	}
+	info := p.modelSpec.info()
+	if info.ID == "" {
+		info.ID = model
+	}
+	if info.Name == "" {
+		info.Name = model
+	}
+	return info, nil
+}
 func (p *OpenAIProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
 	if err != nil {

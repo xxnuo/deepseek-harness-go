@@ -2,7 +2,6 @@ package harness
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -24,6 +23,8 @@ var readImageMediaTypes = map[string]string{
 	".webp": "image/webp",
 	".gif":  "image/gif",
 }
+
+var errImageRouteUnresolved = errors.New("image model route could not be resolved")
 
 func imageMediaTypeForPath(path string) string {
 	return readImageMediaTypes[strings.ToLower(filepath.Ext(path))]
@@ -55,6 +56,8 @@ func readImageAttachmentError(path, mediaType string, err error) error {
 		return fmt.Errorf("cannot read %q: the image exceeds the %d-pixel decoded-size limit; downscale the image and read the smaller copy", path, maxImagePixels)
 	case strings.Contains(message, "image cannot be encoded within the normalized byte limit"):
 		return fmt.Errorf("cannot read %q: the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy", path)
+	case strings.Contains(strings.ToLower(message), "16-bit png"):
+		return fmt.Errorf("cannot read %q: the 16-bit PNG could not be converted to the normalized 8-bit sRGB form; convert it to an 8-bit PNG/JPEG/WebP and retry", path)
 	case strings.Contains(message, "declared image media type does not match the data"):
 		extension := strings.ToLower(filepath.Ext(path))
 		return fmt.Errorf("cannot read %q: the %s extension declares %s, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats", path, extension, mediaType)
@@ -63,37 +66,84 @@ func readImageAttachmentError(path, mediaType string, err error) error {
 	}
 }
 
-func imageModelSupportsInput(ctx context.Context, e *Engine, call ToolCall) error {
+func imageModelSelection(e *Engine, call ToolCall) (ModelSelection, error) {
 	if strings.TrimSpace(call.SessionID) == "" {
-		return errors.New("cannot read image: the current model route could not be resolved")
+		return ModelSelection{}, errImageRouteUnresolved
 	}
 	s, err := e.getSession(call.SessionID)
 	if err != nil {
-		return err
+		return ModelSelection{}, err
 	}
 	s.mu.Lock()
-	selection := s.Model
+	selection := cloneModelSelection(s.Model)
+	events := append([]Event(nil), s.Events...)
 	s.mu.Unlock()
+	if routed, ok := latestLoggedModel(events); ok {
+		selection = routed
+	}
+	if strings.TrimSpace(selection.Provider) == "" || strings.TrimSpace(selection.Model) == "" {
+		return ModelSelection{}, errImageRouteUnresolved
+	}
+	return selection, nil
+}
+
+func resolveExactModelInfo(ctx context.Context, e *Engine, selection ModelSelection) (ModelInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, context.Cause(ctx)
+	}
 	e.mu.RLock()
 	provider := e.providers[selection.Provider]
 	e.mu.RUnlock()
-	if provider == nil || selection.Model == "" {
-		return errors.New("cannot read image: the current model route could not be resolved")
+	if provider == nil {
+		return ModelInfo{}, errImageRouteUnresolved
+	}
+	if resolver, ok := provider.(ExactModelInfoResolver); ok {
+		model, resolveErr := resolver.ResolveModelInfo(ctx, selection.Model)
+		if resolveErr != nil {
+			if ctx.Err() != nil {
+				return ModelInfo{}, context.Cause(ctx)
+			}
+			return ModelInfo{}, resolveErr
+		}
+		return model, nil
 	}
 	models, err := provider.Models(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot read image: resolve model route: %w", err)
+		if ctx.Err() != nil {
+			return ModelInfo{}, context.Cause(ctx)
+		}
+		return ModelInfo{}, err
 	}
 	for _, model := range models {
-		if model.ID != selection.Model {
-			continue
+		if model.ID == selection.Model {
+			return model, nil
 		}
-		if containsString(model.InputModalities, "image") {
-			return nil
-		}
-		return fmt.Errorf("cannot read image: model %q does not declare image input; switch to an image-capable model to read images", selection.Model)
 	}
-	return fmt.Errorf("cannot read image: model %q is unavailable", selection.Model)
+	return ModelInfo{}, fmt.Errorf("model %q is unavailable", selection.Model)
+}
+
+func imageModelSupportsInput(ctx context.Context, e *Engine, call ToolCall, requestedPath string) error {
+	selection, err := imageModelSelection(e, call)
+	if err != nil {
+		if errors.Is(err, errImageRouteUnresolved) {
+			return fmt.Errorf("cannot read %q as an image: the current model route could not be resolved", requestedPath)
+		}
+		return err
+	}
+	model, err := resolveExactModelInfo(ctx, e, selection)
+	if err != nil {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		if errors.Is(err, errImageRouteUnresolved) {
+			return fmt.Errorf("cannot read %q as an image: the current model route could not be resolved", requestedPath)
+		}
+		return fmt.Errorf("cannot read %q as an image: resolve model route: %w", requestedPath, err)
+	}
+	if containsString(model.InputModalities, "image") {
+		return nil
+	}
+	return fmt.Errorf("cannot read %q as an image: model %q does not declare image input; switch to an image-capable model to read images", requestedPath, selection.Model)
 }
 
 func builtinReadImageTool(e *Engine) Tool {
@@ -114,6 +164,7 @@ func builtinReadImageTool(e *Engine) Tool {
 				}, "width", "height"),
 			}, "attachmentId", "mediaType", "bytes", "width", "height")}, "path", "image"),
 		},
+		IsConcurrencySafe: alwaysConcurrencySafe,
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
@@ -126,7 +177,7 @@ func builtinReadImageTool(e *Engine) Tool {
 			if mediaType == "" {
 				return ToolResult{}, fmt.Errorf("cannot read %q: read_image only accepts PNG/JPEG/WebP/GIF paths", in.FilePath)
 			}
-			if err := imageModelSupportsInput(ctx, e, call); err != nil {
+			if err := imageModelSupportsInput(ctx, e, call, in.FilePath); err != nil {
 				return ToolResult{}, err
 			}
 			if err := ctx.Err(); err != nil {
@@ -147,7 +198,7 @@ func builtinReadImageTool(e *Engine) Tool {
 			if len(data) > min(maxImageBytes, maxMessageImageBytes) {
 				return ToolResult{}, fmt.Errorf("cannot read %q: the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy", target.displayPath)
 			}
-			prepared, err := prepareImage(mediaType, base64.StdEncoding.EncodeToString(data), filepath.Base(target.displayPath))
+			prepared, err := e.prepareImageContext(ctx, decodedImageInput{mediaType: mediaType, data: data, name: filepath.Base(target.displayPath)})
 			if err != nil {
 				return ToolResult{}, readImageAttachmentError(target.displayPath, mediaType, err)
 			}

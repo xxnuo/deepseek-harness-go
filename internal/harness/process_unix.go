@@ -60,6 +60,17 @@ func killChildProcessPID(pid int) error {
 	return normalizeProcessError(syscall.Kill(-pid, syscall.SIGKILL))
 }
 
+func childProcessExitSignal(state *os.ProcessState) string {
+	if state == nil {
+		return ""
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return ""
+	}
+	return status.Signal().String()
+}
+
 func signalProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone

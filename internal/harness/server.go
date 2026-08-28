@@ -302,7 +302,7 @@ func (s *Server) Close() error {
 func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w, map[string]any{"ok": true, "version": e.cfg.Version}, http.StatusOK)
+		writeEnvelope(w, map[string]any{"ok": true, "version": e.Config().Version}, http.StatusOK)
 	})
 	mux.HandleFunc("/api/events.mux", func(w http.ResponseWriter, r *http.Request) {
 		if !e.allowed(r) {
@@ -344,7 +344,7 @@ func (e *Engine) Handler() http.Handler {
 }
 
 func (e *Engine) allowed(r *http.Request) bool {
-	return isTrustedAPIRequest(r, e.cfg.TrustedHosts)
+	return isTrustedAPIRequest(r, e.Config().TrustedHosts)
 }
 
 var loopbackOnlyRPCMethods = map[string]bool{
@@ -366,6 +366,7 @@ var loopbackOnlyRPCMethods = map[string]bool{
 }
 
 func (e *Engine) apiHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := e.Config()
 	if !e.allowed(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -384,7 +385,7 @@ func (e *Engine) apiHandler(w http.ResponseWriter, r *http.Request) {
 			RPCID  string         `json:"rpcId"`
 			Result map[string]any `json:"result"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, e.cfg.MaxBodyBytes)).Decode(&response); err != nil || response.Type != "client-response" || response.RPCID == "" || response.Result == nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, cfg.MaxBodyBytes)).Decode(&response); err != nil || response.Type != "client-response" || response.RPCID == "" || response.Result == nil {
 			writeEnvelope(w, map[string]any{"accepted": false, "reason": "bad-response"}, http.StatusOK)
 			return
 		}
@@ -414,7 +415,7 @@ func (e *Engine) apiHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	req, err := readRequest(r, e.cfg.MaxBodyBytes)
+	req, err := readRequest(r, cfg.MaxBodyBytes)
 	if err != nil {
 		writeEnvelope(w, errResult("invalid-request", rpcError("bad-request", "invalid JSON request", nil)), http.StatusBadRequest)
 		return

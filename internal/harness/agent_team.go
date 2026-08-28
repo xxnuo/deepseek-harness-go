@@ -1,15 +1,20 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -33,7 +38,10 @@ const (
 	teamTaskDeleted            = "deleted"
 )
 
-var teamMemberNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+var (
+	teamMemberNamePattern    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	numericTeamTaskIDPattern = regexp.MustCompile(`^task-([0-9]+)$`)
+)
 
 // AgentTeamConfig enables the experimental durable Agent Teams runtime.
 type AgentTeamConfig struct {
@@ -78,7 +86,11 @@ func normalizeAgentTeamConfig(config AgentTeamConfig) (AgentTeamConfig, error) {
 	if config.ForkProvider == "" {
 		config.ForkProvider = defaults.ForkProvider
 	}
-	if config.MaxMembers < 1 || config.MaxTasks < 1 || config.MaxPendingMessagesPerMember < 1 || config.MaxMessageBytes < 1 || config.DisposalTimeout < 1 {
+	if config.MaxMembers < 1 || int64(config.MaxMembers) > maxJSONSafeInteger ||
+		config.MaxTasks < 1 || int64(config.MaxTasks) > maxJSONSafeInteger ||
+		config.MaxPendingMessagesPerMember < 1 || int64(config.MaxPendingMessagesPerMember) > maxJSONSafeInteger ||
+		config.MaxMessageBytes < 1 || int64(config.MaxMessageBytes) > maxJSONSafeInteger ||
+		config.DisposalTimeout < time.Millisecond || config.DisposalTimeout%time.Millisecond != 0 {
 		return AgentTeamConfig{}, &TeamError{Code: "TEAM_INVALID_CONFIG", Message: "Agent Teams limits must be positive"}
 	}
 	config.FreshProvider = strings.TrimSpace(config.FreshProvider)
@@ -272,15 +284,335 @@ func emptyTeamFold(rootID string) *teamFoldState {
 	}
 }
 
-func decodeTeamPayload(value any, target any) error {
+func decodeTeamJSON(value any) ([]byte, any, error) {
 	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, nil, err
+	}
+	return data, decoded, nil
+}
+
+func teamJSONObject(value any) (map[string]any, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("value must be an object")
+	}
+	return object, nil
+}
+
+func teamJSONExactObject(value any, required, optional []string) (map[string]any, error) {
+	object, err := teamJSONObject(value)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(required)+len(optional))
+	for _, key := range required {
+		allowed[key] = true
+		if _, ok := object[key]; !ok {
+			return nil, fmt.Errorf("missing field %q", key)
+		}
+	}
+	for _, key := range optional {
+		allowed[key] = true
+	}
+	for key := range object {
+		if !allowed[key] {
+			return nil, fmt.Errorf("unknown field %q", key)
+		}
+	}
+	return object, nil
+}
+
+func teamJSONString(value any, nonEmpty bool) (string, error) {
+	text, ok := value.(string)
+	if !ok || nonEmpty && text == "" {
+		return "", errors.New("value must be a string")
+	}
+	return text, nil
+}
+
+func teamJSONSafeInteger(value any, minimum float64) (int64, error) {
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, errors.New("value must be a number")
+	}
+	parsed, err := number.Float64()
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || math.Trunc(parsed) != parsed || parsed < minimum || parsed > float64(maxJSONSafeInteger) {
+		return 0, errors.New("value must be a safe integer")
+	}
+	return int64(parsed), nil
+}
+
+func teamJSONArray(value any) ([]any, error) {
+	values, ok := value.([]any)
+	if !ok {
+		return nil, errors.New("value must be an array")
+	}
+	return values, nil
+}
+
+func validateTeamTaskID(value any) error {
+	id, err := teamJSONString(value, true)
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(data, target); err != nil {
-		return err
+	if match := numericTeamTaskIDPattern.FindStringSubmatch(id); match != nil {
+		var number json.Number = json.Number(match[1])
+		if _, err := teamJSONSafeInteger(number, 0); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateTeamContentBlock(value any) error {
+	object, err := teamJSONObject(value)
+	if err != nil {
+		return err
+	}
+	typ, err := teamJSONString(object["type"], true)
+	if err != nil {
+		return err
+	}
+	switch typ {
+	case "text", "reasoning":
+		object, err = teamJSONExactObject(value, []string{"type", "text"}, nil)
+		if err == nil {
+			_, err = teamJSONString(object["text"], false)
+		}
+	case "image":
+		object, err = teamJSONExactObject(value, []string{"type", "attachment"}, nil)
+		if err != nil {
+			return err
+		}
+		attachment, attachmentErr := teamJSONExactObject(object["attachment"], []string{"attachmentId", "mediaType", "bytes", "width", "height"}, []string{"name"})
+		if attachmentErr != nil {
+			return attachmentErr
+		}
+		if _, err = teamJSONString(attachment["attachmentId"], true); err != nil {
+			return err
+		}
+		mediaType, mediaErr := teamJSONString(attachment["mediaType"], false)
+		if mediaErr != nil || mediaType != "image/png" && mediaType != "image/jpeg" && mediaType != "image/webp" && mediaType != "image/gif" {
+			return errors.New("invalid image media type")
+		}
+		if _, err = teamJSONSafeInteger(attachment["bytes"], 0); err != nil {
+			return err
+		}
+		if _, err = teamJSONSafeInteger(attachment["width"], 1); err != nil {
+			return err
+		}
+		if _, err = teamJSONSafeInteger(attachment["height"], 1); err != nil {
+			return err
+		}
+		if name, ok := attachment["name"]; ok {
+			_, err = teamJSONString(name, false)
+		}
+		return err
+	case "tool-call":
+		object, err = teamJSONExactObject(value, []string{"type", "id", "name", "arguments"}, nil)
+		if err == nil {
+			_, err = teamJSONString(object["id"], true)
+		}
+		if err == nil {
+			_, err = teamJSONString(object["name"], false)
+		}
+		if err == nil {
+			_, err = teamJSONString(object["arguments"], false)
+		}
+	case "tool-result":
+		object, err = teamJSONExactObject(value, []string{"type", "toolCallId", "content"}, []string{"isError"})
+		if err == nil {
+			_, err = teamJSONString(object["toolCallId"], true)
+		}
+		var content []any
+		if err == nil {
+			content, err = teamJSONArray(object["content"])
+		}
+		for _, child := range content {
+			if err == nil {
+				err = validateTeamContentBlock(child)
+			}
+		}
+		if err == nil {
+			if isError, ok := object["isError"]; ok {
+				if _, valid := isError.(bool); !valid {
+					return errors.New("isError must be boolean")
+				}
+			}
+		}
+	default:
+		return nil
+	}
+	return err
+}
+
+func validateCurrentTeamPayload(eventType string, value any) error {
+	var object map[string]any
+	var err error
+	switch eventType {
+	case "team/member":
+		object, err = teamJSONExactObject(value, []string{"version", "teamId", "member"}, nil)
+		if err != nil {
+			return err
+		}
+		member, memberErr := teamJSONExactObject(object["member"], []string{"id", "name", "description", "provider", "context", "phase"}, []string{"error"})
+		if memberErr != nil {
+			return memberErr
+		}
+		for _, key := range []string{"id", "provider"} {
+			if _, err = teamJSONString(member[key], true); err != nil {
+				return err
+			}
+		}
+		for _, key := range []string{"name", "description"} {
+			if _, err = teamJSONString(member[key], false); err != nil {
+				return err
+			}
+		}
+		contextMode, contextErr := teamJSONString(member["context"], false)
+		if contextErr != nil || contextMode != "fresh" && contextMode != "fork" {
+			return errors.New("invalid teammate context")
+		}
+		phase, phaseErr := teamJSONString(member["phase"], false)
+		if phaseErr != nil || phase != teamMemberProvisioning && phase != teamMemberActive && phase != teamMemberFailed {
+			return errors.New("invalid teammate phase")
+		}
+		if failure, ok := member["error"]; ok {
+			_, err = teamJSONString(failure, false)
+			return err
+		}
+	case "team/task":
+		object, err = teamJSONExactObject(value, []string{"version", "teamId", "task"}, nil)
+		if err != nil {
+			return err
+		}
+		task, taskErr := teamJSONExactObject(object["task"], []string{"id", "revision", "subject", "description", "status", "blockedBy", "writeScopes"}, []string{"ownerId"})
+		if taskErr != nil {
+			return taskErr
+		}
+		if err = validateTeamTaskID(task["id"]); err != nil {
+			return err
+		}
+		if _, err = teamJSONSafeInteger(task["revision"], 1); err != nil {
+			return err
+		}
+		for _, key := range []string{"subject", "description"} {
+			if _, err = teamJSONString(task[key], false); err != nil {
+				return err
+			}
+		}
+		status, statusErr := teamJSONString(task["status"], false)
+		if statusErr != nil || !validTeamTaskStatus(status) {
+			return errors.New("invalid task status")
+		}
+		if owner, ok := task["ownerId"]; ok {
+			if _, err = teamJSONString(owner, true); err != nil {
+				return err
+			}
+		}
+		blocked, arrayErr := teamJSONArray(task["blockedBy"])
+		if arrayErr != nil {
+			return arrayErr
+		}
+		for _, id := range blocked {
+			if err = validateTeamTaskID(id); err != nil {
+				return err
+			}
+		}
+		scopes, arrayErr := teamJSONArray(task["writeScopes"])
+		if arrayErr != nil {
+			return arrayErr
+		}
+		for _, scope := range scopes {
+			if _, err = teamJSONString(scope, false); err != nil {
+				return err
+			}
+		}
+	case "team/message/queued":
+		object, err = teamJSONExactObject(value, []string{"version", "teamId", "message"}, nil)
+		if err != nil {
+			return err
+		}
+		message, messageErr := teamJSONExactObject(object["message"], []string{"id", "senderId", "senderName", "targetId", "delivery", "content"}, nil)
+		if messageErr != nil {
+			return messageErr
+		}
+		for _, key := range []string{"id", "senderId", "targetId"} {
+			if _, err = teamJSONString(message[key], true); err != nil {
+				return err
+			}
+		}
+		if _, err = teamJSONString(message["senderName"], false); err != nil {
+			return err
+		}
+		delivery, deliveryErr := teamJSONString(message["delivery"], false)
+		if deliveryErr != nil || delivery != teamMessageQuiet && delivery != teamMessageWakeup {
+			return errors.New("invalid message delivery")
+		}
+		content, arrayErr := teamJSONArray(message["content"])
+		if arrayErr != nil {
+			return arrayErr
+		}
+		for _, block := range content {
+			if err = validateTeamContentBlock(block); err != nil {
+				return err
+			}
+		}
+	case "team/message/delivered":
+		object, err = teamJSONExactObject(value, []string{"version", "teamId", "messageId", "targetId"}, nil)
+		if err != nil {
+			return err
+		}
+		for _, key := range []string{"messageId", "targetId"} {
+			if _, err = teamJSONString(object[key], true); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("unknown Team event type")
+	}
+	if version, versionErr := teamJSONSafeInteger(object["version"], 0); versionErr != nil || version != teamEventVersion {
+		return errors.New("invalid Team event version")
+	}
+	_, err = teamJSONString(object["teamId"], true)
+	return err
+}
+
+func decodeTeamSelector(value any, target *teamEventSelector) ([]byte, any, error) {
+	data, decoded, err := decodeTeamJSON(value)
+	if err != nil {
+		return nil, nil, err
+	}
+	object, err := teamJSONObject(decoded)
+	if err != nil {
+		return nil, nil, err
+	}
+	version, err := teamJSONSafeInteger(object["version"], 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	teamID, err := teamJSONString(object["teamId"], true)
+	if err != nil {
+		return nil, nil, err
+	}
+	target.Version, target.TeamID = int(version), teamID
+	return data, decoded, nil
+}
+
+func decodeCurrentTeamPayload(eventType string, data []byte, decoded any, target any) error {
+	if err := validateCurrentTeamPayload(eventType, decoded); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
 }
 
 func isTeamEventType(typ string) bool {
@@ -299,20 +631,24 @@ func foldTeam(rootID string, events []Event) (*teamFoldState, error) {
 			continue
 		}
 		var selector teamEventSelector
-		if err := decodeTeamPayload(event.Data, &selector); err != nil || selector.TeamID == "" {
+		data, decoded, selectorErr := decodeTeamSelector(event.Data, &selector)
+		if selectorErr != nil {
 			return nil, fmt.Errorf("persisted Agent Teams %s payload is invalid", event.Type)
 		}
-		if selector.TeamID != rootID {
-			continue
-		}
 		if selector.Version != teamEventVersion {
+			if selector.TeamID != rootID {
+				continue
+			}
 			return nil, fmt.Errorf("unsupported Agent Teams event version %d", selector.Version)
 		}
 		switch event.Type {
 		case "team/member":
 			var value teamMemberEvent
-			if err := decodeTeamPayload(event.Data, &value); err != nil {
+			if err := decodeCurrentTeamPayload(event.Type, data, decoded, &value); err != nil {
 				return nil, fmt.Errorf("persisted Agent Teams team/member payload is invalid: %w", err)
+			}
+			if value.TeamID != rootID {
+				continue
 			}
 			member := value.Member
 			if member.ID == "" || member.Name == "" || member.Provider == "" || (member.Context != "fresh" && member.Context != "fork") ||
@@ -340,8 +676,11 @@ func foldTeam(rootID string, events []Event) (*teamFoldState, error) {
 			state.members[member.ID] = cloneTeamMember(member)
 		case "team/task":
 			var value teamTaskEvent
-			if err := decodeTeamPayload(event.Data, &value); err != nil {
+			if err := decodeCurrentTeamPayload(event.Type, data, decoded, &value); err != nil {
 				return nil, fmt.Errorf("persisted Agent Teams team/task payload is invalid: %w", err)
+			}
+			if value.TeamID != rootID {
+				continue
 			}
 			task := cloneTeamTask(value.Task)
 			if task.ID == "" || task.Revision < 1 || !validTeamTaskStatus(task.Status) {
@@ -370,8 +709,11 @@ func foldTeam(rootID string, events []Event) (*teamFoldState, error) {
 			state.tasks[task.ID] = task
 		case "team/message/queued":
 			var value teamMessageQueuedEvent
-			if err := decodeTeamPayload(event.Data, &value); err != nil {
+			if err := decodeCurrentTeamPayload(event.Type, data, decoded, &value); err != nil {
 				return nil, fmt.Errorf("persisted Agent Teams team/message/queued payload is invalid: %w", err)
+			}
+			if value.TeamID != rootID {
+				continue
 			}
 			message := cloneTeamMessage(value.Message)
 			if message.ID == "" || message.SenderID == "" || message.SenderName == "" || message.TargetID == "" ||
@@ -385,8 +727,11 @@ func foldTeam(rootID string, events []Event) (*teamFoldState, error) {
 			state.messageOrder = append(state.messageOrder, message.ID)
 		case "team/message/delivered":
 			var value teamMessageDeliveredEvent
-			if err := decodeTeamPayload(event.Data, &value); err != nil || value.MessageID == "" || value.TargetID == "" {
+			if err := decodeCurrentTeamPayload(event.Type, data, decoded, &value); err != nil {
 				return nil, errors.New("persisted Agent Teams team/message/delivered payload is invalid")
+			}
+			if value.TeamID != rootID {
+				continue
 			}
 			queued, exists := state.messages[value.MessageID]
 			if !exists {
@@ -429,13 +774,16 @@ func FoldTeam(rootID string, events []Event) (TeamFold, error) {
 func cloneTeamMember(value TeamMemberSnapshot) TeamMemberSnapshot { return value }
 
 func cloneTeamTask(value TeamTaskSnapshot) TeamTaskSnapshot {
-	value.BlockedBy = append([]string(nil), value.BlockedBy...)
-	value.WriteScopes = append([]string(nil), value.WriteScopes...)
+	value.BlockedBy = append([]string{}, value.BlockedBy...)
+	value.WriteScopes = append([]string{}, value.WriteScopes...)
 	return value
 }
 
 func cloneTeamMessage(value TeamMessageSnapshot) TeamMessageSnapshot {
 	value.Content = cloneContentBlocks(value.Content)
+	if value.Content == nil {
+		value.Content = []ContentBlock{}
+	}
 	return value
 }
 
@@ -444,11 +792,12 @@ func validTeamTaskStatus(status string) bool {
 }
 
 func numericTeamTaskID(id string) (int, bool) {
-	if !strings.HasPrefix(id, "task-") {
+	match := numericTeamTaskIDPattern.FindStringSubmatch(id)
+	if match == nil {
 		return 0, false
 	}
-	var number int64
-	if _, err := fmt.Sscanf(id, "task-%d", &number); err != nil || number < 0 || number > maxJSONSafeInteger || id != fmt.Sprintf("task-%d", number) {
+	number, err := strconv.ParseUint(match[1], 10, 64)
+	if err != nil || number > uint64(maxJSONSafeInteger) {
 		return 0, false
 	}
 	return int(number), true
@@ -473,6 +822,18 @@ type teamRootRuntime struct {
 type teamCreation struct {
 	cancel context.CancelCauseFunc
 	done   chan struct{}
+	err    error
+}
+
+type teamDispatch struct {
+	cancel context.CancelCauseFunc
+	done   chan struct{}
+	err    error
+}
+
+type teamDispatchOutcome struct {
+	accepted bool
+	err      error
 }
 
 // TeamService exposes Agent Teams as a reusable Go library service.
@@ -484,9 +845,13 @@ type TeamService struct {
 	roots  map[string]*teamRootRuntime
 	closed bool
 
-	creations map[*teamCreation]struct{}
-	closeDone chan struct{}
-	closeErr  error
+	dispatchOrderMu sync.Mutex
+	dispatchTails   map[string]chan struct{}
+
+	creations  map[*teamCreation]struct{}
+	dispatches map[*teamDispatch]struct{}
+	closeDone  chan struct{}
+	closeErr   error
 }
 
 func newTeamService(engine *Engine, config AgentTeamConfig) (*TeamService, error) {
@@ -496,7 +861,8 @@ func newTeamService(engine *Engine, config AgentTeamConfig) (*TeamService, error
 	}
 	return &TeamService{
 		engine: engine, config: normalized, roots: map[string]*teamRootRuntime{},
-		creations: map[*teamCreation]struct{}{},
+		creations: map[*teamCreation]struct{}{}, dispatches: map[*teamDispatch]struct{}{},
+		dispatchTails: map[string]chan struct{}{},
 	}, nil
 }
 
@@ -509,6 +875,20 @@ func (t *TeamService) runtime(rootID string) *teamRootRuntime {
 	runtime := &teamRootRuntime{changed: make(chan struct{})}
 	t.roots[rootID] = runtime
 	return runtime
+}
+
+func (t *TeamService) waitRuntime(rootID string) (*teamRootRuntime, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, false
+	}
+	if runtime := t.roots[rootID]; runtime != nil {
+		return runtime, true
+	}
+	runtime := &teamRootRuntime{changed: make(chan struct{})}
+	t.roots[rootID] = runtime
+	return runtime, true
 }
 
 func (t *TeamService) notify(rootID string) {
@@ -544,13 +924,26 @@ func (t *TeamService) beginCreation(ctx context.Context) (context.Context, *team
 	return operationCtx, creation, nil
 }
 
-func (t *TeamService) finishCreation(creation *teamCreation) bool {
+func (t *TeamService) finishCreation(creation *teamCreation, resultErr *error, childID string) bool {
 	if creation == nil {
 		return false
 	}
 	t.mu.Lock()
 	closed := t.closed
+	if closed {
+		t.mu.Unlock()
+		if *resultErr == nil {
+			disposed := teamError("TEAM_DISPOSED", "Agent Teams service is disposing")
+			var cleanupErr error
+			if childID != "" {
+				cleanupErr = t.engine.stopModelSubagentActivation(childID)
+			}
+			*resultErr = errors.Join(disposed, cleanupErr)
+		}
+		t.mu.Lock()
+	}
 	if _, ok := t.creations[creation]; ok {
+		creation.err = *resultErr
 		delete(t.creations, creation)
 		close(creation.done)
 	}
@@ -572,6 +965,48 @@ func (t *TeamService) creationContextError(ctx context.Context) error {
 	return t.checkOpen()
 }
 
+func (t *TeamService) beginDispatch(ctx context.Context) (context.Context, *teamDispatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, nil, teamError("TEAM_DISPOSED", "Agent Teams service is disposing")
+	}
+	operationCtx, cancel := context.WithCancelCause(ctx)
+	dispatch := &teamDispatch{cancel: cancel, done: make(chan struct{})}
+	t.dispatches[dispatch] = struct{}{}
+	return operationCtx, dispatch, nil
+}
+
+func (t *TeamService) finishDispatch(dispatch *teamDispatch, resultErr error) {
+	if dispatch == nil {
+		return
+	}
+	t.mu.Lock()
+	if _, ok := t.dispatches[dispatch]; ok {
+		dispatch.err = resultErr
+		delete(t.dispatches, dispatch)
+		close(dispatch.done)
+	}
+	t.mu.Unlock()
+	dispatch.cancel(nil)
+}
+
+func (t *TeamService) dispatchContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			var teamErr *TeamError
+			if errors.As(cause, &teamErr) && teamErr.Code == "TEAM_DISPOSED" {
+				return teamErr
+			}
+		}
+		return err
+	}
+	return t.checkOpen()
+}
+
 func (t *TeamService) state(root *Session) (*teamFoldState, error) {
 	root.mu.Lock()
 	id := root.Header.ID
@@ -580,30 +1015,67 @@ func (t *TeamService) state(root *Session) (*teamFoldState, error) {
 	return foldTeam(id, events)
 }
 
+func foldPersistedSubagentDescriptor(events []Event) (mode, provider string, found bool, err error) {
+	descriptor, err := FoldSubagentDescriptor(events)
+	if err != nil || descriptor == nil {
+		return "", "", false, err
+	}
+	return descriptor.Mode, descriptor.Provider, true, nil
+}
+
+func sessionHasPersistedSubagentDescriptor(session *Session) (bool, error) {
+	session.mu.Lock()
+	seedLength := session.Header.SeedLength
+	events := append([]Event(nil), session.Events...)
+	session.mu.Unlock()
+	if seedLength < 0 || seedLength > len(events) {
+		return false, errors.New("subagent descriptor suffix is invalid")
+	}
+	_, _, found, err := foldPersistedSubagentDescriptor(events[seedLength:])
+	return found, err
+}
+
 func (t *TeamService) membership(callerID string) (teamMembership, error) {
+	notMember := func() (teamMembership, error) {
+		return teamMembership{}, teamError("TEAM_NOT_MEMBER", fmt.Sprintf("agent %q is not a member of an active Agent Team", callerID))
+	}
 	caller, err := t.engine.getSession(callerID)
 	if err != nil {
-		return teamMembership{}, teamError("TEAM_NOT_MEMBER", fmt.Sprintf("agent %q is not a member of an active Agent Team", callerID))
+		return notMember()
 	}
 	caller.mu.Lock()
-	header := caller.Header
+	header, attached := caller.Header, caller.attached
 	caller.mu.Unlock()
-	if header.Origin != "subagent" {
-		return teamMembership{root: caller, id: header.ID, role: "lead", name: teamLeadName}, nil
+	if !attached {
+		return notMember()
 	}
-	root, err := t.engine.getSession(header.ParentSession)
-	if err != nil {
-		return teamMembership{}, teamError("TEAM_NOT_MEMBER", fmt.Sprintf("agent %q is not a member of an active Agent Team", callerID))
+	if header.ParentSession != "" {
+		if root, rootErr := t.engine.getSession(header.ParentSession); rootErr == nil {
+			root.mu.Lock()
+			rootAttached := root.attached
+			root.mu.Unlock()
+			if rootAttached {
+				state, stateErr := t.state(root)
+				if stateErr != nil {
+					return notMember()
+				}
+				if member, ok := state.members[callerID]; ok &&
+					(member.Phase == teamMemberActive || member.Phase == teamMemberProvisioning) {
+					return teamMembership{root: root, id: root.Header.ID, role: "teammate", name: member.Name}, nil
+				}
+				providerChild, descriptorErr := sessionHasPersistedSubagentDescriptor(caller)
+				if descriptorErr != nil || providerChild {
+					return notMember()
+				}
+				return teamMembership{root: caller, id: header.ID, role: "lead", name: teamLeadName}, nil
+			}
+		}
 	}
-	state, err := t.state(root)
-	if err != nil {
-		return teamMembership{}, err
+	providerChild, descriptorErr := sessionHasPersistedSubagentDescriptor(caller)
+	if descriptorErr != nil || providerChild {
+		return notMember()
 	}
-	member, ok := state.members[callerID]
-	if !ok || (member.Phase != teamMemberActive && member.Phase != teamMemberProvisioning) {
-		return teamMembership{}, teamError("TEAM_NOT_MEMBER", fmt.Sprintf("agent %q is not a member of an active Agent Team", callerID))
-	}
-	return teamMembership{root: root, id: root.Header.ID, role: "teammate", name: member.Name}, nil
+	return teamMembership{root: caller, id: header.ID, role: "lead", name: teamLeadName}, nil
 }
 
 func (t *TeamService) append(root *Session, typ string, data any) error {
@@ -613,6 +1085,13 @@ func (t *TeamService) append(root *Session, typ string, data any) error {
 	root.mu.Lock()
 	rootID := root.Header.ID
 	root.mu.Unlock()
+	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
+	if !ok {
+		return teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
+	}
+	if err := flusher.Flush(context.Background(), rootID); err != nil {
+		return err
+	}
 	t.notify(rootID)
 	return nil
 }
@@ -622,7 +1101,7 @@ func requiredTeamText(value, field string, max int) (string, error) {
 	if value == "" {
 		return "", teamError("TEAM_INVALID_ARGUMENT", field+" must be non-empty")
 	}
-	if len([]rune(value)) > max {
+	if len(utf16.Encode([]rune(value))) > max {
 		return "", teamError("TEAM_INVALID_ARGUMENT", fmt.Sprintf("%s exceeds %d characters", field, max))
 	}
 	return value, nil
@@ -758,12 +1237,8 @@ func (t *TeamService) SpawnTeammate(ctx context.Context, callerID string, reques
 		return SpawnTeammateResult{}, err
 	}
 	defer func() {
-		if t.finishCreation(creation) && resultErr == nil {
-			if childID != "" {
-				_ = t.engine.CancelSession(childID)
-			}
+		if t.finishCreation(creation, &resultErr, childID) {
 			result = SpawnTeammateResult{}
-			resultErr = teamError("TEAM_DISPOSED", "Agent Teams service is disposing")
 		}
 	}()
 	childID = newID("ses")
@@ -794,21 +1269,17 @@ func (t *TeamService) SpawnTeammate(ctx context.Context, callerID string, reques
 
 	config := SubagentToolConfig{Provider: provider, BackgroundMode: "continuable"}
 	fork := request.Context == "fork"
-	_, createErr := t.engine.createModelSubagentWithID(operationCtx, callerID, childID, description, fork, "continuable", config)
+	_, _, createErr := t.engine.startContinuableModelSubagentWithID(operationCtx, callerID, childID, description, request.Prompt, fork, config)
+	if createErr == nil {
+		flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
+		if !ok {
+			createErr = teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
+		} else {
+			createErr = flusher.Flush(operationCtx, childID)
+		}
+	}
 	if operationErr := t.creationContextError(operationCtx); operationErr != nil {
 		createErr = operationErr
-	}
-	if createErr == nil {
-		child, getErr := t.engine.getSession(childID)
-		if getErr != nil {
-			createErr = getErr
-		} else if operationErr := t.creationContextError(operationCtx); operationErr != nil {
-			createErr = operationErr
-		} else {
-			_, createErr = t.engine.enqueueTeamPrompt(child, cloneContentBlocks(request.Prompt), map[string]any{
-				"kind": "coordinator", "form": "relay", "senderSessionId": callerID,
-			}, "next-turn", true)
-		}
 	}
 	if createErr == nil {
 		createErr = t.creationContextError(operationCtx)
@@ -817,25 +1288,54 @@ func (t *TeamService) SpawnTeammate(ctx context.Context, callerID string, reques
 	terminal.Phase = teamMemberActive
 	if createErr != nil {
 		terminal.Phase, terminal.Error = teamMemberFailed, createErr.Error()
-		_ = t.engine.CancelSession(childID)
 	}
 	runtime.op.Lock()
-	terminalErr := t.append(membership.root, "team/member", teamMemberEvent{Version: teamEventVersion, TeamID: rootID, Member: terminal})
+	var terminalErr error
+	state, terminalErr = t.state(membership.root)
+	settledPhase := ""
+	if terminalErr == nil {
+		current, ok := state.members[childID]
+		if !ok {
+			terminalErr = teamError("TEAM_PROVISIONING_CONFLICT", fmt.Sprintf("provisioned teammate %q disappeared", childID))
+		} else if current.Phase == teamMemberProvisioning {
+			terminalErr = t.append(membership.root, "team/member", teamMemberEvent{Version: teamEventVersion, TeamID: rootID, Member: terminal})
+			if terminalErr == nil {
+				settledPhase = terminal.Phase
+			}
+		} else {
+			settledPhase = current.Phase
+		}
+	}
 	runtime.op.Unlock()
 	if createErr != nil {
 		if terminalErr != nil {
 			return SpawnTeammateResult{}, errors.Join(createErr, terminalErr)
+		}
+		cleanupErr := t.engine.stopModelSubagentActivation(childID)
+		if settledPhase == teamMemberActive {
+			conflict := teamError("TEAM_PROVISIONING_CONFLICT", fmt.Sprintf("teammate %q became active while its creator reported failure", name))
+			return SpawnTeammateResult{}, errors.Join(createErr, conflict, cleanupErr)
+		}
+		if cleanupErr != nil {
+			return SpawnTeammateResult{}, errors.Join(createErr, cleanupErr)
 		}
 		return SpawnTeammateResult{}, createErr
 	}
 	if terminalErr != nil {
 		return SpawnTeammateResult{}, terminalErr
 	}
+	if settledPhase == teamMemberFailed {
+		conflict := teamError("TEAM_PROVISIONING_CONFLICT", fmt.Sprintf("teammate %q was reconciled as failed while creation was in progress", name))
+		if cleanupErr := t.engine.stopModelSubagentActivation(childID); cleanupErr != nil {
+			return SpawnTeammateResult{}, errors.Join(conflict, cleanupErr)
+		}
+		return SpawnTeammateResult{}, conflict
+	}
 	state, err = t.state(membership.root)
 	if err != nil {
 		return SpawnTeammateResult{}, err
 	}
-	return SpawnTeammateResult{Member: t.memberView(membership.root, state, terminal)}, nil
+	return SpawnTeammateResult{Member: t.memberView(membership.root, state, state.members[childID])}, nil
 }
 
 func teamMessageContent(message TeamMessageSnapshot) []ContentBlock {
@@ -849,6 +1349,75 @@ func teamMessageSource(rootID string, message TeamMessageSnapshot) map[string]an
 	}
 }
 
+func (t *TeamService) acknowledgeRecordedMessage(root *Session, target *Session, messageID, targetID string) error {
+	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
+	if !ok {
+		return teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
+	}
+	if err := flusher.Flush(context.Background(), targetID); err != nil {
+		return err
+	}
+	if !sessionHasTeamMessage(target, messageID) {
+		return nil
+	}
+	root.mu.Lock()
+	rootID := root.Header.ID
+	root.mu.Unlock()
+	runtime := t.runtime(rootID)
+	runtime.op.Lock()
+	defer runtime.op.Unlock()
+	state, err := t.state(root)
+	if err != nil || state.delivered[messageID] {
+		return err
+	}
+	queued, ok := state.messages[messageID]
+	if !ok || queued.TargetID != targetID {
+		return nil
+	}
+	return t.append(root, "team/message/delivered", teamMessageDeliveredEvent{
+		Version: teamEventVersion, TeamID: rootID, MessageID: messageID, TargetID: targetID,
+	})
+}
+
+func (t *TeamService) observeSessionEvent(target *Session, event Event) {
+	if event.Type != "user/message" {
+		return
+	}
+	data, _ := event.Data.(map[string]any)
+	source, _ := data["source"].(map[string]any)
+	if source["kind"] != "team-message" {
+		return
+	}
+	rootID, _ := source["teamId"].(string)
+	messageID, _ := source["messageId"].(string)
+	if rootID == "" || messageID == "" {
+		return
+	}
+	root, err := t.engine.getSession(rootID)
+	if err != nil {
+		return
+	}
+	root.mu.Lock()
+	rootAttached := root.attached
+	root.mu.Unlock()
+	if !rootAttached {
+		return
+	}
+	_, dispatch, err := t.beginDispatch(context.Background())
+	if err != nil {
+		return
+	}
+	target.mu.Lock()
+	targetID := target.Header.ID
+	target.mu.Unlock()
+	go func() {
+		defer t.finishDispatch(dispatch, nil)
+		if err := t.acknowledgeRecordedMessage(root, target, messageID, targetID); err != nil {
+			log.Printf("deepseek-harness: Team message %q acknowledgement failed: %v", messageID, err)
+		}
+	}()
+}
+
 func sessionHasTeamMessage(session *Session, messageID string) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -857,7 +1426,11 @@ func sessionHasTeamMessage(session *Session, messageID string) bool {
 			return true
 		}
 	}
-	for _, event := range session.Events {
+	start := session.Header.SeedLength
+	if start < 0 || start > len(session.Events) {
+		return false
+	}
+	for _, event := range session.Events[start:] {
 		if event.Type != "user/message" {
 			continue
 		}
@@ -868,6 +1441,13 @@ func sessionHasTeamMessage(session *Session, messageID string) bool {
 		}
 	}
 	return false
+}
+
+func sessionHasActiveTeamMessage(session *Session, messageID string) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	item := session.activePrompt
+	return item != nil && item.source["kind"] == "team-message" && item.source["messageId"] == messageID
 }
 
 func (t *TeamService) attachForWakeup(ctx context.Context, target *Session) error {
@@ -882,18 +1462,39 @@ func (t *TeamService) attachForWakeup(ctx context.Context, target *Session) erro
 	return err
 }
 
-func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message TeamMessageSnapshot) (bool, error) {
+func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message TeamMessageSnapshot, forceWake bool) (bool, error) {
 	target, err := t.engine.getSession(message.TargetID)
 	if err != nil {
 		return false, nil
 	}
 	if sessionHasTeamMessage(target, message.ID) {
-		return true, nil
+		flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
+		if !ok {
+			return false, teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
+		}
+		if err := flusher.Flush(ctx, message.TargetID); err != nil {
+			return false, err
+		}
+		return sessionHasTeamMessage(target, message.ID), nil
+	}
+	if sessionHasActiveTeamMessage(target, message.ID) {
+		return false, nil
 	}
 	root.mu.Lock()
 	rootID := root.Header.ID
 	root.mu.Unlock()
-	if message.Delivery == teamMessageQuiet {
+	delivery := message.Delivery
+	if forceWake {
+		delivery = teamMessageWakeup
+	}
+	if message.TargetID == rootID {
+		targetName := "next-step"
+		wakeup := false
+		if delivery == teamMessageWakeup {
+			targetName, wakeup = "next-turn", true
+		}
+		_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), targetName, wakeup)
+	} else if delivery == teamMessageQuiet {
 		target.mu.Lock()
 		attached := target.attached
 		target.mu.Unlock()
@@ -901,17 +1502,125 @@ func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message
 			return false, nil
 		}
 		_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), "next-step", false)
-		return err == nil, err
+	} else {
+		_, err = t.engine.promptContinuableModelSubagent(ctx, rootID, message.TargetID, teamMessageContent(message), teamMessageSource(rootID, message))
 	}
-	if err := t.attachForWakeup(ctx, target); err != nil {
+	if err != nil {
 		return false, err
 	}
-	_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), "next-turn", true)
-	return err == nil, err
+	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
+	if !ok {
+		return false, teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
+	}
+	if err := flusher.Flush(ctx, message.TargetID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func teamPendingTargetBatch(state *teamFoldState, targetID, throughID string) []TeamMessageSnapshot {
+	result := []TeamMessageSnapshot{}
+	for _, id := range state.messageOrder {
+		message := state.messages[id]
+		if message.TargetID == targetID && !state.delivered[id] {
+			result = append(result, message)
+		}
+		if id == throughID {
+			break
+		}
+	}
+	return result
+}
+
+func (t *TeamService) serializeTargetDispatch(targetID string, operation func() teamDispatchOutcome) <-chan teamDispatchOutcome {
+	t.dispatchOrderMu.Lock()
+	prior := t.dispatchTails[targetID]
+	done := make(chan struct{})
+	t.dispatchTails[targetID] = done
+	t.dispatchOrderMu.Unlock()
+
+	result := make(chan teamDispatchOutcome, 1)
+	go func() {
+		if prior != nil {
+			<-prior
+		}
+		outcome := operation()
+		t.dispatchOrderMu.Lock()
+		if t.dispatchTails[targetID] == done {
+			delete(t.dispatchTails, targetID)
+		}
+		close(done)
+		t.dispatchOrderMu.Unlock()
+		result <- outcome
+	}()
+	return result
+}
+
+func (t *TeamService) dispatchPendingMessage(
+	ctx context.Context,
+	runtime *teamRootRuntime,
+	root *Session,
+	targetID string,
+	throughID string,
+	forceWake bool,
+) teamDispatchOutcome {
+	runtime.op.Lock()
+	state, err := t.state(root)
+	if err != nil {
+		runtime.op.Unlock()
+		return teamDispatchOutcome{err: err}
+	}
+	batch := []TeamMessageSnapshot{}
+	if message, ok := state.messages[throughID]; ok && !state.delivered[throughID] {
+		batch = []TeamMessageSnapshot{message}
+		if forceWake {
+			batch = teamPendingTargetBatch(state, targetID, throughID)
+		}
+	}
+	runtime.op.Unlock()
+
+	accepted := false
+	for _, candidate := range batch {
+		runtime.op.Lock()
+		current, stateErr := t.state(root)
+		if stateErr != nil {
+			runtime.op.Unlock()
+			return teamDispatchOutcome{accepted: accepted, err: stateErr}
+		}
+		if current.delivered[candidate.ID] {
+			if candidate.ID == throughID {
+				accepted = true
+			}
+			runtime.op.Unlock()
+			continue
+		}
+		runtime.op.Unlock()
+
+		candidateAccepted, dispatchErr := t.dispatchLocked(ctx, root, candidate, forceWake)
+		if dispatchErr != nil || !candidateAccepted {
+			return teamDispatchOutcome{accepted: accepted, err: dispatchErr}
+		}
+
+		runtime.op.Lock()
+		current, stateErr = t.state(root)
+		if stateErr == nil && !current.delivered[candidate.ID] {
+			stateErr = t.append(root, "team/message/delivered", teamMessageDeliveredEvent{
+				Version: teamEventVersion, TeamID: current.id, MessageID: candidate.ID, TargetID: candidate.TargetID,
+			})
+		}
+		runtime.op.Unlock()
+		if stateErr != nil {
+			return teamDispatchOutcome{accepted: accepted, err: stateErr}
+		}
+		if candidate.ID == throughID {
+			accepted = true
+		}
+	}
+	return teamDispatchOutcome{accepted: accepted}
 }
 
 // SendMessage durably queues a peer message and attempts immediate delivery.
-func (t *TeamService) SendMessage(ctx context.Context, callerID string, request SendTeamMessageRequest) (SendTeamMessageResult, error) {
+func (t *TeamService) SendMessage(ctx context.Context, callerID string, request SendTeamMessageRequest) (result SendTeamMessageResult, resultErr error) {
 	if err := t.checkOpen(); err != nil {
 		return SendTeamMessageResult{}, err
 	}
@@ -921,55 +1630,76 @@ func (t *TeamService) SendMessage(ctx context.Context, callerID string, request 
 	if request.Delivery != teamMessageQuiet && request.Delivery != teamMessageWakeup {
 		return SendTeamMessageResult{}, teamError("TEAM_INVALID_ARGUMENT", "delivery must be quiet or wakeup")
 	}
+	operationCtx, dispatch, err := t.beginDispatch(ctx)
+	if err != nil {
+		return SendTeamMessageResult{}, err
+	}
+	defer func() { t.finishDispatch(dispatch, resultErr) }()
+	ctx = operationCtx
 	membership, err := t.membership(callerID)
 	if err != nil {
 		return SendTeamMessageResult{}, err
 	}
 	runtime := t.runtime(membership.id)
-	runtime.op.Lock()
-	defer runtime.op.Unlock()
-	state, err := t.state(membership.root)
-	if err != nil {
-		return SendTeamMessageResult{}, err
-	}
-	targetID, targetName, err := t.resolveActiveMember(membership.root, state, request.Target)
-	if err != nil {
-		return SendTeamMessageResult{}, err
-	}
-	if targetID == callerID {
-		return SendTeamMessageResult{}, teamError("TEAM_SELF_MESSAGE", "a Team member cannot message itself")
-	}
-	pending := 0
-	for _, message := range state.messages {
-		if message.TargetID == targetID && !state.delivered[message.ID] {
-			pending++
+	message := TeamMessageSnapshot{}
+	var dispatchResult <-chan teamDispatchOutcome
+	admissionErr := func() error {
+		runtime.op.Lock()
+		defer runtime.op.Unlock()
+		if err := t.dispatchContextError(ctx); err != nil {
+			return err
 		}
-	}
-	if pending >= t.config.MaxPendingMessagesPerMember {
-		return SendTeamMessageResult{}, teamError("TEAM_MAILBOX_FULL", fmt.Sprintf("teammate %q has %d pending messages", targetName, pending))
-	}
-	message := TeamMessageSnapshot{
-		ID: newID("team-message"), SenderID: callerID, SenderName: membership.name,
-		TargetID: targetID, Delivery: request.Delivery, Content: cloneContentBlocks(request.Content),
-	}
-	encoded, _ := json.Marshal(teamMessageContent(message))
-	if len(encoded) > t.config.MaxMessageBytes {
-		return SendTeamMessageResult{}, teamError("TEAM_MESSAGE_TOO_LARGE", fmt.Sprintf("team message exceeds %d bytes", t.config.MaxMessageBytes))
-	}
-	if err := t.append(membership.root, "team/message/queued", teamMessageQueuedEvent{Version: teamEventVersion, TeamID: membership.id, Message: message}); err != nil {
-		return SendTeamMessageResult{}, err
-	}
-	accepted, dispatchErr := t.dispatchLocked(ctx, membership.root, message)
-	if dispatchErr == nil && accepted {
-		dispatchErr = t.append(membership.root, "team/message/delivered", teamMessageDeliveredEvent{
-			Version: teamEventVersion, TeamID: membership.id, MessageID: message.ID, TargetID: targetID,
+		state, err := t.state(membership.root)
+		if err != nil {
+			return err
+		}
+		targetID, targetName, err := t.resolveActiveMember(membership.root, state, request.Target)
+		if err != nil {
+			return err
+		}
+		if targetID == callerID {
+			return teamError("TEAM_SELF_MESSAGE", "a Team member cannot message itself")
+		}
+		pending := 0
+		for _, candidate := range state.messages {
+			if candidate.TargetID == targetID && !state.delivered[candidate.ID] {
+				pending++
+			}
+		}
+		if pending >= t.config.MaxPendingMessagesPerMember {
+			return teamError("TEAM_MAILBOX_FULL", fmt.Sprintf("teammate %q has %d pending messages", targetName, pending))
+		}
+		message = TeamMessageSnapshot{
+			ID: newID("team-message"), SenderID: callerID, SenderName: membership.name,
+			TargetID: targetID, Delivery: request.Delivery, Content: cloneContentBlocks(request.Content),
+		}
+		encoded, encodeErr := stringifyJavaScriptJSON(teamMessageContent(message))
+		if encodeErr != nil {
+			return teamError("TEAM_INVALID_ARGUMENT", "team message content must be JSON-serializable")
+		}
+		if len([]byte(encoded)) > t.config.MaxMessageBytes {
+			return teamError("TEAM_MESSAGE_TOO_LARGE", fmt.Sprintf("team message exceeds %d bytes", t.config.MaxMessageBytes))
+		}
+		if err := t.append(membership.root, "team/message/queued", teamMessageQueuedEvent{
+			Version: teamEventVersion, TeamID: membership.id, Message: message,
+		}); err != nil {
+			return err
+		}
+		forceWake := message.Delivery == teamMessageWakeup
+		dispatchResult = t.serializeTargetDispatch(targetID, func() teamDispatchOutcome {
+			return t.dispatchPendingMessage(ctx, runtime, membership.root, targetID, message.ID, forceWake)
 		})
+		return nil
+	}()
+	if admissionErr != nil {
+		return SendTeamMessageResult{}, admissionErr
 	}
-	if dispatchErr != nil {
+	outcome := <-dispatchResult
+	if outcome.err != nil {
 		return SendTeamMessageResult{MessageID: message.ID, Status: "queued"}, nil
 	}
 	status := "queued"
-	if accepted {
+	if outcome.accepted {
 		status = "accepted"
 	}
 	return SendTeamMessageResult{MessageID: message.ID, Status: status}, nil
@@ -1128,8 +1858,8 @@ func teamTaskView(root *Session, state *teamFoldState, task TeamTaskSnapshot) Te
 	}
 	return TeamTaskView{
 		ID: task.ID, Revision: task.Revision, Subject: task.Subject, Description: task.Description,
-		Status: task.Status, OwnerName: ownerName, BlockedBy: append([]string(nil), task.BlockedBy...),
-		WriteScopes: append([]string(nil), task.WriteScopes...),
+		Status: task.Status, OwnerName: ownerName, BlockedBy: append([]string{}, task.BlockedBy...),
+		WriteScopes: append([]string{}, task.WriteScopes...),
 		Ready:       task.Status == teamTaskPending && teamTaskReady(state, task), WriteScopeWarnings: warnings,
 	}
 }
@@ -1368,13 +2098,19 @@ func (t *TeamService) UpdateTask(callerID string, request UpdateTeamTaskRequest)
 // WaitForChange waits for a later Team event or status notification.
 func (t *TeamService) WaitForChange(ctx context.Context, callerID string, timeout time.Duration) (TeamWaitResult, error) {
 	if timeout < minimumTeamWait || timeout > maximumTeamWait || timeout%time.Millisecond != 0 {
-		return TeamWaitResult{}, teamError("TEAM_INVALID_TIMEOUT", "timeout must be from 10s through 1h in whole milliseconds")
+		return TeamWaitResult{}, teamError("TEAM_INVALID_TIMEOUT", "timeoutMs must be an integer from 10000 through 3600000")
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return TeamWaitResult{}, cause
 	}
 	membership, err := t.membership(callerID)
 	if err != nil {
 		return TeamWaitResult{}, err
 	}
-	runtime := t.runtime(membership.id)
+	runtime, open := t.waitRuntime(membership.id)
+	if !open {
+		return TeamWaitResult{TimedOut: false}, nil
+	}
 	runtime.waitMu.Lock()
 	changed := runtime.changed
 	runtime.waitMu.Unlock()
@@ -1382,11 +2118,48 @@ func (t *TeamService) WaitForChange(ctx context.Context, callerID string, timeou
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return TeamWaitResult{}, ctx.Err()
+		return TeamWaitResult{}, context.Cause(ctx)
 	case <-changed:
 		return TeamWaitResult{TimedOut: false}, nil
 	case <-timer.C:
 		return TeamWaitResult{TimedOut: true}, nil
+	}
+}
+
+// waitForModelChange preserves the model-only active-peer shortcut without a
+// gap between reading peer activity and registering for the next Team edge.
+func (t *TeamService) waitForModelChange(ctx context.Context, callerID string, timeout time.Duration) (TeamWaitResult, bool, error) {
+	if timeout < minimumTeamWait || timeout > maximumTeamWait || timeout%time.Millisecond != 0 {
+		return TeamWaitResult{}, false, teamError("TEAM_INVALID_TIMEOUT", "timeoutMs must be an integer from 10000 through 3600000")
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return TeamWaitResult{}, false, cause
+	}
+	membership, err := t.membership(callerID)
+	if err != nil {
+		return TeamWaitResult{}, false, err
+	}
+	runtime, open := t.waitRuntime(membership.id)
+	if !open {
+		return TeamWaitResult{TimedOut: false}, false, nil
+	}
+	runtime.waitMu.Lock()
+	if !t.activePeer(callerID) {
+		runtime.waitMu.Unlock()
+		return TeamWaitResult{TimedOut: false}, true, nil
+	}
+	changed := runtime.changed
+	runtime.waitMu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return TeamWaitResult{}, false, context.Cause(ctx)
+	case <-changed:
+		return TeamWaitResult{TimedOut: false}, false, nil
+	case <-timer.C:
+		return TeamWaitResult{TimedOut: true}, false, nil
 	}
 }
 
@@ -1415,7 +2188,7 @@ func (t *TeamService) Interrupt(callerID, targetName string) (string, error) {
 	if getErr == nil {
 		previous = sessionTeamStatus(target)
 		if previous == "running" {
-			if err := t.engine.CancelSession(targetID); err != nil {
+			if err := t.engine.CancelAgent(targetID, AgentCancelCause{Kind: "parent"}, CancelAgentOptions{KeepInbox: true}); err != nil {
 				return "", err
 			}
 		}
@@ -1435,21 +2208,100 @@ func (t *TeamService) recoverRoot(ctx context.Context, root *Session) {
 	if err != nil {
 		return
 	}
+	for _, memberID := range state.memberOrder {
+		member := state.members[memberID]
+		if member.Phase != teamMemberProvisioning {
+			continue
+		}
+		if live, getErr := t.engine.getSession(member.ID); getErr == nil {
+			live.mu.Lock()
+			attached := live.attached
+			live.mu.Unlock()
+			if attached {
+				continue
+			}
+		}
+		terminal := member
+		terminal.Phase = teamMemberFailed
+		terminal.Error = "provisioning did not leave a resumable child Session"
+		inspection, inspectErr := t.engine.sessionStore.Inspect(ctx, member.ID)
+		if inspectErr != nil {
+			terminal.Error = "child Session recovery failed: " + inspectErr.Error()
+		} else {
+			matches, matchErr := teamProvisionedChildMatches(rootID, member, inspection)
+			if matchErr != nil {
+				terminal.Error = "child Session recovery failed: " + matchErr.Error()
+			} else if matches {
+				terminal.Phase, terminal.Error = teamMemberActive, ""
+			} else {
+				terminal.Error = "persisted child Session does not match the provisioned continuation"
+			}
+		}
+		if err := t.append(root, "team/member", teamMemberEvent{Version: teamEventVersion, TeamID: rootID, Member: terminal}); err != nil {
+			return
+		}
+		state.members[member.ID] = terminal
+	}
 	for _, id := range state.messageOrder {
 		if state.delivered[id] {
 			continue
 		}
 		message := state.messages[id]
-		accepted, dispatchErr := t.dispatchLocked(ctx, root, message)
-		if dispatchErr != nil || !accepted {
-			continue
+		batch := []TeamMessageSnapshot{message}
+		forceWake := message.Delivery == teamMessageWakeup
+		if forceWake {
+			batch = teamPendingTargetBatch(state, message.TargetID, message.ID)
 		}
-		if err := t.append(root, "team/message/delivered", teamMessageDeliveredEvent{
-			Version: teamEventVersion, TeamID: rootID, MessageID: message.ID, TargetID: message.TargetID,
-		}); err != nil {
-			return
+		for _, candidate := range batch {
+			if state.delivered[candidate.ID] {
+				continue
+			}
+			accepted, dispatchErr := t.dispatchLocked(ctx, root, candidate, forceWake)
+			if dispatchErr != nil || !accepted {
+				break
+			}
+			if err := t.append(root, "team/message/delivered", teamMessageDeliveredEvent{
+				Version: teamEventVersion, TeamID: rootID, MessageID: candidate.ID, TargetID: candidate.TargetID,
+			}); err != nil {
+				return
+			}
+			state.delivered[candidate.ID] = true
 		}
 	}
+}
+
+func teamProvisionedChildMatches(rootID string, member TeamMemberSnapshot, inspection SessionInspection) (bool, error) {
+	if inspection.Meta.ParentSession != rootID || inspection.Meta.SeedLength < 0 || inspection.Meta.SeedLength > len(inspection.Events) {
+		return false, nil
+	}
+	suffix := inspection.Events[inspection.Meta.SeedLength:]
+	mode, provider, found, descriptorErr := foldPersistedSubagentDescriptor(suffix)
+	if descriptorErr != nil {
+		return false, descriptorErr
+	}
+	if !found || mode != "continuable" || provider != member.Provider {
+		return false, nil
+	}
+	for _, event := range suffix {
+		if event.Type != "user/message" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		source, _ := data["source"].(map[string]any)
+		if source["kind"] == "user" {
+			return true, nil
+		}
+	}
+	pending, steering, err := restorePromptQueues(suffix)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range append(pending, steering...) {
+		if item != nil && item.source["kind"] == "user" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (t *TeamService) recoverAll() {
@@ -1461,7 +2313,7 @@ func (t *TeamService) recoverAll() {
 	t.engine.mu.RUnlock()
 	for _, session := range sessions {
 		session.mu.Lock()
-		root := session.Header.Origin != "subagent"
+		root := session.attached && session.Header.Origin != "subagent"
 		session.mu.Unlock()
 		if root {
 			t.recoverRoot(context.Background(), session)
@@ -1520,6 +2372,10 @@ func (t *TeamService) close() error {
 	for creation := range t.creations {
 		creations = append(creations, creation)
 	}
+	dispatches := make([]*teamDispatch, 0, len(t.dispatches))
+	for dispatch := range t.dispatches {
+		dispatches = append(dispatches, dispatch)
+	}
 	t.mu.Unlock()
 	for _, runtime := range roots {
 		runtime.waitMu.Lock()
@@ -1530,16 +2386,27 @@ func (t *TeamService) close() error {
 	for _, creation := range creations {
 		creation.cancel(teamError("TEAM_DISPOSED", "Agent Teams service is disposing"))
 	}
+	for _, dispatch := range dispatches {
+		dispatch.cancel(teamError("TEAM_DISPOSED", "Agent Teams service is disposing"))
+	}
 	var failures []error
 	if err := waitTeamCreations(creations, t.config.DisposalTimeout); err != nil {
 		failures = append(failures, err)
 	}
-	for rootID, childIDs := range t.rosterChildrenByRoot() {
-		ctx, cancel := context.WithTimeout(context.Background(), t.config.DisposalTimeout)
-		err := t.engine.DrainSubagentChildren(ctx, rootID, childIDs)
-		cancel()
-		if err != nil {
-			failures = append(failures, err)
+	if err := waitTeamDispatches(dispatches, t.config.DisposalTimeout); err != nil {
+		failures = append(failures, err)
+	}
+	childrenByRoot, discoveryErr := t.rosterChildrenByRoot()
+	if discoveryErr != nil {
+		failures = append(failures, discoveryErr)
+	} else {
+		for rootID, childIDs := range childrenByRoot {
+			ctx, cancel := context.WithTimeout(context.Background(), t.config.DisposalTimeout)
+			err := t.engine.DrainSubagentChildren(ctx, rootID, childIDs)
+			cancel()
+			if err != nil {
+				failures = append(failures, err)
+			}
 		}
 	}
 	err := errors.Join(failures...)
@@ -1548,6 +2415,64 @@ func (t *TeamService) close() error {
 	close(t.closeDone)
 	t.mu.Unlock()
 	return err
+}
+
+func isTeamDisposalCancellation(err error) bool {
+	for depth := 0; err != nil && depth < 128; depth++ {
+		if teamErr, ok := err.(*TeamError); ok && teamErr.Code == "TEAM_DISPOSED" {
+			return true
+		}
+		if _, joined := err.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+		wrapped, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = wrapped.Unwrap()
+	}
+	return false
+}
+
+func teamCreationFailures(creations []*teamCreation) error {
+	failures := make([]error, 0, len(creations))
+	for _, creation := range creations {
+		if creation.err != nil && !isTeamDisposalCancellation(creation.err) {
+			failures = append(failures, creation.err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func teamDispatchFailures(dispatches []*teamDispatch) error {
+	failures := make([]error, 0, len(dispatches))
+	for _, dispatch := range dispatches {
+		if dispatch.err != nil && !isTeamDisposalCancellation(dispatch.err) {
+			failures = append(failures, dispatch.err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func waitTeamDispatches(dispatches []*teamDispatch, timeout time.Duration) error {
+	if len(dispatches) == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, dispatch := range dispatches {
+			<-dispatch.done
+		}
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return teamDispatchFailures(dispatches)
+	case <-timer.C:
+		return teamError("TEAM_DISPOSAL_TIMEOUT", fmt.Sprintf("Agent Teams runtime disposal exceeded %dms", timeout/time.Millisecond))
+	}
 }
 
 func waitTeamCreations(creations []*teamCreation, timeout time.Duration) error {
@@ -1565,13 +2490,13 @@ func waitTeamCreations(creations []*teamCreation, timeout time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-done:
-		return nil
+		return teamCreationFailures(creations)
 	case <-timer.C:
-		return teamError("TEAM_DISPOSAL_TIMEOUT", fmt.Sprintf("Agent Teams runtime disposal exceeded %s", timeout))
+		return teamError("TEAM_DISPOSAL_TIMEOUT", fmt.Sprintf("Agent Teams runtime disposal exceeded %dms", timeout/time.Millisecond))
 	}
 }
 
-func (t *TeamService) rosterChildrenByRoot() map[string][]string {
+func (t *TeamService) rosterChildrenByRoot() (map[string][]string, error) {
 	t.engine.mu.RLock()
 	sessions := make([]*Session, 0, len(t.engine.sessions))
 	for _, session := range t.engine.sessions {
@@ -1579,31 +2504,32 @@ func (t *TeamService) rosterChildrenByRoot() map[string][]string {
 	}
 	t.engine.mu.RUnlock()
 	result := map[string][]string{}
-	for _, root := range sessions {
+	for _, child := range sessions {
+		child.mu.Lock()
+		childID, parentID, childAttached := child.Header.ID, child.Header.ParentSession, child.attached
+		child.mu.Unlock()
+		if !childAttached || parentID == "" {
+			continue
+		}
+		root, err := t.engine.getSession(parentID)
+		if err != nil {
+			continue
+		}
 		root.mu.Lock()
-		rootID, rootAttached, rootOrigin := root.Header.ID, root.attached, root.Header.Origin
+		rootAttached := root.attached
 		root.mu.Unlock()
-		if !rootAttached || rootOrigin == "subagent" {
+		if !rootAttached {
 			continue
 		}
 		state, err := t.state(root)
 		if err != nil {
-			continue
+			return nil, err
 		}
-		for _, memberID := range state.memberOrder {
-			child, err := t.engine.getSession(memberID)
-			if err != nil {
-				continue
-			}
-			child.mu.Lock()
-			match := child.attached && child.Header.Origin == "subagent" && child.Header.ParentSession == rootID
-			child.mu.Unlock()
-			if match {
-				result[rootID] = append(result[rootID], memberID)
-			}
+		if _, rostered := state.members[childID]; rostered {
+			result[parentID] = append(result[parentID], childID)
 		}
 	}
-	return result
+	return result, nil
 }
 
 func sortedTeamTasks(tasks []TeamTaskView) {

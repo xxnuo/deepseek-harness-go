@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	defaultMaxGoalRounds = 256
-	goalBlockThreshold   = 3
+	defaultMaxGoalRounds      = 256
+	defaultGoalBlockThreshold = 3
 )
 
 var goalBlockCodePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
@@ -93,6 +93,19 @@ func normalizeGoalBlockReason(reason GoalBlockReason) (*GoalBlockReason, error) 
 	return &reason, nil
 }
 
+func goalToolGuidance(blockedAfter int) string {
+	if blockedAfter < 1 {
+		blockedAfter = defaultGoalBlockThreshold
+	}
+	return "Use goal tools for one long-running completion objective in the current session. " +
+		"create_goal may infer goal intent from a direct human request in any language; do not create a goal for routine single-turn work. " +
+		"Call get_goal before update_goal and copy its exact goal_id and revision. After session resume or fork, an active goal is disarmed: " +
+		"when a human asks to continue or resume in any wording or language, use update_goal action resume to rearm it. " +
+		"Mark complete only when the objective is actually achieved. Mark blocked only after the same blocking condition persists for at least " +
+		fmt.Sprintf("%d consecutive goal rounds", blockedAfter) +
+		", and report that concrete condition in blocked_reason; difficulty, uncertainty, or useful remaining work is not blocked."
+}
+
 func (e *Engine) GoalMutation(id, op, objective string, rev, maxRounds int) (map[string]any, error) {
 	return e.goalMutationWithOrigin(nil, id, "", op, objective, nil, rev, maxRounds)
 }
@@ -113,6 +126,14 @@ func (e *Engine) goalMutationWithOrigin(origin *dynamicCordisRun, id, goalID, op
 	s, err := e.getSession(id)
 	if err != nil {
 		return nil, err
+	}
+	createDefaultMaxRounds := defaultMaxGoalRounds
+	if op == "create" {
+		runtimeConfig, runtimeErr := e.runtimeForSession(s)
+		if runtimeErr != nil {
+			return nil, runtimeErr
+		}
+		createDefaultMaxRounds = runtimeConfig.goalDefaultMaxRounds
 	}
 	e.mu.Lock()
 	s.mu.Lock()
@@ -156,7 +177,7 @@ func (e *Engine) goalMutationWithOrigin(origin *dynamicCordisRun, id, goalID, op
 			return nil, errors.New("goal-invalid-objective")
 		}
 		if maxRounds == 0 {
-			maxRounds = defaultMaxGoalRounds
+			maxRounds = createDefaultMaxRounds
 		}
 		if maxRounds < 1 {
 			s.mu.Unlock()
@@ -353,6 +374,13 @@ func isGoalPrompt(item *queuedPrompt) bool {
 }
 
 func (e *Engine) scheduleGoalRound(s *Session) (bool, error) {
+	runtimeConfig, err := e.runtimeForSession(s)
+	if err != nil {
+		return false, err
+	}
+	if !runtimeConfig.goalRoundDriver {
+		return false, nil
+	}
 	id := s.Header.ID
 	e.mu.Lock()
 	s.mu.Lock()
@@ -395,8 +423,9 @@ func (e *Engine) scheduleGoalRound(s *Session) (bool, error) {
 	prompt := renderGoalRoundPrompt(goal, round)
 	item := &queuedPrompt{
 		id: newID("msg"), text: prompt,
-		content: []ContentBlock{{Type: "text", Text: prompt}},
-		source:  map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": round},
+		content:         []ContentBlock{{Type: "text", Text: prompt}},
+		source:          map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": round},
+		goalReservation: true,
 	}
 	event, err := appendEventLocked(s, "agent/inbox/spliced", map[string]any{
 		"target": "next-turn", "start": len(s.pending), "inserted": []any{item.message()},
@@ -431,21 +460,32 @@ func (e *Engine) admitPrompt(ctx context.Context, s *Session, item *queuedPrompt
 	}
 	goalID, revision, round, isGoal := goalSource(item.source)
 	goal := e.goals[id]
-	if isGoal && (goal.ID != goalID || goal.Revision != revision || goal.Phase != "active" ||
+	if isGoal && (!item.goalReservation || item.goalStale ||
+		blockText(item.content) != renderGoalRoundPrompt(goal, round) ||
+		goal.ID != goalID || goal.Revision != revision || goal.Phase != "active" ||
 		goal.Activation != "armed" || round != goal.RoundsStarted+1 || round > goal.MaxRounds) {
 		s.mu.Unlock()
 		e.mu.Unlock()
 		return Event{}, errors.New("goal-round-stale")
 	}
+	if isGoal {
+		for _, queued := range append(append([]*queuedPrompt(nil), s.pending...), s.steering...) {
+			if queued != nil && !isGoalPrompt(queued) {
+				s.mu.Unlock()
+				e.mu.Unlock()
+				return Event{}, errors.New("goal-round-stale")
+			}
+		}
+	}
 	messages := make([]map[string]any, 0, len(item.additionalContexts)+1)
+	messages = append(messages, map[string]any{
+		"id": item.id, "role": "user", "content": item.content, "source": item.source,
+	})
 	for _, additional := range item.additionalContexts {
 		messages = append(messages, map[string]any{
 			"id": newID("msg"), "role": "user", "content": additional.Content, "source": additional.Source,
 		})
 	}
-	messages = append(messages, map[string]any{
-		"id": item.id, "role": "user", "content": item.content, "source": item.source,
-	})
 	events, err := appendUserMessagesLocked(s, messages)
 	if err == nil && isGoal {
 		goal.RoundsStarted = round
@@ -520,6 +560,27 @@ func (e *Engine) finishGoalTurn(s *Session, item *queuedPrompt, turn int) {
 		// aborted turn must still lose process-local continuation authority.
 		e.disarmGoal(s.Header.ID)
 	case "error", "max-tokens":
+		e.disarmGoal(s.Header.ID)
+	}
+}
+
+func (e *Engine) blockRejectedGoalRound(s *Session, item *queuedPrompt) {
+	goalID, revision, round, ok := goalSource(item.source)
+	if !ok || !item.goalReservation || item.goalStale {
+		return
+	}
+	e.mu.RLock()
+	goal, exists := e.goals[s.Header.ID]
+	e.mu.RUnlock()
+	if !exists || goal.ID != goalID || goal.Revision != revision || goal.Phase != "active" ||
+		goal.Activation != "armed" || round != goal.RoundsStarted+1 ||
+		blockText(item.content) != renderGoalRoundPrompt(goal, round) {
+		return
+	}
+	_, err := e.goalMutationWithReason(s.Header.ID, goalID, "block", "", &GoalBlockReason{
+		Code: "prompt-rejected", Message: "Goal round was rejected before entering its step.",
+	}, revision, 0)
+	if err != nil {
 		e.disarmGoal(s.Header.ID)
 	}
 }

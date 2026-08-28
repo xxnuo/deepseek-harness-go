@@ -190,6 +190,56 @@ func TestPersistentShellRegistryWorkspaceAndClose(t *testing.T) {
 	}
 }
 
+func TestPersistentShellOwnerActivityAndClose(t *testing.T) {
+	requirePersistentShell(t)
+	registry := newPersistentShellRegistry()
+	workspace := t.TempDir()
+	if _, err := registry.run(context.Background(), "owner", workspace, "export DSH_OWNER_STATE=value"); err != nil {
+		t.Fatal(err)
+	}
+	if !registry.hasOwnerActivity("owner") {
+		t.Fatal("persistent shell was not reported as owner activity")
+	}
+	registry.closeOwner("owner")
+	if registry.hasOwnerActivity("owner") {
+		t.Fatal("persistent shell owner activity survived closeOwner")
+	}
+	output, err := registry.run(context.Background(), "owner", workspace, `printf %s "${DSH_OWNER_STATE-unset}"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "unset" {
+		t.Fatalf("replacement shell inherited disposed state: %q", output)
+	}
+	registry.close()
+}
+
+func TestPersistentShellBlocksPermissionSwitchAndDetachesWithOwner(t *testing.T) {
+	requirePersistentShell(t)
+	e := newIntegrationEngine(t)
+	owner, err := e.CreateSession(context.Background(), e.Config().Workspace, "persistent-permission-owner", "minimal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.shells.run(context.Background(), owner, e.Config().Workspace, "export DSH_OWNER_STATE=value"); err != nil {
+		t.Fatal(err)
+	}
+	session, err := e.getSession(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.runCommand(session, "/permission danger-full-access")
+	if err != nil || result.Command == nil || result.Command.Kind != "error" || !strings.Contains(result.Command.Text, "open or being created") {
+		t.Fatalf("permission fence result = %#v, err=%v", result, err)
+	}
+	if err := detachSDKSession(e, owner); err != nil {
+		t.Fatal(err)
+	}
+	if e.HasTerminalActivity(owner) {
+		t.Fatal("detached owner retained persistent shell activity")
+	}
+}
+
 func TestEngineCloseCancelsPersistentShellFirst(t *testing.T) {
 	requirePersistentShell(t)
 	e := newIntegrationEngine(t)

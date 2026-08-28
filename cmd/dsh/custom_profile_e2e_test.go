@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	harness "github.com/xxnuo/deepseek-harness-go"
 )
 
 func TestStandaloneCustomProfileMJSArgsHelpAndHMR(t *testing.T) {
@@ -111,6 +113,70 @@ func TestCompositionAcceptsMixedExternalHostPlugin(t *testing.T) {
 	plugins, err := buildProfileRuntimePlugins(composed)
 	if err != nil || len(plugins) != 1 || plugins[0].id != "extension" {
 		t.Fatalf("mixed external plugins = %#v, %v", plugins, err)
+	}
+}
+
+func TestExternalPluginEntriesUseQualifiedNestedIDs(t *testing.T) {
+	plugin := filepath.Join(t.TempDir(), "plugin.mjs")
+	if err := os.WriteFile(plugin, []byte("export function apply() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	composed := testComposition(t, fmt.Sprintf(`
+- id: outer
+  name: cordis:group
+  group: true
+  config:
+    - id: child
+      name: %q
+- id: sibling
+  name: cordis:group
+  group: true
+  config:
+    - id: child
+      name: %q
+`, plugin, plugin))
+	entries := composed.externalPluginEntries()
+	if len(entries) != 2 || entries[0].id != "outer:child" || entries[1].id != "sibling:child" {
+		t.Fatalf("qualified external plugin entries = %#v", entries)
+	}
+}
+
+func TestProfileRuntimePublishesPendingPluginInventoryPhase(t *testing.T) {
+	active := "active"
+	cfg := harness.DefaultConfig()
+	cfg.Persist = false
+	cfg.PluginInventory = []harness.PluginInventoryEntry{
+		{EntryID: "waiting", ModuleName: "fixture:waiting", Enabled: true, FiberPhase: &active},
+		{EntryID: "consumer", ModuleName: "fixture:consumer", Enabled: true, FiberPhase: &active},
+		{EntryID: "provider", ModuleName: "fixture:provider", Enabled: true, FiberPhase: &active},
+	}
+	engine, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	if _, err := mountProfileRuntimePluginSet(engine, nil, []profileRuntimePlugin{
+		{id: "waiting", body: "return { inject: ['neverReady'], apply() {} }"},
+		{id: "consumer", body: "return { inject: ['readyLater'], apply() {} }"},
+		{id: "provider", body: "return { apply(ctx) { ctx.provide('readyLater', {}) } }"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(engine.Handler())
+	t.Cleanup(server.Close)
+	snapshot := profileRPC(t, server.URL, "pluginInventory/list", map[string]any{"args": map[string]any{}})
+	entries, _ := snapshot["entries"].([]any)
+	if len(entries) != 3 {
+		t.Fatalf("plugin inventory = %#v", snapshot)
+	}
+	waiting, _ := entries[0].(map[string]any)
+	consumer, _ := entries[1].(map[string]any)
+	provider, _ := entries[2].(map[string]any)
+	if waiting["entryId"] != "waiting" || waiting["moduleName"] != "fixture:waiting" || waiting["enabled"] != true || waiting["fiberPhase"] != "pending" {
+		t.Fatalf("pending inventory entry = %#v", waiting)
+	}
+	if consumer["fiberPhase"] != "active" || provider["fiberPhase"] != "active" {
+		t.Fatalf("reactivated inventory entries = %#v", entries)
 	}
 }
 

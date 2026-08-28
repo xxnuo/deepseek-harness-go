@@ -341,6 +341,58 @@ func (r *SessionProjectionRegistry) snapshotNow(session *Session, events []Event
 	return ProjectionSnapshot{AsOfSeq: len(events) - 1, Values: values}, errors.Join(failures...)
 }
 
+// snapshotDetached folds a persisted event log without publishing per-session
+// cells. Listing and other cold readers use it to keep projection failures
+// isolated to the inspected session.
+func (r *SessionProjectionRegistry) snapshotDetached(events []Event) (ProjectionSnapshot, error) {
+	cloned := append([]Event(nil), events...)
+	var snapshot ProjectionSnapshot
+	var snapshotErr error
+	err := r.execute(false, func() error {
+		snapshot, snapshotErr = r.snapshotDetachedNow(cloned)
+		return nil
+	})
+	if err != nil {
+		return ProjectionSnapshot{}, err
+	}
+	return snapshot, snapshotErr
+}
+
+func (r *SessionProjectionRegistry) snapshotDetachedNow(events []Event) (ProjectionSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	values := map[string]any{}
+	var failures []error
+	for _, key := range r.order {
+		registration := r.registrations[key]
+		if registration == nil || registration.definition.View == nil {
+			continue
+		}
+		state, err := callProjectionInit(registration.definition)
+		if err == nil {
+			for _, event := range events {
+				result, applyErr := callProjectionApply(registration.definition, state, event)
+				if applyErr != nil {
+					err = applyErr
+					break
+				}
+				state = result.State
+			}
+		}
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		value, err := callProjectionView(registration.definition, state)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		values[key] = value
+	}
+	return ProjectionSnapshot{AsOfSeq: len(events) - 1, Values: values}, errors.Join(failures...)
+}
+
 // StateOf reads one registered unit's internal state. Callers must not mutate
 // the returned value.
 func (r *SessionProjectionRegistry) StateOf(session *Session, key string) (any, bool, error) {

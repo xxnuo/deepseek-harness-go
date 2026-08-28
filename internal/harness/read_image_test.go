@@ -19,12 +19,29 @@ type readImageProvider struct {
 	id         string
 	model      string
 	modalities []string
+	catalog    []ModelInfo
+	resolveErr error
 }
 
 func (p *readImageProvider) ID() string   { return p.id }
 func (p *readImageProvider) Name() string { return p.id }
 func (p *readImageProvider) Models(context.Context) ([]ModelInfo, error) {
+	if p.catalog != nil {
+		return append([]ModelInfo(nil), p.catalog...), nil
+	}
 	return []ModelInfo{{ID: p.model, Name: p.model, InputModalities: p.modalities}}, nil
+}
+func (p *readImageProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, context.Cause(ctx)
+	}
+	if p.resolveErr != nil {
+		return ModelInfo{}, p.resolveErr
+	}
+	if model != p.model {
+		return ModelInfo{}, errors.New("model unavailable")
+	}
+	return ModelInfo{ID: p.model, Name: p.model, InputModalities: append([]string(nil), p.modalities...)}, nil
 }
 func (p *readImageProvider) Complete(context.Context, ChatRequest, func(Delta) error) (Completion, error) {
 	return Completion{Text: "unused", Finish: "stop"}, nil
@@ -128,6 +145,64 @@ func TestReadImageRejectsTextOnlyRouteAndNonImagePath(t *testing.T) {
 	}
 }
 
+func TestReadImageUsesLatestRequestHeaderAndExactRouteResolver(t *testing.T) {
+	e := newIntegrationEngine(t)
+	textProvider := &readImageProvider{id: "text-route", model: "text-1", modalities: []string{"text"}}
+	visionProvider := &readImageProvider{id: "vision-route", model: "hidden-vision", modalities: []string{"text", "image"}, catalog: []ModelInfo{}}
+	e.RegisterProvider(textProvider)
+	e.RegisterProvider(visionProvider)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "header-route", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: textProvider.ID(), Model: textProvider.model}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.appendEvent(s, "request/header", map[string]any{"header": map[string]any{"config": map[string]any{
+		"provider": visionProvider.ID(), "model": visionProvider.model,
+	}}, "reason": "change"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := base64.StdEncoding.DecodeString(readImagePNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.Config().Workspace, "header.png"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := executeRegisteredTool(t, e, "read_image", id, map[string]any{"file_path": "header.png"})
+	if result.IsError {
+		t.Fatalf("read_image exact route result = %#v", result)
+	}
+}
+
+func TestReadImageRouteResolutionPreservesFailureAndCancellation(t *testing.T) {
+	e := newIntegrationEngine(t)
+	provider := &readImageProvider{id: "failing-vision", model: "vision", modalities: []string{"text", "image"}, resolveErr: errors.New("catalog down")}
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "route-failure", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: provider.model}); err != nil {
+		t.Fatal(err)
+	}
+	if err := imageModelSupportsInput(context.Background(), e, ToolCall{SessionID: id}, "image.png"); err == nil ||
+		!strings.Contains(err.Error(), "resolve model route: catalog down") || strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("route resolution error = %v", err)
+	}
+	reason := errors.New("cancel route resolution")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(reason)
+	if err := imageModelSupportsInput(ctx, e, ToolCall{SessionID: id}, "image.png"); !errors.Is(err, reason) {
+		t.Fatalf("route cancellation = %v", err)
+	}
+}
+
 func TestReadImageSchemaAndDescriptionExposeRC2ImageSemantics(t *testing.T) {
 	e := newIntegrationEngine(t)
 	e.mu.RLock()
@@ -177,6 +252,7 @@ func TestReadImageAttachmentErrorGuidesRecoverableFailures(t *testing.T) {
 		{name: "dimension", err: "attachment-error: image exceeds the configured per-side pixel limit", want: "at least one image side exceeds"},
 		{name: "pixels", err: "attachment-error: image exceeds the decoded pixel limit", want: "decoded-size limit"},
 		{name: "bytes", err: "attachment-error: image cannot be encoded within the normalized byte limit", want: "deployment's byte limits"},
+		{name: "16-bit", err: "attachment-error: The 16-bit PNG could not be converted to the normalized 8-bit sRGB form.", want: "convert it to an 8-bit PNG/JPEG/WebP"},
 		{name: "mismatch", err: "attachment-error: declared image media type does not match the data", want: ".jpg extension declares image/jpeg"},
 	}
 	for _, test := range tests {

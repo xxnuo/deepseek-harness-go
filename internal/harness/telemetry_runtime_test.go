@@ -17,6 +17,58 @@ type failingTelemetrySink struct {
 	shutdownFn func(context.Context) error
 }
 
+type sliceTelemetrySink []byte
+
+func (sliceTelemetrySink) Emit(context.Context, SessionTelemetryRecord) error { return nil }
+func (sliceTelemetrySink) Shutdown(context.Context) error                     { return nil }
+
+func TestEquivalentTelemetryConfigHandlesNonComparableSink(t *testing.T) {
+	left := &SessionTelemetryConfig{Sink: sliceTelemetrySink{1}}
+	right := &SessionTelemetryConfig{Sink: sliceTelemetrySink{1}}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("telemetry config comparison panicked: %v", recovered)
+		}
+	}()
+	if equivalentSessionTelemetryConfig(left, right) {
+		t.Fatal("non-comparable sinks must not be treated as identical")
+	}
+}
+
+func TestApplyRuntimeConfigReplacesTelemetryCoordinator(t *testing.T) {
+	oldSink := &recordingTelemetrySink{}
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace, cfg.Persist = t.TempDir(), t.TempDir(), false
+	cfg.Terminal.Disabled = true
+	cfg.SessionTelemetry = &SessionTelemetryConfig{Mode: SessionTelemetryModeFull, Sink: oldSink}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	newSink := &recordingTelemetrySink{}
+	next := cfg
+	next.SessionTelemetry = &SessionTelemetryConfig{Mode: SessionTelemetryModeFull, Sink: newSink}
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	_, oldShutdown := oldSink.snapshot()
+	if oldShutdown != 1 {
+		t.Fatalf("old telemetry coordinator shutdown count = %d, want 1", oldShutdown)
+	}
+	if e.telemetry == nil || e.telemetry.sink != newSink {
+		t.Fatal("new telemetry coordinator was not published")
+	}
+	disabled := next
+	disabled.SessionTelemetry = nil
+	if err := e.ApplyRuntimeConfig(disabled); err != nil {
+		t.Fatal(err)
+	}
+	if e.telemetry != nil {
+		t.Fatal("disabled telemetry coordinator survived runtime update")
+	}
+}
+
 func (s *failingTelemetrySink) Emit(_ context.Context, record SessionTelemetryRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

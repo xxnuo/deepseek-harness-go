@@ -77,6 +77,7 @@ func builtinStrReplaceEditorTool(e *Engine) Tool {
 					}
 					defer root.Close()
 					text := editorDirectoryView(root.FS(), name, display)
+					text = clipEditorOutputForCall(e, call, text)
 					result := textToolResult(text)
 					result.Value = text
 					return result, nil
@@ -90,7 +91,7 @@ func builtinStrReplaceEditorTool(e *Engine) Tool {
 				if err != nil {
 					return ToolResult{}, err
 				}
-				text = clipEditorOutput(text)
+				text = clipEditorOutputForCall(e, call, text)
 				result := textToolResult(text)
 				result.Value = text
 				return result, nil
@@ -282,7 +283,7 @@ func editorDirectoryView(fsys fs.FS, name, display string) string {
 		return nil
 	})
 	sort.Strings(rows)
-	return clipEditorOutput(fmt.Sprintf("Here're the files and directories up to 2 levels deep in %s, excluding hidden items, node_modules, and Python cache directories:\n%s\n\n", display, strings.Join(rows, "\n")))
+	return fmt.Sprintf("Here're the files and directories up to 2 levels deep in %s, excluding hidden items, node_modules, and Python cache directories:\n%s\n\n", display, strings.Join(rows, "\n"))
 }
 
 func editorMatchOffsets(content, search string) []int {
@@ -307,8 +308,27 @@ func editorLineNumbers(content string, offsets []int) []int {
 }
 
 func clipEditorOutput(text string) string {
-	if len(text) <= editorOutputLimit {
+	return clipEditorOutputLimit(text, editorOutputLimit)
+}
+
+func clipEditorOutputLimit(text string, limit int) string {
+	if limit <= 0 {
+		limit = editorOutputLimit
+	}
+	if len(text) <= limit {
 		return text
 	}
-	return text[:editorOutputLimit] + "<response clipped><NOTE>To save on context only part of this file has been shown to you.</NOTE>"
+	return text[:limit] + "<response clipped><NOTE>To save on context only part of this file has been shown to you.</NOTE>"
+}
+
+func clipEditorOutputForCall(e *Engine, call ToolCall, text string) string {
+	limit := editorOutputLimit
+	if e != nil && call.SessionID != "" {
+		if session, err := e.getSession(call.SessionID); err == nil {
+			if runtimeConfig, err := e.runtimeForSession(session); err == nil && runtimeConfig.editorMaxOutputChars > 0 {
+				limit = runtimeConfig.editorMaxOutputChars
+			}
+		}
+	}
+	return clipEditorOutputLimit(text, limit)
 }

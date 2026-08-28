@@ -70,6 +70,9 @@ func TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = runtime.close() })
 	endpoint := "http://" + runtime.listener.Addr().String()
+	if _, err := engine.CreateSession(context.Background(), cfg.Workspace, "reload-session", ""); err != nil {
+		t.Fatal(err)
+	}
 	patch := filepath.Join(home, profilesDir, "web", profilePatchFile)
 	ctx, cancel := context.WithCancel(context.Background())
 	var watcher sync.WaitGroup
@@ -83,19 +86,28 @@ func TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			next, err := harness.New(harness.WithConfig(nextConfig))
+			runtime.mu.RLock()
+			generation := runtime.generation
+			runtime.mu.RUnlock()
+			plugins, err := buildProfileRuntimePlugins(nextComposition)
 			if err != nil {
 				return err
 			}
-			profileRuntime, err := mountProfileRuntimePlugins(next, nextComposition, nil)
-			if err != nil {
-				_ = next.Close()
+			if generation.profileRuntime == nil {
+				if len(plugins) > 0 {
+					mounted, mountErr := mountProfileRuntimePluginSet(engine, nil, plugins)
+					if mountErr != nil {
+						return mountErr
+					}
+					generation.profileRuntime = mounted
+				}
+			} else if err := generation.profileRuntime.reconcile(plugins); err != nil {
 				return err
 			}
-			if err := runtime.replace(next, profileRuntime, nextConfig); err != nil {
+			if err := engine.ApplyRuntimeConfig(nextConfig); err != nil {
 				return err
 			}
-			paths.setRuntime(profileRuntime)
+			paths.setRuntime(generation.profileRuntime)
 			return nil
 		}, &diagnostics)
 	}()
@@ -108,6 +120,22 @@ func TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine(t *testing.T) {
 	writeWebPatch(t, patch, "first-hot-model", "first-hot-provider")
 	waitForWebModel(t, endpoint, "first-hot-model")
 	waitForWebSubagentProvider(t, runtime, "first-hot-provider")
+	runtime.mu.RLock()
+	activeEngine := runtime.generation.engine
+	runtime.mu.RUnlock()
+	if activeEngine != engine {
+		t.Fatal("profile reload replaced the Engine instead of updating it in place")
+	}
+	foundSession := false
+	for _, session := range engine.ListSessions() {
+		if session.SessionID == "reload-session" {
+			foundSession = true
+			break
+		}
+	}
+	if !foundSession {
+		t.Fatal("profile reload lost an existing session")
+	}
 
 	if err := os.WriteFile(patch, []byte("invalid: [\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -116,7 +144,7 @@ func TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine(t *testing.T) {
 	if model := webModel(t, endpoint); model != "first-hot-model" {
 		t.Fatalf("invalid reload replaced last good model with %q", model)
 	}
-	if provider := webSubagentProvider(runtime); provider != "first-hot-provider" {
+	if provider := webSubagentProvider(runtime, "first-hot-provider"); provider != "first-hot-provider" {
 		t.Fatalf("invalid reload replaced last good subagent provider with %q", provider)
 	}
 
@@ -169,21 +197,24 @@ func waitForWebModel(t *testing.T, endpoint, want string) {
 
 func waitForWebSubagentProvider(t *testing.T, runtime *reloadableWebServer, want string) {
 	t.Helper()
-	waitFor(t, func() bool { return webSubagentProvider(runtime) == want })
+	waitFor(t, func() bool { return webSubagentProvider(runtime, want) == want })
 }
 
-func webSubagentProvider(runtime *reloadableWebServer) string {
+func webSubagentProvider(runtime *reloadableWebServer, want ...string) string {
 	runtime.mu.RLock()
 	generation := runtime.generation
 	runtime.mu.RUnlock()
 	if generation == nil {
 		return ""
 	}
-	providers := generation.engine.ListSubagentProviders()
-	if len(providers) != 1 {
-		return ""
+	for _, provider := range generation.engine.ListSubagentProviders() {
+		for _, expected := range want {
+			if provider.Name == expected {
+				return provider.Name
+			}
+		}
 	}
-	return providers[0].Name
+	return ""
 }
 
 func waitFor(t *testing.T, condition func() bool) {

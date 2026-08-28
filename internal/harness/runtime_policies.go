@@ -10,14 +10,36 @@ import (
 const toolResultPruneMarker = "\n\n[... tool result middle pruned ...]\n\n"
 
 type CompactionConfig struct {
-	Disabled           bool
-	AutoDisabled       bool
-	ThresholdRatio     float64
-	RetainRatio        float64
-	RetainTokens       int
-	MaxTokens          int
-	CompactionRetries  int
-	MaxOverflowRetries int
+	Disabled              bool
+	AutoDisabled          bool
+	ThresholdRatio        float64
+	RetainRatio           float64
+	RetainTokens          int
+	SummarizationProvider string
+	SummarizationModel    string
+	MaxTokens             int
+	CompactionRetries     int
+	MaxOverflowRetries    int
+}
+
+type compactionRuntimeConfig struct {
+	CompactionConfig
+	useRetainTokens bool
+	modelPolicies   []compactionModelPolicy
+}
+
+type compactionModelPolicy struct {
+	Provider              string
+	Model                 string
+	ThresholdRatio        float64
+	RetainRatio           float64
+	RetainTokens          int
+	useRetainTokens       bool
+	SummarizationProvider string
+	SummarizationModel    string
+	MaxTokens             int
+	CompactionRetries     int
+	MaxOverflowRetries    int
 }
 
 type ToolResultPruneConfig struct {
@@ -73,6 +95,36 @@ func normalizeCompactionConfig(config CompactionConfig) CompactionConfig {
 		config.MaxTokens = defaults.MaxTokens
 	}
 	return config
+}
+
+func newCompactionRuntimeConfig(config CompactionConfig) compactionRuntimeConfig {
+	return compactionRuntimeConfig{CompactionConfig: config, useRetainTokens: config.RetainTokens > 0}
+}
+
+func cloneCompactionRuntimeConfig(config compactionRuntimeConfig) compactionRuntimeConfig {
+	config.modelPolicies = append([]compactionModelPolicy(nil), config.modelPolicies...)
+	return config
+}
+
+func compactionPolicyFor(config compactionRuntimeConfig, selection ModelSelection) CompactionConfig {
+	for _, policy := range config.modelPolicies {
+		if policy.Provider != selection.Provider || policy.Model != selection.Model {
+			continue
+		}
+		config.ThresholdRatio = policy.ThresholdRatio
+		config.RetainRatio = policy.RetainRatio
+		config.RetainTokens = policy.RetainTokens
+		if policy.useRetainTokens {
+			config.RetainRatio = 0
+		}
+		config.SummarizationProvider = policy.SummarizationProvider
+		config.SummarizationModel = policy.SummarizationModel
+		config.MaxTokens = policy.MaxTokens
+		config.CompactionRetries = policy.CompactionRetries
+		config.MaxOverflowRetries = policy.MaxOverflowRetries
+		break
+	}
+	return config.CompactionConfig
 }
 
 func normalizeToolResultPruneConfig(config ToolResultPruneConfig) ToolResultPruneConfig {

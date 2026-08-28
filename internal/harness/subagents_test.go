@@ -9,7 +9,7 @@ import (
 )
 
 func TestCreateSubagentPublicAPI(t *testing.T) {
-	e := newIntegrationEngine(t)
+	e := newPersistentModelSubagentEngine(t)
 	parent, err := e.CreateSession(context.Background(), e.Config().Workspace, "subagent-parent", "")
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestCreateSubagentPublicAPI(t *testing.T) {
 		t.Fatalf("child model = %#v, want echo/echo", gotModel)
 	}
 
-	value, rpcErr := e.subagentList(map[string]any{"parentSessionId": parent})
+	value, rpcErr := e.subagentList(context.Background(), map[string]any{"parentSessionId": parent})
 	if rpcErr != nil {
 		t.Fatalf("subagentList: %v", rpcErr)
 	}
@@ -105,7 +105,16 @@ func TestSubagentReportQuietAndNextStep(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return mustSession(t, e, parent), mustSession(t, e, child)
+		childSession := mustSession(t, e, child)
+		activation, err := e.registerModelSubagentActivation(childSession, parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			e.removeModelSubagentActivation(activation)
+			_ = detachSDKSession(e, child)
+		})
+		return mustSession(t, e, parent), childSession
 	}
 	hasReport := func(session *Session) bool {
 		t.Helper()
@@ -225,6 +234,72 @@ func TestDrainSubagentChildrenReleasesSelectedBranchOnly(t *testing.T) {
 	if !siblingAttached {
 		t.Fatal("unselected sibling was released")
 	}
+}
+
+func TestDrainSubagentChildrenUsesModelActivationLifecycle(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	provider := newQueuedTestProvider()
+	e.RegisterProvider(provider)
+	parent, err := e.CreateSession(t.Context(), e.Config().Workspace, "activation-drain-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(parent, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	result := executeRegisteredTool(t, e, "subagent", parent, map[string]any{
+		"description": "activation drain child", "prompt": "blocked child work",
+	})
+	childID, _ := result.Value.(map[string]any)["subagentId"].(string)
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child model request did not start")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if err := e.DrainSubagentChildren(ctx, parent, []string{childID}); err != nil {
+		t.Fatal(err)
+	}
+	e.modelSubagentMu.Lock()
+	activation := e.modelSubagentActivations[childID]
+	e.modelSubagentMu.Unlock()
+	if activation != nil {
+		t.Fatal("selected drain returned before removing the model activation")
+	}
+	child := mustSession(t, e, childID)
+	child.mu.Lock()
+	attached := child.attached
+	child.mu.Unlock()
+	if attached {
+		t.Fatal("selected drain returned before detaching the child session")
+	}
+	parentSession := mustSession(t, e, parent)
+	parentSession.mu.Lock()
+	defer parentSession.mu.Unlock()
+	for _, event := range parentSession.Events {
+		if event.Type != "agent/inbox/spliced" && event.Type != "user/message" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		if message, ok := data["message"].(map[string]any); ok {
+			data = message
+		}
+		source, _ := data["source"].(map[string]any)
+		if source["kind"] == "subagent-settled" && source["senderSessionId"] == childID {
+			return
+		}
+		if inserted, ok := data["inserted"].([]any); ok {
+			for _, value := range inserted {
+				message, _ := value.(map[string]any)
+				source, _ := message["source"].(map[string]any)
+				if source["kind"] == "subagent-settled" && source["senderSessionId"] == childID {
+					return
+				}
+			}
+		}
+	}
+	t.Fatal("selected drain did not deliver a settlement notice")
 }
 
 func TestDrainSubagentChildrenAuthorizationAndColdTargets(t *testing.T) {

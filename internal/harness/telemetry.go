@@ -101,6 +101,44 @@ type SessionTelemetryConfig struct {
 	OnError         func(error)
 }
 
+func equivalentSessionTelemetryConfig(a, b *SessionTelemetryConfig) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Mode != b.Mode || a.ShutdownTimeout != b.ShutdownTimeout || !sameTelemetrySink(a.Sink, b.Sink) {
+		return false
+	}
+	if a.Exporter.URL != b.Exporter.URL || a.Exporter.Compression != b.Exporter.Compression || a.Exporter.Timeout != b.Exporter.Timeout || a.Exporter.ConcurrencyLimit != b.Exporter.ConcurrencyLimit || a.Exporter.UserAgent != b.Exporter.UserAgent || a.Exporter.HTTPClient != b.Exporter.HTTPClient {
+		return false
+	}
+	if (a.Exporter.KeepAlive == nil) != (b.Exporter.KeepAlive == nil) || a.Exporter.KeepAlive != nil && *a.Exporter.KeepAlive != *b.Exporter.KeepAlive {
+		return false
+	}
+	if len(a.Exporter.Headers) != len(b.Exporter.Headers) {
+		return false
+	}
+	for key, value := range a.Exporter.Headers {
+		if b.Exporter.Headers[key] != value {
+			return false
+		}
+	}
+	return a.Processor == b.Processor
+}
+
+// Interface equality panics when the dynamic concrete value is not
+// comparable (for example, a named slice implementing SessionTelemetrySink).
+// Such sinks cannot be proven identical across a reload, so conservatively
+// treat them as changed and let the replacement lifecycle handle them.
+func sameTelemetrySink(a, b SessionTelemetrySink) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if reflect.TypeOf(a) != reflect.TypeOf(b) || !reflect.TypeOf(a).Comparable() {
+		return false
+	}
+	return a == b
+}
+
 const defaultSessionTelemetryShutdownTimeout = 3 * time.Second
 
 const (

@@ -26,9 +26,11 @@ func TestReferenceDiscoveryRemotesUseRealWorkspaceAndSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	source, _ := e.getSession(sourceID)
-	source.mu.Lock()
-	source.Title = "Source title"
-	source.mu.Unlock()
+	if _, err := e.appendEvent(source, "session/title", map[string]any{
+		"title": "Source title", "messageSeqs": []any{}, "source": map[string]any{"kind": "fallback"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := httptest.NewServer(e.Handler())
 	t.Cleanup(server.Close)

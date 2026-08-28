@@ -30,6 +30,18 @@ func scrubbedChildEnv(extra map[string]string) []string {
 	return env
 }
 
+// shellEnvironmentForSession builds the trusted per-execution overlay used by
+// model-facing shell calls. scrubbedChildEnv removes inherited DSH_* values
+// first, so these values cannot be spoofed by the parent process or a previous
+// agent.
+func (e *Engine) shellEnvironmentForSession(sessionID string) map[string]string {
+	env := shellEnvironment()
+	for key, value := range e.trustedDSHEnvironmentForSession(sessionID) {
+		env[key] = value
+	}
+	return env
+}
+
 func sensitiveEnvName(name string) bool {
 	name = strings.ToUpper(name)
 	return strings.Contains(name, "KEY") || strings.Contains(name, "PASSWORD") ||

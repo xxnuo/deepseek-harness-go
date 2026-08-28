@@ -195,6 +195,13 @@ func (p *ACPSubagentProvider) Start(ctx context.Context, request SubagentStartRe
 		rpc.close()
 		return process.dispose(p.disposeEOFGrace, p.disposeGrace)
 	})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-run.Done():
+		}
+	}()
 	collect := func() []ContentBlock {
 		outputMu.Lock()
 		text := output.String()

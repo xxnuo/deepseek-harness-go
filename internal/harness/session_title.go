@@ -438,6 +438,40 @@ func (e *Engine) RegisterSessionTitleProvider(provider SessionTitleProvider) (fu
 	}, nil
 }
 
+// replaceSessionTitleProvider applies the configuration-owned provider
+// lifetime without cancelling the shared title context. This is the reload
+// counterpart of RegisterSessionTitleProvider: active requests from the old
+// provider are cancelled and drained before the new provider is published.
+func (e *Engine) replaceSessionTitleProvider(config SessionTitleLLMConfig) error {
+	e.titleMu.Lock()
+	previous := e.titleProvider
+	if previous != nil {
+		previous.closing = true
+		for _, state := range e.titleWork {
+			if state.pending != nil && state.pending.registration == previous {
+				state.pending = nil
+			}
+			if state.active != nil && state.active.registration == previous {
+				state.active.cancel()
+			}
+		}
+	}
+	e.titleMu.Unlock()
+	if previous != nil {
+		previous.active.Wait()
+		e.titleMu.Lock()
+		if e.titleProvider == previous {
+			e.titleProvider = nil
+		}
+		e.titleMu.Unlock()
+	}
+	if !config.Enabled {
+		return nil
+	}
+	_, err := e.RegisterSessionTitleProvider(&llmSessionTitleProvider{engine: e, config: config})
+	return err
+}
+
 func (e *Engine) SessionTitle(id string) (SessionTitleSnapshot, bool, error) {
 	session, err := e.getSession(id)
 	if err != nil {

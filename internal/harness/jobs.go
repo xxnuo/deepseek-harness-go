@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,6 +110,16 @@ type jobSnapshot struct {
 	Reported    bool
 }
 
+type jobDoneListener struct {
+	owner string
+	fn    func(jobSnapshot)
+}
+
+type jobsChangedListener struct {
+	owner string
+	fn    func(string)
+}
+
 type managedJobResult struct {
 	Status jobStatus
 	Detail string
@@ -119,7 +130,7 @@ type managedJobHandle struct {
 	Done         <-chan managedJobResult
 	Cancel       func(string) error
 	CancelInline func(string) error
-	ReadOutput   func() (string, bool)
+	ReadOutput   func() (string, bool, error)
 }
 
 type jobRegistry struct {
@@ -129,8 +140,8 @@ type jobRegistry struct {
 	counters         map[string]int
 	starting         map[string]int
 	controllerRefs   map[string]map[*dynamicCordisRun]int
-	doneListeners    map[uint64]func(jobSnapshot)
-	changedListeners map[uint64]func(string)
+	doneListeners    map[uint64]jobDoneListener
+	changedListeners map[uint64]jobsChangedListener
 	nextListener     uint64
 	closed           bool
 }
@@ -141,8 +152,8 @@ func newJobRegistry() *jobRegistry {
 		counters:         map[string]int{},
 		starting:         map[string]int{},
 		controllerRefs:   map[string]map[*dynamicCordisRun]int{},
-		doneListeners:    map[uint64]func(jobSnapshot){},
-		changedListeners: map[uint64]func(string){},
+		doneListeners:    map[uint64]jobDoneListener{},
+		changedListeners: map[uint64]jobsChangedListener{},
 	}
 }
 
@@ -208,28 +219,25 @@ func (r *jobRegistry) releaseControllers(owner string, run *dynamicCordisRun) {
 	r.mu.Unlock()
 }
 
-// hasController intentionally treats dynamic controllers as process-wide.
-// Dynamic runs are host-level compositions in this port; the job owner fence
-// still prevents cross-session reads, waits, and kills.
-func (r *jobRegistry) hasController(_ string) bool {
+// hasController resolves controller admission relative to the requested owner.
+// Controllers attached by a global run serve every owner; a session-scoped
+// controller serves only that session's composition.
+func (r *jobRegistry) hasController(owner string) bool {
+	owner = strings.TrimSpace(owner)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return false
 	}
-	for _, refs := range r.controllerRefs {
-		if len(refs) != 0 {
-			return true
-		}
-	}
-	return false
+	return len(r.controllerRefs[""]) != 0 || len(r.controllerRefs[owner]) != 0
 }
 
-func (r *jobRegistry) onDone(listener func(jobSnapshot)) func() {
+func (r *jobRegistry) onDone(owner string, listener func(jobSnapshot)) func() {
+	owner = strings.TrimSpace(owner)
 	r.mu.Lock()
 	r.nextListener++
 	id := r.nextListener
-	r.doneListeners[id] = listener
+	r.doneListeners[id] = jobDoneListener{owner: owner, fn: listener}
 	r.mu.Unlock()
 	var once sync.Once
 	return func() {
@@ -241,11 +249,12 @@ func (r *jobRegistry) onDone(listener func(jobSnapshot)) func() {
 	}
 }
 
-func (r *jobRegistry) onChanged(listener func(string)) func() {
+func (r *jobRegistry) onChanged(owner string, listener func(string)) func() {
+	owner = strings.TrimSpace(owner)
 	r.mu.Lock()
 	r.nextListener++
 	id := r.nextListener
-	r.changedListeners[id] = listener
+	r.changedListeners[id] = jobsChangedListener{owner: owner, fn: listener}
 	r.mu.Unlock()
 	var once sync.Once
 	return func() {
@@ -260,24 +269,46 @@ func (r *jobRegistry) onChanged(listener func(string)) func() {
 func (r *jobRegistry) emitChanged(owner string) {
 	r.mu.Lock()
 	listeners := make([]func(string), 0, len(r.changedListeners))
-	for _, listener := range r.changedListeners {
-		listeners = append(listeners, listener)
+	ids := make([]uint64, 0, len(r.changedListeners))
+	for id := range r.changedListeners {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		listener := r.changedListeners[id]
+		if listener.owner == "" || listener.owner == owner {
+			listeners = append(listeners, listener.fn)
+		}
 	}
 	r.mu.Unlock()
 	for _, listener := range listeners {
-		listener(owner)
+		func() {
+			defer func() { _ = recover() }()
+			listener(owner)
+		}()
 	}
 }
 
 func (r *jobRegistry) emitDone(snapshot jobSnapshot) {
 	r.mu.Lock()
 	listeners := make([]func(jobSnapshot), 0, len(r.doneListeners))
-	for _, listener := range r.doneListeners {
-		listeners = append(listeners, listener)
+	ids := make([]uint64, 0, len(r.doneListeners))
+	for id := range r.doneListeners {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		listener := r.doneListeners[id]
+		if listener.owner == "" || listener.owner == snapshot.Owner {
+			listeners = append(listeners, listener.fn)
+		}
 	}
 	r.mu.Unlock()
 	for _, listener := range listeners {
-		listener(snapshot)
+		func() {
+			defer func() { _ = recover() }()
+			listener(snapshot)
+		}()
 	}
 }
 
@@ -412,6 +443,10 @@ func (r *jobRegistry) wait(job *backgroundJob) {
 	}
 
 	r.mu.Lock()
+	if terminalJobStatus(job.status) {
+		r.mu.Unlock()
+		return
+	}
 	if job.cancelRequested && status != jobKilled {
 		status, detail = jobKilled, "killed before exit"
 	}
@@ -535,7 +570,10 @@ func (r *jobRegistry) read(owner, id string) (string, jobSnapshot, error) {
 	var outLossy, errLossy bool
 	errText := ""
 	if job.managed != nil {
-		out, outLossy = job.managed.ReadOutput()
+		out, outLossy, err = job.managed.ReadOutput()
+		if err != nil {
+			return "", jobSnapshot{}, err
+		}
 	} else {
 		out, outLossy = job.stdout.read()
 		errText, errLossy = job.stderr.read()
@@ -613,6 +651,70 @@ func (r *jobRegistry) waitFor(ctx context.Context, owner, id string, timeout tim
 	snapshot := snapshotJob(job)
 	r.mu.Unlock()
 	return snapshot, nil
+}
+
+// disposeOwner mirrors the jobs-local owner-scope teardown contract. A session
+// may disappear while its background records are still live; cancellation and
+// settlement must complete before those records are removed, and teardown
+// records are reported so no completion notice wakes a disposed owner.
+func (r *jobRegistry) disposeOwner(owner, reason string) error {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return nil
+	}
+	r.mu.Lock()
+	owned := make([]*backgroundJob, 0)
+	live := make([]*backgroundJob, 0)
+	for _, job := range r.jobs {
+		if job.owner != owner {
+			continue
+		}
+		owned = append(owned, job)
+		if !terminalJobStatus(job.status) {
+			job.reported = true
+			live = append(live, job)
+		}
+	}
+	r.mu.Unlock()
+
+	var failures []error
+	for _, job := range live {
+		_, _, err := r.killWithMode(owner, job.id, reason, false)
+		if err != nil {
+			// A producer cancel that throws must not leave owner disposal waiting
+			// forever. Force-fail only this record; a late producer outcome loses.
+			r.mu.Lock()
+			if !terminalJobStatus(job.status) {
+				job.status = jobFailed
+				job.detail = "cancel threw during teardown; work may be orphaned: " + err.Error()
+				job.finishedAt = time.Now().UnixMilli()
+				close(job.done)
+			}
+			r.mu.Unlock()
+			failures = append(failures, err)
+		}
+	}
+	for _, job := range live {
+		<-job.done
+	}
+	r.mu.Lock()
+	for _, job := range owned {
+		if r.jobs[job.id] == job {
+			delete(r.jobs, job.id)
+		}
+	}
+	kept := r.order[:0]
+	for _, id := range r.order {
+		if r.jobs[id] != nil {
+			kept = append(kept, id)
+		}
+	}
+	r.order = kept
+	r.mu.Unlock()
+	if len(owned) > 0 {
+		r.emitChanged(owner)
+	}
+	return errors.Join(failures...)
 }
 
 func (r *jobRegistry) signalProcessLocked(job *backgroundJob, reason string) error {
@@ -759,6 +861,51 @@ func statusLine(job jobSnapshot) string {
 	return fmt.Sprintf("[status: %s]", job.Status)
 }
 
+// deliverJobCompletion is the host-owned equivalent of tool-jobs' completion
+// listener. Busy sessions receive a next-step notice; idle sessions are woken
+// for the first three completions, then receive a quiet next-turn notice.
+func (e *Engine) deliverJobCompletion(snapshot jobSnapshot) {
+	if e == nil || snapshot.Owner == "" || snapshot.Reported {
+		return
+	}
+	s, err := e.getSession(snapshot.Owner)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.attached || s.draining {
+		s.mu.Unlock()
+		return
+	}
+	running := s.Running
+	s.mu.Unlock()
+	text := fmt.Sprintf("background job %s (%s: %s) finished %s. Read its output with job_output.", snapshot.ID, snapshot.Kind, snapshot.Label, statusLine(snapshot))
+	if len(text) > 2048 {
+		text = text[:2045] + "..."
+	}
+	source := map[string]any{
+		"kind": "plugin", "plugin": "tool-jobs", "form": "notice",
+		"summary": fmt.Sprintf("%s %s %s", snapshot.Kind, snapshot.Label, statusLine(snapshot)),
+	}
+	content := []ContentBlock{{Type: "text", Text: text}}
+	if running {
+		_, _ = e.enqueueTeamPrompt(s, content, source, "next-step", false)
+		return
+	}
+	e.jobWakeMu.Lock()
+	wakes := e.jobWakes[snapshot.Owner]
+	maxWakes := e.cfg.Jobs.MaxConsecutiveWakes
+	if maxWakes <= 0 {
+		maxWakes = 3
+	}
+	wakeup := e.cfg.Jobs.CompletionDelivery != "quiet" && wakes < maxWakes
+	if wakeup {
+		e.jobWakes[snapshot.Owner] = wakes + 1
+	}
+	e.jobWakeMu.Unlock()
+	_, _ = e.enqueueTeamPrompt(s, content, source, "next-turn", wakeup)
+}
+
 func validateJobID(id string) error {
 	if id == "" {
 		return errors.New(`invalid job_id: expected a non-empty string, got ""`)
@@ -811,14 +958,21 @@ func builtinJobOutputTool(e *Engine) Tool {
 				return ToolResult{}, err
 			}
 			if in.Wait {
-				timeout := jobWaitDefault
+				timeout := e.cfg.Jobs.WaitTimeoutMs
+				if timeout <= 0 {
+					timeout = jobWaitDefault
+				}
 				if in.TimeoutMS != nil {
 					if *in.TimeoutMS <= 0 {
 						return ToolResult{}, fmt.Errorf("invalid wait timeout: expected a positive number of milliseconds, got %v", *in.TimeoutMS)
 					}
 					milliseconds := *in.TimeoutMS
-					if milliseconds > float64(jobWaitMax/time.Millisecond) {
-						milliseconds = float64(jobWaitMax / time.Millisecond)
+					maxWait := e.cfg.Jobs.MaxWaitTimeoutMs
+					if maxWait <= 0 {
+						maxWait = jobWaitMax
+					}
+					if milliseconds > float64(maxWait/time.Millisecond) {
+						milliseconds = float64(maxWait / time.Millisecond)
 					}
 					timeout = time.Duration(milliseconds * float64(time.Millisecond))
 				}

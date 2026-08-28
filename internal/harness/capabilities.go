@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
@@ -288,6 +289,7 @@ type skillRecord struct {
 	path, content                string
 	provider                     string
 	modelInvocable               bool
+	userInvocable                bool
 }
 
 func validSkillName(name string) bool {
@@ -321,13 +323,43 @@ func parseSkill(path string) (skillRecord, bool) {
 		return skillRecord{}, false
 	}
 	trimmed := strings.TrimSpace(text)
-	parts := strings.SplitN(trimmed, "---", 3)
-	if len(parts) < 3 {
+	if !strings.HasPrefix(trimmed, "---\n") && !strings.HasPrefix(trimmed, "---\r\n") {
 		return skillRecord{}, false
 	}
-	var front skillFrontmatter
-	if yaml.Unmarshal([]byte(parts[1]), &front) != nil {
+	lines := strings.Split(strings.ReplaceAll(trimmed, "\r\n", "\n"), "\n")
+	closing := -1
+	for index := 1; index < len(lines); index++ {
+		if lines[index] == "---" {
+			closing = index
+			break
+		}
+	}
+	if closing < 0 {
 		return skillRecord{}, false
+	}
+	var values map[string]any
+	if yaml.Unmarshal([]byte(strings.Join(lines[1:closing], "\n")), &values) != nil || values == nil {
+		return skillRecord{}, false
+	}
+	for _, legacy := range []string{"disableModelInvocation", "modelInvocable", "userInvocable"} {
+		if _, exists := values[legacy]; exists {
+			return skillRecord{}, false
+		}
+	}
+	front := skillFrontmatter{Name: stringValue(values["name"]), Description: stringValue(values["description"]), WhenToUse: stringValue(values["whenToUse"]), WhenToUseAlt: stringValue(values["when-to-use"])}
+	if raw, ok := values["disable-model-invocation"]; ok {
+		value, ok := skillFrontmatterBool(raw)
+		if !ok {
+			return skillRecord{}, false
+		}
+		front.DisableModelInvocation = &value
+	}
+	if raw, ok := values["user-invocable"]; ok {
+		value, ok := skillFrontmatterBool(raw)
+		if !ok {
+			return skillRecord{}, false
+		}
+		front.UserInvocable = &value
 	}
 	name := strings.TrimSpace(front.Name)
 	if !validSkillName(name) {
@@ -344,13 +376,32 @@ func parseSkill(path string) (skillRecord, bool) {
 	model := true
 	if front.DisableModelInvocation != nil {
 		model = !*front.DisableModelInvocation
-	} else if front.ModelInvocable != nil {
-		model = *front.ModelInvocable
+	}
+	user := true
+	if front.UserInvocable != nil {
+		user = *front.UserInvocable
 	}
 	return skillRecord{
 		name: name, description: description, whenToUse: when,
-		path: path, content: strings.TrimSpace(parts[2]), provider: "filesystem", modelInvocable: model,
+		path: path, content: strings.TrimSpace(strings.Join(lines[closing+1:], "\n")), provider: "filesystem", modelInvocable: model, userInvocable: user,
 	}, true
+}
+
+func skillFrontmatterBool(value any) (bool, bool) {
+	switch value := value.(type) {
+	case bool:
+		return value, true
+	case int:
+		return value == 1, value == 0 || value == 1
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "yes", "on", "1":
+			return true, true
+		case "false", "no", "off", "0":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 const bundledBadgeSkillDescription = "Add the official \u201cpowered by dsh\u201d badge to documents, pull requests, merge requests, and other content produced with DeepSeek Harness. Use whenever creating a pull request or merge request. Also use when the user asks for a dsh badge, powered-by-dsh attribution, or a reusable dsh badge asset or snippet."
@@ -368,6 +419,7 @@ func (e *Engine) bundledBadgeSkill() (skillRecord, bool) {
 			return skillRecord{
 				name: "dsh-badge", description: bundledBadgeSkillDescription,
 				path: path, content: strings.TrimSpace(string(data)), provider: "dsh-badge", modelInvocable: true,
+				userInvocable: true,
 			}, true
 		}
 	}
@@ -375,7 +427,34 @@ func (e *Engine) bundledBadgeSkill() (skillRecord, bool) {
 }
 
 func (e *Engine) skillRoots(cwd, preset string) []string {
+	var generation *presetRuntimeGeneration
+	if preset != "" {
+		generation, _ = e.ensurePresetRuntime(preset)
+	}
+	return e.skillRootsForGeneration(cwd, preset, generation)
+}
+
+func (e *Engine) skillRootsForGeneration(cwd, preset string, generation *presetRuntimeGeneration) []string {
 	roots := []string{}
+	includeDefaultRoots := true
+	dshHome, agentsHome, bundledSkillDir := e.cfg.DataDir, e.cfg.AgentsHome, e.cfg.SkillDir
+	if generation != nil {
+		if generation.runtime.skillBundledSkillDir != "" {
+			bundledSkillDir = generation.runtime.skillBundledSkillDir
+		}
+		if !generation.runtime.skillFilesystemEnabled {
+			// A preset without the scoped filesystem provider still sees the
+			// host's bundled layer, but must not inherit project/user discovery.
+			return []string{bundledSkillDir}
+		}
+		includeDefaultRoots = generation.runtime.skillIncludeDefaultRoots
+		if generation.runtime.skillDshHome != "" {
+			dshHome = generation.runtime.skillDshHome
+		}
+		if generation.runtime.skillAgentsHome != "" {
+			agentsHome = generation.runtime.skillAgentsHome
+		}
+	}
 	add := func(path string) {
 		if path == "" {
 			return
@@ -388,45 +467,105 @@ func (e *Engine) skillRoots(cwd, preset string) []string {
 				return
 			}
 		}
-		if st, err := os.Stat(path); err == nil && st.IsDir() {
-			roots = append(roots, path)
+		// Keep absent roots in the ordered view. The upstream provider watches
+		// the nearest existing ancestor and can therefore observe a skill root
+		// created after the first catalog read; discovery itself treats an
+		// absent root as an empty directory.
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			return
 		}
+		roots = append(roots, path)
 	}
-	add(e.cfg.SkillDir)
-	add(filepath.Join(e.cfg.DataDir, "skills"))
-	add(filepath.Join(e.cfg.AgentsHome, "skills"))
-	if root := findInstructionRoot(cwd); root != "" {
-		add(filepath.Join(root, ".dsh", "skills"))
-		add(filepath.Join(root, ".agents", "skills"))
+	// Root order is the filesystem provider's precedence order. Project roots
+	// outrank custom roots, which outrank user roots. skillRecordsForSession
+	// keeps the first valid definition for a duplicate name, so this ordering
+	// is observable in both the catalog and subsequent loads.
+	if includeDefaultRoots {
+		if root := findInstructionRoot(cwd); root != "" {
+			add(filepath.Join(root, ".dsh", "skills"))
+			add(filepath.Join(root, ".agents", "skills"))
+		}
 	}
 	if preset != "" {
 		if row, ok := e.findPreset(preset); ok {
 			add(filepath.Join(row.dir, "skills"))
 		}
+		if generation != nil {
+			for _, custom := range generation.runtime.customSkillDirs {
+				add(custom)
+			}
+		}
 	}
+	if includeDefaultRoots {
+		add(filepath.Join(dshHome, "skills"))
+		add(filepath.Join(agentsHome, "skills"))
+	}
+	// SkillDir is the packaged/bundled root supplied by the host. It must be
+	// lowest precedence so a user or project skill can intentionally override
+	// the shipped definition, matching BUNDLED_SKILL_RANK in the upstream
+	// registry.
+	add(bundledSkillDir)
 	return roots
 }
 
 func (e *Engine) skillRecordsForSession(id string) ([]skillRecord, *RPCError) {
+	rows, _, rpcErr := e.skillRecordsForSessionState(id)
+	return rows, rpcErr
+}
+
+// skillRecordsForSessionState mirrors the provider's complete observation
+// bit. Missing roots are an authoritative empty result; other directory
+// failures are incomplete and must not cause consumers to discard a last-good
+// catalog.
+func (e *Engine) skillRecordsForSessionState(id string) ([]skillRecord, bool, *RPCError) {
 	s, err := e.getSession(id)
 	if err != nil {
-		return nil, errorToRPC(err)
+		return nil, false, errorToRPC(err)
 	}
 	s.mu.Lock()
 	cwd, preset := s.Header.CWD, sessionAgentPreset(s.Header, s.Events)
+	parentID := s.Header.ParentSession
+	generation := s.presetRuntime
 	s.mu.Unlock()
+	if preset != "" && generation == nil {
+		var err error
+		generation, err = e.presetRuntimeForSession(s, preset, parentID)
+		if err != nil {
+			return nil, false, errorToRPC(err)
+		}
+	}
 	seen := map[string]bool{}
 	rows := []skillRecord{}
-	for _, root := range e.skillRoots(cwd, preset) {
+	complete := true
+	for _, root := range e.skillRootsForGeneration(cwd, preset, generation) {
 		entries, readErr := os.ReadDir(root)
 		if readErr != nil {
+			if !errors.Is(readErr, os.ErrNotExist) && !errors.Is(readErr, syscall.ENOTDIR) {
+				complete = false
+			}
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			path := filepath.Join(root, entry.Name())
+			if entry.IsDir() {
+				path = filepath.Join(path, "SKILL.md")
+			} else if entry.Type()&os.ModeSymlink != 0 {
+				// os.ReadDir reports symlinks as non-directories. The upstream
+				// provider follows a symlink target to classify directory bundles
+				// and flat Markdown files, so resolve the target before filtering.
+				info, statErr := os.Stat(path)
+				if statErr != nil {
+					continue
+				}
+				if info.IsDir() {
+					path = filepath.Join(path, "SKILL.md")
+				} else if !info.Mode().IsRegular() || filepath.Ext(entry.Name()) != ".md" {
+					continue
+				}
+			} else if filepath.Ext(entry.Name()) != ".md" {
 				continue
 			}
-			row, ok := parseSkill(filepath.Join(root, entry.Name(), "SKILL.md"))
+			row, ok := parseSkill(path)
 			if !ok || seen[row.name] {
 				continue
 			}
@@ -440,7 +579,7 @@ func (e *Engine) skillRecordsForSession(id string) ([]skillRecord, *RPCError) {
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
-	return rows, nil
+	return rows, complete, nil
 }
 
 func (e *Engine) skillsForSession(id string) ([]map[string]any, *RPCError) {
@@ -452,7 +591,7 @@ func (e *Engine) skillsForSession(id string) ([]map[string]any, *RPCError) {
 	for _, record := range records {
 		row := map[string]any{
 			"name": record.name, "description": record.description,
-			"modelInvocable": record.modelInvocable,
+			"modelInvocable": record.modelInvocable, "userInvocable": record.userInvocable,
 		}
 		if record.whenToUse != "" {
 			row["whenToUse"] = record.whenToUse
@@ -476,6 +615,9 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 	if !available {
 		return "", errors.New("subagent-parent-unavailable: parent session is not resident")
 	}
+	if int64(depth) >= maxJSONSafeInteger {
+		return "", errors.New("subagent child depth exceeds the safe-integer range")
+	}
 	child, err := e.createSession(ctx, SessionHeader{
 		ID: id, CWD: cwd, ParentSession: parentID, Origin: "subagent",
 		DelegationDepth: depth + 1, AgentPreset: preset, Mode: "continuable",
@@ -487,14 +629,14 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 	s.mu.Lock()
 	s.Model = model
 	s.mu.Unlock()
-	if _, err := e.appendEvent(s, "subagent/descriptor", map[string]any{
-		"version":       SubagentDescriptorVersion,
-		"mode":          "continuable",
-		"provider":      "library",
-		"label":         child,
-		"agentProvider": model.Provider,
-		"agentModel":    model.Model,
-	}); err != nil {
+	descriptor, err := SnapshotSubagentDescriptor(SubagentDescriptorData{
+		Mode: "continuable", Provider: "library", Label: descriptorString(child),
+		AgentProvider: descriptorString(model.Provider), AgentModel: descriptorString(model.Model),
+	})
+	if err != nil {
+		return "", err
+	}
+	if _, err := e.appendEvent(s, "subagent/descriptor", descriptor.eventData()); err != nil {
 		return "", err
 	}
 	e.mu.Lock()

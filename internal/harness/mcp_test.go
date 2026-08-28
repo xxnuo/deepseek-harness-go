@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -294,6 +295,86 @@ func TestMCPStreamableHTTPHeadersCallsAndListChanged(t *testing.T) {
 	}
 }
 
+func TestMCPReconcilePreservesIdentityReplacesAndRollsBack(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "reconcile-fixture", Version: "1.0.0"}, nil)
+	server.AddTool(&mcp.Tool{Name: "ping", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "pong"}}}, nil
+	})
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	engine := newMCPTestEngine(t)
+	base := MCPConfig{
+		Transport: MCPTransportStreamableHTTP, ServerName: "stable", URL: httpServer.URL,
+		ToolCallTimeout: 2 * time.Second, FailOnStartupError: true,
+	}
+	if err := engine.reconcileMCPServers(t.Context(), []MCPConfig{base}); err != nil {
+		t.Fatal(err)
+	}
+	first := mcpConnectionsSnapshot(engine)["stable"]
+	if first == nil {
+		t.Fatal("initial MCP connection was not published")
+	}
+	if _, err := callMCPTool(t, engine, "mcp__stable__ping", `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.reconcileMCPServers(t.Context(), []MCPConfig{base}); err != nil {
+		t.Fatal(err)
+	}
+	if second := mcpConnectionsSnapshot(engine)["stable"]; second != first {
+		t.Fatal("unchanged MCP config did not preserve connection identity")
+	}
+
+	changed := base
+	changed.Headers = map[string]string{"Authorization": "Bearer changed"}
+	if err := engine.reconcileMCPServers(t.Context(), []MCPConfig{changed}); err != nil {
+		t.Fatal(err)
+	}
+	replaced := mcpConnectionsSnapshot(engine)["stable"]
+	if replaced == nil || replaced == first {
+		t.Fatal("changed MCP config did not replace connection")
+	}
+	if _, err := callMCPTool(t, engine, "mcp__stable__ping", `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.reconcileMCPServers(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := mcpConnectionsSnapshot(engine)["stable"]; exists {
+		t.Fatal("removed MCP connection remained published")
+	}
+	for _, schema := range engine.ListTools() {
+		if schema.Name == "mcp__stable__ping" {
+			t.Fatal("removed MCP tool remained registered")
+		}
+	}
+
+	// A failed candidate must restore the last-good changed connection. Names
+	// sort deterministically, so the broken row is attempted first after the
+	// existing stable row has been closed.
+	if err := engine.reconcileMCPServers(t.Context(), []MCPConfig{changed}); err != nil {
+		t.Fatal(err)
+	}
+	lastGood := mcpConnectionsSnapshot(engine)["stable"]
+	failed := []MCPConfig{
+		changed,
+		{Transport: MCPTransportStdio, ServerName: "broken", Command: "/path/that/does/not/exist", FailOnStartupError: true},
+	}
+	if err := engine.reconcileMCPServers(t.Context(), failed); err == nil {
+		t.Fatal("invalid MCP candidate unexpectedly succeeded")
+	}
+	restored := mcpConnectionsSnapshot(engine)["stable"]
+	if restored == nil {
+		t.Fatalf("last-good MCP connection was not restored after failed reconcile: lastGood=%v", lastGood)
+	}
+	if _, err := callMCPTool(t, engine, "mcp__stable__ping", `{}`); err != nil {
+		t.Fatalf("restored MCP tool failed: %v", err)
+	}
+}
+
 func TestMCPRejectsInvalidAndDuplicateServerConfigs(t *testing.T) {
 	engine := newMCPTestEngine(t)
 	if _, err := engine.ConnectMCP(t.Context(), MCPConfig{Transport: MCPTransportStdio, ServerName: "bad name", Command: os.Args[0]}); err == nil {
@@ -343,5 +424,48 @@ func TestEngineStartsAndClosesConfiguredMCPServers(t *testing.T) {
 	}
 	if _, err := engine.ConnectMCP(t.Context(), cfg.MCPServers[0]); err == nil {
 		t.Fatal("closed engine accepted a new MCP connection")
+	}
+}
+
+func TestMCPImageWireValidationIsAtomicAndPerBlock(t *testing.T) {
+	engine := newIntegrationEngine(t)
+	content := []any{
+		map[string]any{"type": "image", "mimeType": "image/png", "data": "AQ=="},
+		map[string]any{"type": "image", "mimeType": "image/png", "data": "not base64"},
+		map[string]any{"type": "image", "mimeType": "image/tiff", "data": "AQ=="},
+	}
+	projected, err := projectMCPContent(context.Background(), engine, ToolCall{}, "mcp_image", content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected) != 3 {
+		t.Fatalf("projected content = %#v", projected)
+	}
+	if !strings.Contains(projected[0].Text, "another image in the same result was invalid") ||
+		!strings.Contains(projected[1].Text, "not canonical base64") ||
+		!strings.Contains(projected[2].Text, "not PNG, JPEG, WebP, or GIF") {
+		t.Fatalf("projected diagnostics = %#v", projected)
+	}
+}
+
+func TestMCPImageRouteCancellationAbortsProjection(t *testing.T) {
+	engine := newIntegrationEngine(t)
+	provider := &readImageProvider{id: "mcp-vision", model: "vision", modalities: []string{"text", "image"}, catalog: []ModelInfo{}}
+	engine.RegisterProvider(provider)
+	sessionID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "mcp-image-cancel", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SelectModel(sessionID, ModelSelection{Provider: provider.ID(), Model: provider.model}); err != nil {
+		t.Fatal(err)
+	}
+	reason := errors.New("cancel MCP image route")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(reason)
+	_, err = projectMCPContent(ctx, engine, ToolCall{SessionID: sessionID}, "mcp_image", []any{
+		map[string]any{"type": "image", "mimeType": "image/png", "data": readImagePNG},
+	})
+	if !errors.Is(err, reason) {
+		t.Fatalf("MCP projection cancellation = %v", err)
 	}
 }

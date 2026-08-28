@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dop251/goja"
 	"github.com/evanw/esbuild/pkg/api"
@@ -149,13 +151,28 @@ type dynamicCordisRun struct {
 	disposers         []func()
 	finalDisposers    []func()
 	pending           map[*dynamicCordisAwait]struct{}
+	effectSetups      int
+	effectSetupErr    error
+	effectWaiters     []func(error)
+	cleanupWaits      []*dynamicCordisCleanupWait
 	renderFailure     *DynamicCordisRenderFailure
 	reportedErrors    map[string]struct{}
 	listeners         map[string][]*dynamicCordisListener
 	preparedSessions  map[string]*dynamicCordisPreparedSession
 	active            bool
 	activating        bool
+	cleaning          bool
 	disposed          bool
+}
+
+type dynamicCordisCleanupWait struct {
+	done bool
+}
+
+type dynamicCordisEffectState struct {
+	cleanups []goja.Callable
+	disposed bool
+	result   goja.Value
 }
 
 type dynamicCordisAwait struct {
@@ -209,6 +226,7 @@ type dynamicCordisPendingRun struct {
 }
 
 var dynamicPluginPrefix = regexp.MustCompile(`^[a-z]{3,6}$`)
+var dynamicPluginMention = regexp.MustCompile(`@[a-z]{3,6}-[0-9]+`)
 var dynamicTypeScriptAssertion = regexp.MustCompile(`\bas\b`)
 var dynamicSyntaxPosition = regexp.MustCompile(`Line ([0-9]+):([0-9]+)`)
 
@@ -322,11 +340,12 @@ func (e *Engine) DynamicCordisDefine(request DynamicCordisDefineRequest) (Dynami
 			return DynamicCordisDefineReceipt{}, errors.New("cordis_define plugin.idPrefix must contain 3-6 lowercase English letters")
 		}
 		for {
-			e.dynamicCordis.nextPlugin++
 			id := fmt.Sprintf("%s-%d", prefix, e.dynamicCordis.nextPlugin)
+			e.dynamicCordis.nextPlugin++
 			if _, exists := e.dynamicCordis.plugins[id]; !exists {
 				plugin = &dynamicCordisPlugin{id: id, sessionID: request.SessionID, global: request.Global, packages: map[string]*dynamicCordisPackage{}, approved: map[string]bool{}, latest: map[string]any{}}
 				e.dynamicCordis.plugins[id] = plugin
+				e.dynamicCordis.pluginOrder = append(e.dynamicCordis.pluginOrder, id)
 				break
 			}
 		}
@@ -338,8 +357,8 @@ func (e *Engine) DynamicCordisDefine(request DynamicCordisDefineRequest) (Dynami
 	default:
 		return DynamicCordisDefineReceipt{}, errors.New("cordis_define plugin.kind must be new or existing")
 	}
-	e.dynamicCordis.nextPackage++
 	packageID := fmt.Sprintf("pkg-%d", e.dynamicCordis.nextPackage)
+	e.dynamicCordis.nextPackage++
 	pkg := &dynamicCordisPackage{id: packageID, name: name, purpose: purpose, host: request.Code.Host, client: request.Code.Client}
 	plugin.packages[packageID] = pkg
 	plugin.order = append(plugin.order, packageID)
@@ -456,6 +475,196 @@ func dynamicCordisAwaitOnLoop(run *dynamicCordisRun, value goja.Value, finish fu
 	if _, err := then(object, fulfilled, rejected); err != nil {
 		complete(nil, err)
 	}
+}
+
+func dynamicCordisFinishEffectSetup(run *dynamicCordisRun, err error) {
+	if err != nil && run.effectSetupErr == nil {
+		run.effectSetupErr = err
+	}
+	run.effectSetups--
+	if run.effectSetups != 0 {
+		return
+	}
+	waiters := append([]func(error){}, run.effectWaiters...)
+	run.effectWaiters = nil
+	setupErr := run.effectSetupErr
+	for _, waiter := range waiters {
+		waiter(setupErr)
+	}
+}
+
+func dynamicCordisAwaitEffectSetups(run *dynamicCordisRun, finish func(error)) {
+	if run.effectSetups == 0 {
+		finish(run.effectSetupErr)
+		return
+	}
+	run.effectWaiters = append(run.effectWaiters, finish)
+}
+
+type dynamicCordisEffectIteratorState struct {
+	object *goja.Object
+	next   goja.Callable
+}
+
+func dynamicCordisEffectIterator(vm *goja.Runtime, value goja.Value, async bool) (dynamicCordisEffectIteratorState, bool, error) {
+	object, ok := value.(*goja.Object)
+	if !ok {
+		return dynamicCordisEffectIteratorState{}, false, nil
+	}
+	member := "iterator"
+	if async {
+		member = "asyncIterator"
+	}
+	symbol, ok := vm.Get("Symbol").ToObject(vm).Get(member).(*goja.Symbol)
+	if !ok {
+		return dynamicCordisEffectIteratorState{}, false, nil
+	}
+	methodValue := object.GetSymbol(symbol)
+	if methodValue == nil || goja.IsUndefined(methodValue) {
+		return dynamicCordisEffectIteratorState{}, false, nil
+	}
+	method, ok := goja.AssertFunction(methodValue)
+	if !ok {
+		return dynamicCordisEffectIteratorState{}, false, errors.New("Invalid effect")
+	}
+	iteratorValue, err := method(object)
+	if err != nil {
+		return dynamicCordisEffectIteratorState{}, false, errors.New(dynamicJSMessage(err))
+	}
+	iterator, ok := iteratorValue.(*goja.Object)
+	if !ok {
+		return dynamicCordisEffectIteratorState{}, false, errors.New("Invalid effect iterator")
+	}
+	next, ok := goja.AssertFunction(iterator.Get("next"))
+	if !ok {
+		return dynamicCordisEffectIteratorState{}, false, errors.New("Invalid effect iterator")
+	}
+	return dynamicCordisEffectIteratorState{object: iterator, next: next}, true, nil
+}
+
+func dynamicCordisCollectEffectCleanup(run *dynamicCordisRun, state *dynamicCordisEffectState, value goja.Value) error {
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return nil
+	}
+	cleanup, ok := goja.AssertFunction(value)
+	if !ok {
+		return errors.New("Invalid effect")
+	}
+	if !state.disposed {
+		state.cleanups = append(state.cleanups, cleanup)
+		return nil
+	}
+	result, err := cleanup(goja.Undefined())
+	if err != nil {
+		return errors.New(dynamicJSMessage(err))
+	}
+	dynamicCordisTrackCleanup(run, result)
+	return nil
+}
+
+func dynamicCordisConsumeEffectIterator(run *dynamicCordisRun, state *dynamicCordisEffectState, iterator dynamicCordisEffectIteratorState) error {
+	for {
+		resultValue, err := iterator.next(iterator.object)
+		if err != nil {
+			return errors.New(dynamicJSMessage(err))
+		}
+		result, ok := resultValue.(*goja.Object)
+		if !ok {
+			return errors.New("Invalid effect iterator result")
+		}
+		if err := dynamicCordisCollectEffectCleanup(run, state, result.Get("value")); err != nil {
+			return err
+		}
+		if result.Get("done").ToBoolean() {
+			return nil
+		}
+	}
+}
+
+func dynamicCordisConsumeAsyncEffectIterator(run *dynamicCordisRun, state *dynamicCordisEffectState, iterator dynamicCordisEffectIteratorState, finish func(error)) {
+	var next func()
+	next = func() {
+		resultValue, err := iterator.next(iterator.object)
+		if err != nil {
+			finish(errors.New(dynamicJSMessage(err)))
+			return
+		}
+		dynamicCordisAwaitOnLoop(run, resultValue, func(resolved goja.Value, awaitErr error) {
+			if awaitErr != nil {
+				finish(awaitErr)
+				return
+			}
+			result, ok := resolved.(*goja.Object)
+			if !ok {
+				finish(errors.New("Invalid effect iterator result"))
+				return
+			}
+			if err := dynamicCordisCollectEffectCleanup(run, state, result.Get("value")); err != nil {
+				finish(err)
+				return
+			}
+			if result.Get("done").ToBoolean() {
+				finish(nil)
+				return
+			}
+			next()
+		})
+	}
+	next()
+}
+
+func dynamicCordisDisposeEffect(run *dynamicCordisRun, state *dynamicCordisEffectState) goja.Value {
+	if state.disposed {
+		if state.result != nil {
+			return state.result
+		}
+		return goja.Undefined()
+	}
+	state.disposed = true
+	if len(state.cleanups) == 0 {
+		return goja.Undefined()
+	}
+	cleanups := append([]goja.Callable(nil), state.cleanups...)
+	state.cleanups = nil
+	vm := run.runtime
+	promise, resolve, reject := vm.NewPromise()
+	state.result = vm.ToValue(promise)
+	index := len(cleanups) - 1
+	var next func()
+	next = func() {
+		if index < 0 {
+			_ = resolve(goja.Undefined())
+			return
+		}
+		cleanup := cleanups[index]
+		index--
+		result, err := cleanup(goja.Undefined())
+		if err != nil {
+			_ = reject(vm.NewGoError(errors.New(dynamicJSMessage(err))))
+			return
+		}
+		dynamicCordisAwaitOnLoop(run, result, func(_ goja.Value, cleanupErr error) {
+			if cleanupErr != nil {
+				_ = reject(vm.NewGoError(cleanupErr))
+				return
+			}
+			next()
+		})
+	}
+	next()
+	return state.result
+}
+
+func dynamicCordisTrackCleanup(run *dynamicCordisRun, value goja.Value) {
+	if value == nil || goja.IsUndefined(value) {
+		return
+	}
+	if _, ok := value.Export().(*goja.Promise); !ok {
+		return
+	}
+	wait := &dynamicCordisCleanupWait{}
+	run.cleanupWaits = append(run.cleanupWaits, wait)
+	dynamicCordisAwaitOnLoop(run, value, func(goja.Value, error) { wait.done = true })
 }
 
 func (wait *dynamicCordisAwait) cancel(err error) {
@@ -821,18 +1030,27 @@ func (e *Engine) DynamicCordisRun(ctx context.Context, sessionID, pluginID, pack
 		e.dynamicCordis.Unlock()
 		return DynamicCordisRunResponse{Reason: "invalid-mode", Message: "mode run can only start or restart the current package"}, nil
 	}
-	if plugin.next != "" {
+	transitioning := e.dynamicCordis.starting[pluginID] != nil
+	if !transitioning {
+		for _, pending := range e.dynamicCordis.pendingRuns {
+			if pending.pluginID == pluginID {
+				transitioning = true
+				break
+			}
+		}
+	}
+	if transitioning {
 		e.dynamicCordis.Unlock()
 		return DynamicCordisRunResponse{Reason: "transition-in-flight", Message: fmt.Sprintf("dynamic plugin %q already has a transition in flight", pluginID)}, nil
 	}
-	e.dynamicCordis.nextRun++
 	runID := fmt.Sprintf("run-%d", e.dynamicCordis.nextRun)
+	e.dynamicCordis.nextRun++
 	plugin.next = packageID
 	plugin.latest = dynamicCordisAttempt(runID, packageID, mode, pkg)
 	if pkg.client != "" {
 		requiresApproval := !plugin.approved[packageID] && !plugin.approveFuture
-		e.dynamicCordis.nextApproval++
 		requestID := fmt.Sprintf("approval-%d", e.dynamicCordis.nextApproval)
+		e.dynamicCordis.nextApproval++
 		if requiresApproval {
 			plugin.latest["status"] = "awaiting-approval"
 		}
@@ -1152,8 +1370,8 @@ func (e *Engine) DynamicCordisRunHostHalf(ctx context.Context, sessionID, plugin
 			dynamicCordisAttemptString(plugin.latest, "status") == "starting-host" {
 			runID = dynamicCordisAttemptRunID(plugin.latest)
 		} else {
-			e.dynamicCordis.nextRun++
 			runID = fmt.Sprintf("run-%d", e.dynamicCordis.nextRun)
+			e.dynamicCordis.nextRun++
 			plugin.next = packageID
 			plugin.latest = dynamicCordisAttempt(runID, packageID, mode, plugin.packages[packageID])
 			if plugin.packages[packageID].client != "" {
@@ -1226,6 +1444,7 @@ func (e *Engine) DynamicCordisResolveRequestRun(requestID string, resolution Dyn
 		}
 		e.dynamicCordis.Unlock()
 		if retract != nil {
+			e.disposeDynamicCordisRun(retract)
 			e.emitCordisEvent("cordis/dynamic-retract", map[string]any{"pluginId": pending.pluginID, "packageId": retract.packageID, "pluginRunId": retract.runID})
 		}
 		outcome := "failed"
@@ -1281,6 +1500,7 @@ func (e *Engine) DynamicCordisSettleUserRun(sessionID, pluginID string, resoluti
 		}
 		e.dynamicCordis.Unlock()
 		if retract {
+			e.disposeDynamicCordisRun(run)
 			e.emitCordisEvent("cordis/dynamic-retract", map[string]any{"pluginId": pluginID, "packageId": run.packageID, "pluginRunId": run.runID})
 		}
 		reason := resolution.Reason
@@ -1560,7 +1780,11 @@ func (e *Engine) DynamicCordisInventory(sessionID string) []DynamicCordisInvento
 	e.dynamicCordis.RLock()
 	defer e.dynamicCordis.RUnlock()
 	rows := make([]DynamicCordisInventoryRow, 0)
-	for _, plugin := range e.dynamicCordis.plugins {
+	for _, pluginID := range e.dynamicCordis.pluginOrder {
+		plugin := e.dynamicCordis.plugins[pluginID]
+		if plugin == nil {
+			continue
+		}
 		if sessionID != "" && plugin.sessionID != sessionID {
 			continue
 		}
@@ -1581,7 +1805,6 @@ func (e *Engine) DynamicCordisInventory(sessionID string) []DynamicCordisInvento
 		}
 		rows = append(rows, row)
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].PluginID < rows[j].PluginID })
 	return rows
 }
 
@@ -1589,38 +1812,297 @@ func (e *Engine) DynamicCordisInspectSelf(sessionID, pluginID, packageID string)
 	e.dynamicCordis.RLock()
 	defer e.dynamicCordis.RUnlock()
 	if pluginID == "" {
-		return map[string]any{"mode": "plugins", "plugins": e.dynamicCordisInventoryLocked(sessionID)}, nil
+		plugins := make([]map[string]any, 0)
+		for _, id := range e.dynamicCordis.pluginOrder {
+			plugin := e.dynamicCordis.plugins[id]
+			if plugin == nil || plugin.sessionID != sessionID {
+				continue
+			}
+			plugins = append(plugins, dynamicCordisSelfSummaryLocked(plugin))
+		}
+		return map[string]any{"mode": "plugins", "plugins": plugins}, nil
 	}
 	p := e.dynamicCordis.plugins[pluginID]
 	if p == nil || p.sessionID != sessionID {
 		return nil, errors.New("dynamic plugin is unavailable")
 	}
 	if packageID == "" {
-		row := e.dynamicCordisPluginViewLocked(p, false)
-		return map[string]any{"mode": "plugin", "plugin": row, "packages": row["packages"]}, nil
+		row := dynamicCordisSelfSummaryLocked(p)
+		packages := make([]map[string]any, 0, len(p.order))
+		for _, id := range p.order {
+			pkg := p.packages[id]
+			packages = append(packages, map[string]any{
+				"packageId":     id,
+				"name":          pkg.name,
+				"purpose":       pkg.purpose,
+				"hasHostHalf":   pkg.host != "",
+				"hasClientHalf": pkg.client != "",
+				"isCurrent":     id == p.current,
+				"isNext":        id == p.next,
+			})
+		}
+		row["mode"] = "plugin"
+		row["packages"] = packages
+		return row, nil
 	}
 	pkg := p.packages[packageID]
 	if pkg == nil {
 		return nil, errors.New("dynamic package is unavailable")
 	}
-	row := e.dynamicCordisPluginViewLocked(p, true)
-	row["mode"] = "package"
-	row["packageId"] = packageID
-	row["name"] = pkg.name
-	row["purpose"] = pkg.purpose
-	row["code"] = map[string]any{"host": pkg.host, "client": pkg.client}
-	return row, nil
+	code := map[string]any{}
+	if pkg.host != "" {
+		code["host"] = pkg.host
+	}
+	if pkg.client != "" {
+		code["client"] = pkg.client
+	}
+	active := p.run
+	if active != nil && active.packageID != packageID {
+		active = nil
+	}
+	latest := p.latest
+	if dynamicCordisAttemptString(latest, "packageId") != packageID {
+		latest = nil
+	}
+	hostWaiting := dynamicCordisAttemptWaiting(latest, "host")
+	provided := []string{}
+	handlers := []string{}
+	if active != nil {
+		hostWaiting = dynamicCordisMissingServicesLocked(e, active)
+		for name := range active.provided {
+			provided = append(provided, name)
+		}
+		sort.Strings(provided)
+		for name := range active.handlers {
+			handlers = append(handlers, name)
+		}
+		sort.Strings(handlers)
+	}
+	hostStatus := "absent"
+	if pkg.host != "" {
+		hostStatus = dynamicCordisAttemptString(dynamicCordisAttemptHalf(latest, "host"), "status")
+		if hostStatus == "" {
+			hostStatus = "stopped"
+			if active != nil {
+				hostStatus = "running"
+				if len(hostWaiting) > 0 {
+					hostStatus = "waiting"
+				}
+			}
+		}
+	}
+	clientStatus := "absent"
+	if pkg.client != "" {
+		clientStatus = dynamicCordisAttemptString(dynamicCordisAttemptHalf(latest, "client"), "status")
+		if clientStatus == "" {
+			clientStatus = "stopped"
+		}
+	}
+	hostRuntime := map[string]any{"status": hostStatus, "provides": provided, "waitingFor": hostWaiting, "handlers": handlers}
+	clientRuntime := map[string]any{"status": clientStatus, "waitingFor": dynamicCordisAttemptWaiting(latest, "client")}
+	if errText := dynamicCordisAttemptString(dynamicCordisAttemptHalf(latest, "host"), "error"); errText != "" {
+		hostRuntime["error"] = errText
+	}
+	if errText := dynamicCordisAttemptString(dynamicCordisAttemptHalf(latest, "client"), "error"); errText != "" {
+		clientRuntime["error"] = errText
+	}
+	if active != nil && active.renderFailure != nil {
+		clientRuntime["renderFailure"] = *active.renderFailure
+	}
+	return map[string]any{
+		"mode":      "package",
+		"plugin":    dynamicCordisSelfSummaryLocked(p),
+		"packageId": packageID,
+		"name":      pkg.name,
+		"purpose":   pkg.purpose,
+		"code":      code,
+		"runtime": map[string]any{
+			"state":  dynamicCordisSelfStateLocked(p),
+			"host":   hostRuntime,
+			"client": clientRuntime,
+		},
+	}, nil
+}
+
+func dynamicCordisPreferredPackageLocked(p *dynamicCordisPlugin) *dynamicCordisPackage {
+	packageID := p.next
+	if packageID == "" {
+		packageID = p.current
+	}
+	if packageID == "" && len(p.order) > 0 {
+		packageID = p.order[len(p.order)-1]
+	}
+	return p.packages[packageID]
+}
+
+func dynamicCordisSelfStateLocked(p *dynamicCordisPlugin) string {
+	switch status := dynamicCordisAttemptString(p.latest, "status"); status {
+	case "awaiting-approval":
+		return "awaiting-approval"
+	case "client-pending", "starting-host":
+		return "client-pending"
+	case "failed", "rejected", "cancelled":
+		return "failed"
+	case "waiting", "running":
+		return status
+	}
+	if p.run != nil {
+		return "running"
+	}
+	if p.current == "" {
+		return "defined"
+	}
+	return "stopped"
+}
+
+func dynamicCordisSelfSummaryLocked(p *dynamicCordisPlugin) map[string]any {
+	pkg := dynamicCordisPreferredPackageLocked(p)
+	name := ""
+	if pkg != nil {
+		name = pkg.name
+	}
+	row := map[string]any{
+		"pluginId":     p.id,
+		"name":         name,
+		"packageCount": len(p.order),
+		"state":        dynamicCordisSelfStateLocked(p),
+	}
+	if p.current != "" {
+		row["currentPackageId"] = p.current
+	}
+	if p.next != "" {
+		row["nextPackageId"] = p.next
+	}
+	if p.run != nil {
+		row["activeRun"] = map[string]any{"pluginRunId": p.run.runID, "packageId": p.run.packageID}
+	}
+	if dynamicCordisAttemptString(p.latest, "status") == "awaiting-approval" {
+		row["pendingApproval"] = map[string]any{
+			"pluginRunId": dynamicCordisAttemptRunID(p.latest),
+			"packageId":   dynamicCordisAttemptString(p.latest, "packageId"),
+			"mode":        dynamicCordisAttemptString(p.latest, "mode"),
+		}
+	}
+	return row
+}
+
+func dynamicCordisMissingServicesLocked(e *Engine, run *dynamicCordisRun) []string {
+	missing := make([]string, 0)
+	for _, name := range run.inject {
+		if _, ok := e.dynamicCordis.services[name]; !ok && !e.dynamicCordisBuiltinService(name) {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+func (e *Engine) dynamicCordisReferenceMessages(sessionID string, messages []ChatMessage, runtime agentRuntime) []ChatMessage {
+	if runtime.toolNames != nil && !runtime.toolNames["cordis_inspect_self"] {
+		return messages
+	}
+	ids := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, message := range messages {
+		if message.Role != "user" || stringValue(message.Source["kind"]) != "user" {
+			continue
+		}
+		text := message.Content
+		for _, indexes := range dynamicPluginMention.FindAllStringIndex(text, -1) {
+			if indexes[0] > 0 {
+				before, _ := utf8.DecodeLastRuneInString(text[:indexes[0]])
+				if !unicode.IsSpace(before) {
+					continue
+				}
+			}
+			if indexes[1] < len(text) {
+				after, _ := utf8.DecodeRuneInString(text[indexes[1]:])
+				if !unicode.IsSpace(after) {
+					continue
+				}
+			}
+			id := text[indexes[0]+1 : indexes[1]]
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return messages
+	}
+	out := append([]ChatMessage(nil), messages...)
+	for _, id := range ids {
+		out = append(out, ChatMessage{
+			Role:    "user",
+			Content: e.renderDynamicCordisReference(sessionID, id),
+			Source:  map[string]any{"kind": "plugin", "plugin": "tool-cordis", "form": "instructions"},
+		})
+	}
+	return out
+}
+
+func (e *Engine) renderDynamicCordisReference(sessionID, pluginID string) string {
+	e.dynamicCordis.RLock()
+	plugin := e.dynamicCordis.plugins[pluginID]
+	if plugin == nil || plugin.sessionID != sessionID {
+		e.dynamicCordis.RUnlock()
+		return strings.Join([]string{
+			"<cordis_dynamic_plugin_context>",
+			fmt.Sprintf("The user explicitly referenced @%s, but this Plugin is unavailable in the current Session.", pluginID),
+			"It may have been removed, belong to another Session, or have been lost when the DSH process restarted.",
+			"Do not claim that it was updated or silently create a replacement Plugin. Tell the user that the reference is currently unavailable.",
+			"</cordis_dynamic_plugin_context>",
+		}, "\n")
+	}
+	pkg := dynamicCordisPreferredPackageLocked(plugin)
+	if pkg == nil {
+		e.dynamicCordis.RUnlock()
+		return "<cordis_dynamic_plugin_context>\nThe referenced Plugin has no Package.\n</cordis_dynamic_plugin_context>"
+	}
+	reference := map[string]any{
+		"pluginId": plugin.id, "packageId": pkg.id, "name": pkg.name, "purpose": pkg.purpose,
+	}
+	if plugin.current != "" {
+		reference["currentPackageId"] = plugin.current
+	}
+	if plugin.next != "" {
+		reference["nextPackageId"] = plugin.next
+	}
+	if plugin.run != nil {
+		reference["activeRun"] = map[string]any{"pluginRunId": plugin.run.runID, "packageId": plugin.run.packageID}
+	}
+	if len(plugin.latest) > 0 {
+		reference["latestRun"] = cloneJSON(plugin.latest)
+	}
+	mode := "run"
+	if plugin.current != "" {
+		mode = "update"
+	}
+	e.dynamicCordis.RUnlock()
+	encoded, _ := json.MarshalIndent(reference, "", "  ")
+	return strings.Join([]string{
+		"<cordis_dynamic_plugin_context>", string(encoded), "",
+		fmt.Sprintf("The user explicitly referenced @%s. Use Package %s as the base for this modification.", pluginID, pkg.id),
+		fmt.Sprintf("Before modifying it, call cordis_inspect_self with pluginId=\"%s\" and packageId=\"%s\" to read the exact metadata and source.", pluginID, pkg.id),
+		fmt.Sprintf("Use cordis_define with plugin.kind=\"existing\" and the original pluginId=\"%s\" to append an immutable Package.", pluginID),
+		fmt.Sprintf("Do not create a new Plugin for this request. After cordis_define succeeds, call cordis_run mode=\"%s\" with the returned packageId.", mode),
+		"</cordis_dynamic_plugin_context>",
+	}, "\n")
 }
 
 func (e *Engine) dynamicCordisInventoryLocked(sessionID string) []map[string]any {
 	rows := make([]map[string]any, 0)
-	for _, p := range e.dynamicCordis.plugins {
+	for _, pluginID := range e.dynamicCordis.pluginOrder {
+		p := e.dynamicCordis.plugins[pluginID]
+		if p == nil {
+			continue
+		}
 		if sessionID != "" && p.sessionID != sessionID {
 			continue
 		}
 		rows = append(rows, e.dynamicCordisPluginViewLocked(p, false))
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i]["pluginId"].(string) < rows[j]["pluginId"].(string) })
 	return rows
 }
 

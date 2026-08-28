@@ -200,23 +200,32 @@ func (c *subagentRPCClient) request(ctx context.Context, method string, params a
 	}
 	select {
 	case <-ctx.Done():
+		select {
+		case response := <-waiter:
+			return decodeSubagentRPCResponse(method, response, target)
+		default:
+		}
 		c.removePending(id)
 		return ctx.Err()
 	case response := <-waiter:
-		if response.err != nil {
-			return response.err
-		}
-		if target == nil {
-			return nil
-		}
-		if len(response.result) == 0 {
-			response.result = json.RawMessage(`null`)
-		}
-		if err := json.Unmarshal(response.result, target); err != nil {
-			return fmt.Errorf("%s returned invalid result: %w", method, err)
-		}
+		return decodeSubagentRPCResponse(method, response, target)
+	}
+}
+
+func decodeSubagentRPCResponse(method string, response subagentRPCResponse, target any) error {
+	if response.err != nil {
+		return response.err
+	}
+	if target == nil {
 		return nil
 	}
+	if len(response.result) == 0 {
+		response.result = json.RawMessage(`null`)
+	}
+	if err := json.Unmarshal(response.result, target); err != nil {
+		return fmt.Errorf("%s returned invalid result: %w", method, err)
+	}
+	return nil
 }
 
 func (c *subagentRPCClient) notify(method string, params any) error {

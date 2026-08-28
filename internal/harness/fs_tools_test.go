@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -125,7 +126,7 @@ func TestGlobToolKeepsCompleteMtimeSortedValue(t *testing.T) {
 	if value["root"] != "." || len(paths) != 107 {
 		t.Fatalf("glob value root=%v paths=%d", value["root"], len(paths))
 	}
-	if paths[0] != ".hidden.txt" || paths[1] != "node_modules/included.txt" || paths[2] != "nested/f104.txt" {
+	if paths[0] != "nested/f000.txt" || paths[1] != "nested/f001.txt" || paths[2] != "nested/f002.txt" || paths[len(paths)-2] != "node_modules/included.txt" || paths[len(paths)-1] != ".hidden.txt" {
 		t.Fatalf("glob mtime order prefix = %#v", paths[:3])
 	}
 	for _, path := range paths {
@@ -176,4 +177,139 @@ func TestGrepToolKeepsCompleteValueAndBoundsPreview(t *testing.T) {
 	if !utf8.ValidString(preview) || len([]byte(preview)) > grepToolMaxLineBytes {
 		t.Fatalf("grep preview bytes=%d valid=%v", len([]byte(preview)), utf8.ValidString(preview))
 	}
+}
+
+func TestSearchRejectsExplicitBlankOptionalArguments(t *testing.T) {
+	e := newIntegrationEngine(t)
+	if _, err := executeFSTool(t, e, "glob", map[string]any{"pattern": "*", "path": ""}); err == nil || !strings.Contains(err.Error(), "path must be a non-empty string") {
+		t.Fatalf("glob blank path error = %v", err)
+	}
+	if _, err := executeFSTool(t, e, "grep", map[string]any{"pattern": "x", "include": ""}); err == nil || !strings.Contains(err.Error(), "include must be a positive non-empty glob") {
+		t.Fatalf("grep blank include error = %v", err)
+	}
+}
+
+func TestGlobSamplingUsesSameGroupedPageForTextAndMeta(t *testing.T) {
+	paths := []string{"a/1", "b/1", "c/1", "a/2", "b/2", "c/2"}
+	caps := searchCaps{sampleOverCap: true, globMaxResults: 4}
+	page := retainGlobPage(paths, caps, ".")
+	want := []string{"a/1", "a/2", "b/1", "c/1"}
+	if strings.Join(page, ",") != strings.Join(want, ",") {
+		t.Fatalf("sample page = %v", page)
+	}
+	text := renderGlobToolResultWithCaps(paths, caps, ".")
+	if !strings.HasPrefix(text, strings.Join(want, "\n")+"\n\n") || !strings.Contains(text, "sampled across 3 of the 3 top-level entries") {
+		t.Fatalf("sample text = %q", text)
+	}
+}
+
+func TestSearchUsesRetainedStderrTailForClassification(t *testing.T) {
+	rg := writeFakeRipgrep(t, "printf '%s' '"+strings.Repeat("x", 100)+"regex parse error' >&2\nexit 2")
+	t.Setenv("DSH_RIPGREP_PATH", rg)
+	_, err := runRipgrep(t.Context(), t.TempDir(), "grep", []string{"--no-config", "--json", "--regexp=("}, searchCaps{
+		timeout: 5 * time.Second, rawOutputMaxBytes: 1024, grace: time.Second, stderrMaxBytes: 32,
+	})
+	if err == nil || !strings.Contains(err.Error(), "SEARCH_INVALID_PATTERN") || !strings.Contains(err.Error(), "[stderr truncated]") {
+		t.Fatalf("stderr-tail classification error = %v", err)
+	}
+}
+
+func TestSearchSpillKeepsCompleteCanonicalResult(t *testing.T) {
+	e := newIntegrationEngine(t)
+	e.cfg.Spill.Root = filepath.Join(t.TempDir(), "spill")
+	e.cfg.Spill.MaxInlineBytes = 1
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "search-spill", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0, globToolMaxResults+1)
+	for index := 0; index < globToolMaxResults+1; index++ {
+		paths = append(paths, fmt.Sprintf("dir/file-%03d.txt", index))
+	}
+	result := e.applySearchSpillPolicy(s, ToolCall{Name: "glob", SessionID: s.Header.ID}, ToolResult{
+		Value:   map[string]any{"root": ".", "paths": paths},
+		Content: []ContentBlock{{Type: "text", Text: "capped"}},
+	})
+	text := contentValueText(result.Content)
+	if !strings.Contains(text, "Full sorted result stored at:") || strings.Contains(text, "file-100.txt") {
+		t.Fatalf("glob spill text = %q", text)
+	}
+	marker := "Full sorted result stored at: "
+	start := strings.Index(text, marker) + len(marker)
+	end := strings.Index(text[start:], ". Use read")
+	if start < len(marker) || end < 0 {
+		t.Fatalf("glob spill locator = %q", text)
+	}
+	stored, err := os.ReadFile(text[start : start+end])
+	if err != nil || !strings.Contains(string(stored), "file-100.txt") || !strings.Contains(string(stored), "file-000.txt") {
+		t.Fatalf("glob spill file = %d bytes, %v", len(stored), err)
+	}
+
+	matches := make([]map[string]any, 0, grepToolMaxMatches+1)
+	for index := 0; index < grepToolMaxMatches+1; index++ {
+		matches = append(matches, map[string]any{"path": "matches.txt", "lineNumber": index + 1, "line": fmt.Sprintf("needle-%03d", index)})
+	}
+	result = e.applySearchSpillPolicy(s, ToolCall{Name: "grep", SessionID: s.Header.ID}, ToolResult{
+		Value:   map[string]any{"matches": matches},
+		Content: []ContentBlock{{Type: "text", Text: "capped"}},
+	})
+	text = contentValueText(result.Content)
+	if !strings.Contains(text, "Full grep result stored at:") || strings.Contains(text, "needle-250") {
+		t.Fatalf("grep spill text = %q", text[len(text)-min(len(text), 240):])
+	}
+}
+
+func writeFakeRipgrep(t *testing.T, body string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ripgrep fixture uses a POSIX executable")
+	}
+	path := filepath.Join(t.TempDir(), "rg")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestSearchInvokesRipgrepWithoutAmbientConfig(t *testing.T) {
+	argsPath := filepath.Join(t.TempDir(), "args")
+	rg := writeFakeRipgrep(t, "printf '%s\\n' \"$@\" > "+shellQuoteForTest(argsPath)+"\nprintf '%s\\n' '{\"type\":\"summary\",\"data\":{}}'")
+	t.Setenv("DSH_RIPGREP_PATH", rg)
+	e := newIntegrationEngine(t)
+	if _, err := executeFSTool(t, e, "glob", map[string]any{"pattern": "*.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(args), "--no-config\n") {
+		t.Fatalf("ripgrep argv did not disable ambient config: %q", string(args))
+	}
+}
+
+func TestGrepRejectsMalformedRipgrepMatchRecord(t *testing.T) {
+	rg := writeFakeRipgrep(t, "printf '%s\\n' '{\"type\":\"match\",\"data\":{}}'")
+	t.Setenv("DSH_RIPGREP_PATH", rg)
+	e := newIntegrationEngine(t)
+	if _, err := executeFSTool(t, e, "grep", map[string]any{"pattern": "x"}); err == nil || !strings.Contains(err.Error(), "SEARCH_FAILED") {
+		t.Fatalf("malformed grep record error = %v", err)
+	}
+}
+
+func TestSearchClassifiesInvalidPatternFromRipgrep(t *testing.T) {
+	rg := writeFakeRipgrep(t, "printf '%s\\n' 'regex parse error' >&2\nexit 2")
+	t.Setenv("DSH_RIPGREP_PATH", rg)
+	e := newIntegrationEngine(t)
+	if _, err := executeFSTool(t, e, "glob", map[string]any{"pattern": "["}); err == nil || !strings.Contains(err.Error(), "SEARCH_INVALID_PATTERN") {
+		t.Fatalf("invalid pattern error = %v", err)
+	}
+}
+
+func shellQuoteForTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

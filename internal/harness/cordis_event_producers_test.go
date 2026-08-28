@@ -12,7 +12,7 @@ import (
 const cordisEventRecorder = `
 const names = [
   'settings/updated', 'domain/changed', 'goal/changed',
-  'subagent/start', 'subagent/end', 'subagent/provider-removed',
+  'subagent/start', 'subagent/end', 'subagent/provider-added', 'subagent/provider-removed',
   'session/disposed',
   'workflow/start', 'workflow/phase', 'workflow/log',
   'workflow/agent-start', 'workflow/agent-end', 'workflow/end',
@@ -311,6 +311,16 @@ func TestDynamicCordisSubagentLifecycleProducersAreScopedAndOrdered(t *testing.T
 	provider := &cordisEventSubagentProvider{}
 	if err := e.RegisterSubagentProvider(provider); err != nil {
 		t.Fatal(err)
+	}
+	for _, target := range []struct{ plugin, run string }{{firstPlugin, firstRun}, {secondPlugin, secondRun}} {
+		added := cordisRecordedEvents(t, e, target.plugin, target.run, "subagent/provider-added")
+		if len(added) != 1 {
+			t.Fatalf("provider-added events = %#v", added)
+		}
+		requireCordisArgs(t, cordisEventArgs(t, added, 0), SubagentProviderInfo{
+			Name: provider.Name(), Capabilities: provider.Capabilities(),
+			InheritsParentContext: provider.InheritsParentContext(),
+		})
 	}
 	run, err := e.StartSubagent(t.Context(), provider.Name(), SubagentStartRequest{ParentSessionID: first})
 	if err != nil {

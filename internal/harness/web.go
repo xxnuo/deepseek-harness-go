@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +75,16 @@ type WebToolConfig struct {
 	FetchMaxOutputChars int
 }
 
+type DeepSeekWebSearchConfig struct {
+	APIKey     *string
+	APIKeyEnv  *string
+	BaseURL    *string
+	Model      *string
+	APIVersion *string
+	MaxTokens  *int
+	MaxUses    *int
+}
+
 type HTTPWebFetchConfig struct {
 	MaxURLLength     int
 	MaxResponseBytes int64
@@ -87,13 +96,21 @@ type HTTPWebFetchConfig struct {
 
 func defaultWebToolConfig() *WebToolConfig {
 	return &WebToolConfig{
-		SearchEnabled: true, SearchMaxResults: 8, SearchMaxQueries: 4,
+		SearchEnabled: true, FetchEnabled: true, SearchMaxResults: 8, SearchMaxQueries: 4,
 		SearchTimeout: 30 * time.Second, FetchTimeout: 30 * time.Second,
 		FetchMaxOutputChars: 200_000,
 	}
 }
 
 func DefaultWebToolConfig() WebToolConfig { return *defaultWebToolConfig() }
+
+func cloneWebToolConfig(config *WebToolConfig) *WebToolConfig {
+	if config == nil {
+		return nil
+	}
+	clone := *config
+	return &clone
+}
 
 func normalizeWebToolConfig(config *WebToolConfig) *WebToolConfig {
 	defaults := defaultWebToolConfig()
@@ -179,43 +196,73 @@ func webSessionID(ctx context.Context) string {
 	return ""
 }
 
-func (e *Engine) RegisterWebSearchProvider(provider WebSearchProvider) error {
+func (e *Engine) RegisterWebSearchProvider(provider WebSearchProvider) (func(), error) {
 	if provider == nil {
-		return errors.New("web provider is nil")
+		return nil, errors.New("web provider is nil")
+	}
+	id := strings.TrimSpace(provider.ID())
+	if id == "" {
+		return nil, errors.New("web provider id is required")
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	id := strings.TrimSpace(provider.ID())
-	if id == "" {
-		return errors.New("web provider id is required")
-	}
 	if _, exists := e.webSearchProviders[id]; exists {
-		return &WebError{Code: "WEB_DUPLICATE_PROVIDER", Message: fmt.Sprintf("a web provider with id %q is already registered", id)}
+		return nil, &WebError{Code: "WEB_DUPLICATE_PROVIDER", Message: fmt.Sprintf("a web provider with id %q is already registered", id)}
 	}
+	token := new(byte)
 	e.webSearchProviders[id] = provider
-	return nil
+	e.webSearchProviderTokens[id] = token
+	e.webSearchProviderOrder = append(e.webSearchProviderOrder, id)
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.webSearchProviderTokens[id] != token {
+			return
+		}
+		delete(e.webSearchProviders, id)
+		delete(e.webSearchProviderTokens, id)
+		e.webSearchProviderOrder = removeWebProviderID(e.webSearchProviderOrder, id)
+	}, nil
 }
-func (e *Engine) RegisterWebFetchProvider(provider WebFetchProvider) error {
+func (e *Engine) RegisterWebFetchProvider(provider WebFetchProvider) (func(), error) {
 	if provider == nil {
-		return errors.New("web provider is nil")
+		return nil, errors.New("web provider is nil")
+	}
+	id := strings.TrimSpace(provider.ID())
+	if id == "" {
+		return nil, errors.New("web provider id is required")
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	id := strings.TrimSpace(provider.ID())
-	if id == "" {
-		return errors.New("web provider id is required")
-	}
 	if _, exists := e.webFetchProviders[id]; exists {
-		return &WebError{Code: "WEB_DUPLICATE_PROVIDER", Message: fmt.Sprintf("a web provider with id %q is already registered", id)}
+		return nil, &WebError{Code: "WEB_DUPLICATE_PROVIDER", Message: fmt.Sprintf("a web provider with id %q is already registered", id)}
 	}
+	token := new(byte)
 	e.webFetchProviders[id] = provider
-	return nil
+	e.webFetchProviderTokens[id] = token
+	e.webFetchProviderOrder = append(e.webFetchProviderOrder, id)
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.webFetchProviderTokens[id] != token {
+			return
+		}
+		delete(e.webFetchProviders, id)
+		delete(e.webFetchProviderTokens, id)
+		e.webFetchProviderOrder = removeWebProviderID(e.webFetchProviderOrder, id)
+	}, nil
+}
+
+func removeWebProviderID(order []string, id string) []string {
+	for index, candidate := range order {
+		if candidate == id {
+			return append(order[:index], order[index+1:]...)
+		}
+	}
+	return order
 }
 
 func (e *Engine) webSearch(ctx context.Context, req WebSearchRequest) (WebSearchResult, error) {
-	if strings.TrimSpace(req.Query) == "" {
-		return WebSearchResult{}, errors.New("query must be a non-empty string")
-	}
 	provider, err := e.selectWebSearchProvider()
 	if err != nil {
 		return WebSearchResult{}, err
@@ -232,9 +279,6 @@ func (e *Engine) webSearch(ctx context.Context, req WebSearchRequest) (WebSearch
 }
 
 func (e *Engine) webFetch(ctx context.Context, req WebFetchRequest) (WebFetchResult, error) {
-	if strings.TrimSpace(req.URL) == "" {
-		return WebFetchResult{}, errors.New("url must be a non-empty string")
-	}
 	provider, err := e.selectWebFetchProvider()
 	if err != nil {
 		return WebFetchResult{}, err
@@ -245,20 +289,22 @@ func (e *Engine) webFetch(ctx context.Context, req WebFetchRequest) (WebFetchRes
 func (e *Engine) selectWebSearchProvider() (WebSearchProvider, error) {
 	e.mu.RLock()
 	configured := strings.TrimSpace(e.cfg.WebSearchProvider)
-	providers := make(map[string]WebSearchProvider, len(e.webSearchProviders))
-	for id, provider := range e.webSearchProviders {
-		providers[id] = provider
+	configuredProvider, configuredExists := e.webSearchProviders[configured]
+	providers := make([]WebSearchProvider, 0, len(e.webSearchProviderOrder))
+	for _, id := range e.webSearchProviderOrder {
+		if provider, ok := e.webSearchProviders[id]; ok {
+			providers = append(providers, provider)
+		}
 	}
 	e.mu.RUnlock()
 	if configured != "" {
-		provider, ok := providers[configured]
-		if !ok {
+		if !configuredExists {
 			return nil, &WebError{Code: "WEB_PROVIDER_CONFIGURED_MISSING", Message: fmt.Sprintf("configured web provider %q is not registered", configured)}
 		}
-		if !provider.Available() {
+		if !configuredProvider.Available() {
 			return nil, &WebError{Code: "WEB_PROVIDER_CONFIGURED_UNAVAILABLE", Message: fmt.Sprintf("configured web provider %q is registered but unavailable", configured)}
 		}
-		return provider, nil
+		return configuredProvider, nil
 	}
 	return chooseWebProvider(providers)
 }
@@ -266,20 +312,22 @@ func (e *Engine) selectWebSearchProvider() (WebSearchProvider, error) {
 func (e *Engine) selectWebFetchProvider() (WebFetchProvider, error) {
 	e.mu.RLock()
 	configured := strings.TrimSpace(e.cfg.WebFetchProvider)
-	providers := make(map[string]WebFetchProvider, len(e.webFetchProviders))
-	for id, provider := range e.webFetchProviders {
-		providers[id] = provider
+	configuredProvider, configuredExists := e.webFetchProviders[configured]
+	providers := make([]WebFetchProvider, 0, len(e.webFetchProviderOrder))
+	for _, id := range e.webFetchProviderOrder {
+		if provider, ok := e.webFetchProviders[id]; ok {
+			providers = append(providers, provider)
+		}
 	}
 	e.mu.RUnlock()
 	if configured != "" {
-		provider, ok := providers[configured]
-		if !ok {
+		if !configuredExists {
 			return nil, &WebError{Code: "WEB_PROVIDER_CONFIGURED_MISSING", Message: fmt.Sprintf("configured web provider %q is not registered", configured)}
 		}
-		if !provider.Available() {
+		if !configuredProvider.Available() {
 			return nil, &WebError{Code: "WEB_PROVIDER_CONFIGURED_UNAVAILABLE", Message: fmt.Sprintf("configured web provider %q is registered but unavailable", configured)}
 		}
-		return provider, nil
+		return configuredProvider, nil
 	}
 	return chooseWebProvider(providers)
 }
@@ -287,67 +335,84 @@ func (e *Engine) selectWebFetchProvider() (WebFetchProvider, error) {
 func chooseWebProvider[P interface {
 	ID() string
 	Available() bool
-}](providers map[string]P) (P, error) {
+}](providers []P) (P, error) {
 	var zero P
-	ids := make([]string, 0, len(providers))
-	for id, provider := range providers {
+	usable := make([]P, 0, len(providers))
+	for _, provider := range providers {
 		if provider.Available() {
-			ids = append(ids, id)
+			usable = append(usable, provider)
 		}
 	}
-	sort.Strings(ids)
-	if len(ids) == 0 {
+	if len(usable) == 0 {
 		return zero, &WebError{Code: "WEB_PROVIDER_UNAVAILABLE", Message: "no usable web provider is registered"}
 	}
-	if len(ids) > 1 {
+	if len(usable) > 1 {
+		ids := make([]string, 0, len(usable))
+		for _, provider := range usable {
+			ids = append(ids, provider.ID())
+		}
 		return zero, &WebError{Code: "WEB_PROVIDER_AMBIGUOUS", Message: fmt.Sprintf("multiple usable web providers are registered (%s); configure one explicitly", strings.Join(ids, ", "))}
 	}
-	return providers[ids[0]], nil
+	return usable[0], nil
 }
 
 func registerWebTools(e *Engine) error {
-	config := e.cfg.WebTools
+	if !e.hostPluginActive("@deepseek-ai/dsh-tool-web") {
+		return nil
+	}
+	config := *e.cfg.WebTools
 	if config.SearchEnabled {
-		description := fmt.Sprintf("Search the web for current information. Provide 1-%d queries in the required queries array.", config.SearchMaxQueries)
-		if err := e.RegisterTool(Tool{Schema: ToolSchema{Name: "web_search", Description: description, Parameters: objectSchema(map[string]any{
-			"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("Required search queries; accepts 1-%d items and merges their results.", config.SearchMaxQueries)},
-		}, "queries"), Output: objectSchema(map[string]any{
-			"content": map[string]any{"type": "string"}, "sources": map[string]any{"type": "array", "items": objectSchema(map[string]any{"url": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"}, "snippet": map[string]any{"type": "string"}, "publishedAt": map[string]any{"type": "string"}}, "url")}, "truncated": map[string]any{"type": "boolean"},
-		}, "sources", "truncated")}, Timeout: config.SearchTimeout, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
-			var in struct {
-				Queries []string `json:"queries"`
-			}
-			if err := decodeToolArguments(call, &in); err != nil {
-				return ToolResult{}, err
-			}
-			queries, err := parseWebSearchQueries(in.Queries, config.SearchMaxQueries)
-			if err != nil {
-				return ToolResult{}, err
-			}
-			result, err := e.runWebSearchQueries(ctx, call.SessionID, queries, config.SearchMaxResults)
-			if err != nil {
-				return ToolResult{}, err
-			}
-			meta := map[string]any{"sources": result.Sources, "truncated": result.Truncated}
-			if result.Content != "" {
-				meta["answer"] = result.Content
-			}
-			return ToolResult{Content: []ContentBlock{{Type: "text", Text: formatWebSearch(result)}}, Value: result, Meta: meta}, nil
-		}}); err != nil {
+		if err := e.RegisterTool(webSearchTool(e, config)); err != nil {
 			return err
 		}
 	}
 	if !config.FetchEnabled {
 		return nil
 	}
-	return e.RegisterTool(Tool{Schema: ToolSchema{Name: "web_fetch", Description: "Fetch a public web URL.", Parameters: objectSchema(map[string]any{"url": map[string]any{"type": "string"}}, "url"), Output: objectSchema(map[string]any{
+	return e.RegisterTool(webFetchTool(e, config))
+}
+
+func webSearchTool(e *Engine, config WebToolConfig) Tool {
+	description := fmt.Sprintf("Search the web for current information. Provide 1–%d queries in the required queries array. Returns an optional summary answer and a list of source URLs.", config.SearchMaxQueries)
+	return Tool{Schema: ToolSchema{Name: "web_search", Description: description, Parameters: objectSchema(map[string]any{
+		"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("Required search queries; accepts 1–%d items and merges their results.", config.SearchMaxQueries)},
+	}, "queries"), Output: objectSchema(map[string]any{
+		"content": map[string]any{"type": "string"}, "sources": map[string]any{"type": "array", "items": objectSchema(map[string]any{"url": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"}, "snippet": map[string]any{"type": "string"}, "publishedAt": map[string]any{"type": "string"}}, "url")}, "truncated": map[string]any{"type": "boolean"},
+	}, "sources", "truncated")}, Timeout: config.SearchTimeout, IsConcurrencySafe: alwaysConcurrencySafe, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		var in struct {
+			Queries []string `json:"queries"`
+		}
+		if err := decodeToolArguments(call, &in); err != nil {
+			return ToolResult{}, err
+		}
+		queries, err := parseWebSearchQueries(in.Queries, config.SearchMaxQueries)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		result, err := e.runWebSearchQueries(ctx, call.SessionID, queries, config.SearchMaxResults)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		meta := map[string]any{"sources": result.Sources, "truncated": result.Truncated}
+		if result.Content != "" {
+			meta["answer"] = result.Content
+		}
+		return ToolResult{Content: []ContentBlock{{Type: "text", Text: formatWebSearch(result)}}, Value: result, Meta: meta}, nil
+	}}
+}
+
+func webFetchTool(e *Engine, config WebToolConfig) Tool {
+	return Tool{Schema: ToolSchema{Name: "web_fetch", Description: "Fetch the content of a specific HTTP(S) URL and return it decoded to text.", Parameters: objectSchema(map[string]any{"url": map[string]any{"type": "string", "description": "The HTTP(S) URL to fetch."}}, "url"), Output: objectSchema(map[string]any{
 		"url": map[string]any{"type": "string"}, "statusCode": map[string]any{"type": "integer"}, "body": objectSchema(map[string]any{"kind": map[string]any{"type": "string", "enum": []string{"html", "text"}}, "content": map[string]any{"type": "string"}}, "kind", "content"), "truncated": map[string]any{"type": "boolean"},
-	}, "url", "statusCode", "body", "truncated")}, Timeout: config.FetchTimeout, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+	}, "url", "statusCode", "body", "truncated")}, Timeout: config.FetchTimeout, IsConcurrencySafe: alwaysConcurrencySafe, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		var in struct {
 			URL string `json:"url"`
 		}
 		if err := decodeToolArguments(call, &in); err != nil {
 			return ToolResult{}, err
+		}
+		if strings.TrimSpace(in.URL) == "" {
+			return ToolResult{}, errors.New("url must be a non-empty string")
 		}
 		result, err := e.webFetch(ctx, WebFetchRequest{URL: in.URL})
 		if err != nil {
@@ -355,7 +420,24 @@ func registerWebTools(e *Engine) error {
 		}
 		text, truncated := renderWebFetch(result, config.FetchMaxOutputChars)
 		return ToolResult{Content: []ContentBlock{{Type: "text", Text: text}}, Value: result, Meta: map[string]any{"url": result.URL, "statusCode": result.StatusCode, "truncated": truncated}}, nil
-	}})
+	}}
+}
+
+func sessionWebTool(e *Engine, name string, config *WebToolConfig) (Tool, bool) {
+	if config == nil {
+		return Tool{}, false
+	}
+	switch name {
+	case "web_search":
+		if config.SearchEnabled {
+			return webSearchTool(e, *config), true
+		}
+	case "web_fetch":
+		if config.FetchEnabled {
+			return webFetchTool(e, *config), true
+		}
+	}
+	return Tool{}, false
 }
 
 func parseWebSearchQueries(queries []string, maxQueries int) ([]string, error) {
@@ -635,9 +717,8 @@ func findHTMLRawTextEnd(lower, name string, offset int) int {
 func renderWebFetch(result WebFetchResult, maxChars int) (string, bool) {
 	content := result.Body.Content
 	sourceTruncated := false
-	runes := []rune(content)
-	if len(runes) > maxChars {
-		content = string(runes[:maxChars])
+	if utf16Length(content) > maxChars {
+		content = truncateUTF16(content, maxChars)
 		sourceTruncated = true
 	}
 	if result.Body.Kind == "html" && !exceedsHTMLConversionDepth(content) {
@@ -648,21 +729,19 @@ func renderWebFetch(result WebFetchResult, maxChars int) (string, bool) {
 	}
 	prefix := fmt.Sprintf("Fetched %s (HTTP %d)\n\n%s", result.URL, result.StatusCode, content)
 	footer := "\n\n(Content truncated. Fetch a more specific URL or section for the full text.)"
-	truncated := result.Truncated || sourceTruncated || len([]rune(prefix)) > maxChars
+	truncated := result.Truncated || sourceTruncated || utf16Length(prefix) > maxChars
 	output := prefix
 	if truncated {
 		output += footer
 	}
-	outputRunes := []rune(output)
-	if len(outputRunes) <= maxChars {
+	if utf16Length(output) <= maxChars {
 		return output, truncated
 	}
-	footerRunes := []rune(footer)
-	if maxChars < len(footerRunes) {
-		return string(outputRunes[:maxChars]), true
+	footerChars := utf16Length(footer)
+	if maxChars < footerChars {
+		return truncateUTF16(output, maxChars), true
 	}
-	prefixRunes := []rune(prefix)
-	return string(prefixRunes[:maxChars-len(footerRunes)]) + footer, true
+	return truncateUTF16(prefix, maxChars-footerChars) + footer, true
 }
 
 type deepSeekWebSearchProvider struct{ engine *Engine }
@@ -820,14 +899,40 @@ const (
 	deepSeekSearchDefaultMaxUses    = 5
 )
 
-func deepSeekWebSearchBaseSettings() map[string]any {
-	return map[string]any{
+func deepSeekWebSearchBaseSettings(configs ...DeepSeekWebSearchConfig) map[string]any {
+	settings := map[string]any{
 		"apiKeyEnv":  "DEEPSEEK_API_KEY",
 		"model":      deepSeekSearchDefaultModel,
 		"apiVersion": deepSeekSearchDefaultAPIVersion,
 		"maxTokens":  deepSeekSearchDefaultMaxTokens,
 		"maxUses":    deepSeekSearchDefaultMaxUses,
 	}
+	if len(configs) == 0 {
+		return settings
+	}
+	config := configs[0]
+	if config.APIKey != nil {
+		settings["apiKey"] = *config.APIKey
+	}
+	if config.APIKeyEnv != nil {
+		settings["apiKeyEnv"] = *config.APIKeyEnv
+	}
+	if config.BaseURL != nil {
+		settings["baseURL"] = *config.BaseURL
+	}
+	if config.Model != nil {
+		settings["model"] = *config.Model
+	}
+	if config.APIVersion != nil {
+		settings["apiVersion"] = *config.APIVersion
+	}
+	if config.MaxTokens != nil {
+		settings["maxTokens"] = *config.MaxTokens
+	}
+	if config.MaxUses != nil {
+		settings["maxUses"] = *config.MaxUses
+	}
+	return settings
 }
 
 func deepSeekWebSearchSettingsSchema() map[string]any {
@@ -859,7 +964,7 @@ type deepSeekWebSearchOptions struct {
 
 func (p *deepSeekWebSearchProvider) snapshot() deepSeekWebSearchOptions {
 	p.engine.mu.RLock()
-	settings := mergeSettings(deepSeekWebSearchBaseSettings(), p.engine.settings["web-search-deepseek"])
+	settings := mergeSettings(deepSeekWebSearchBaseSettings(p.engine.cfg.DeepSeekWebSearch), p.engine.settings["web-search-deepseek"])
 	ref := stringSetting(settings["apiKeyEnv"])
 	if ref == "" {
 		ref = "DEEPSEEK_API_KEY"
@@ -1092,9 +1197,8 @@ func (p *HTTPWebFetchProvider) readWebFetchResponse(response *http.Response, req
 	if maxChars <= 0 {
 		maxChars = 100_000
 	}
-	runes := []rune(content)
-	if len(runes) > maxChars {
-		content = string(runes[:maxChars])
+	if utf16Length(content) > maxChars {
+		content = truncateUTF16(content, maxChars)
 		truncated = true
 	}
 	return WebFetchResult{URL: requestURL.String(), StatusCode: response.StatusCode, Body: WebFetchBody{Kind: kind, Content: content}, Truncated: truncated}, nil

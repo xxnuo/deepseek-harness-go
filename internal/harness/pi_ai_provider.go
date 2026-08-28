@@ -137,6 +137,17 @@ func (p *managedPiAIProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	return piAIModelInfos(p.profile.models), nil
 }
 
+func (p *managedPiAIProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, err
+	}
+	resolved, ok := p.profile.modelByID[model]
+	if !ok {
+		return ModelInfo{}, fmt.Errorf("llm-pi-ai: provider route %q has no model %q", p.profile.route, model)
+	}
+	return resolved.info(), nil
+}
+
 func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta func(Delta) error) (Completion, error) {
 	if req.Model == "" {
 		req.Model = p.profile.configuredModel

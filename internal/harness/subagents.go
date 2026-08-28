@@ -30,61 +30,28 @@ func (e *Engine) childFor(parentID, childID string) (*Session, *RPCError) {
 	return child, nil
 }
 
-func (e *Engine) subagentList(p map[string]any) (any, *RPCError) {
+func (e *Engine) subagentList(ctx context.Context, p map[string]any) (any, *RPCError) {
 	parentID, _ := p["parentSessionId"].(string)
-	if _, err := e.getSession(parentID); err != nil {
-		return nil, rpcError("subagent-parent-unavailable", "parent session is unavailable", map[string]any{"parentSessionId": parentID})
+	entries, parentAvailable, err := e.listSubagentEntries(ctx, parentID, false)
+	if err != nil {
+		return nil, subagentListingError(err)
 	}
-	// Snapshot the registry before taking any Session locks. Other state paths
-	// (notably persistence) use Engine -> Session ordering; keeping the Engine
-	// lock out of the per-session reads prevents lock inversion as those paths
-	// run concurrently.
-	e.mu.RLock()
-	sessions := make([]*Session, 0, len(e.sessions))
-	for _, candidate := range e.sessions {
-		sessions = append(sessions, candidate)
+	values := make([]map[string]any, 0, len(entries))
+	for _, row := range entries {
+		if row.Kind == "diagnostic" {
+			values = append(values, map[string]any{"kind": "diagnostic", "id": row.ID, "reason": row.Reason})
+			continue
+		}
+		entry := map[string]any{
+			"kind": "child", "id": row.ID, "activity": row.Activity,
+			"mode": row.Mode, "hasChildren": row.HasChildren,
+		}
+		if row.Mode == "continuable" || row.Label != "" {
+			entry["label"] = row.Label
+		}
+		values = append(values, entry)
 	}
-	e.mu.RUnlock()
-	children := make([]*Session, 0)
-	for _, candidate := range sessions {
-		candidate.mu.Lock()
-		match := candidate.Header.ParentSession == parentID && candidate.Header.Origin == "subagent"
-		candidate.mu.Unlock()
-		if match {
-			children = append(children, candidate)
-		}
-	}
-	entries := make([]map[string]any, 0, len(children))
-	for _, child := range children {
-		child.mu.Lock()
-		id, running, mode, label := child.Header.ID, child.Running, child.Header.Mode, child.Title
-		if mode == "" {
-			mode = "continuable"
-		}
-		child.mu.Unlock()
-		hasChildren := false
-		for _, candidate := range sessions {
-			candidate.mu.Lock()
-			if candidate.Header.ParentSession == id && candidate.Header.Origin == "subagent" {
-				hasChildren = true
-			}
-			candidate.mu.Unlock()
-			if hasChildren {
-				break
-			}
-		}
-		entry := map[string]any{"kind": "child", "id": id, "activity": "inactive", "mode": mode, "hasChildren": hasChildren}
-		if running {
-			entry["activity"] = "running"
-		}
-		if mode == "continuable" {
-			entry["label"] = label
-		} else if label != "" {
-			entry["label"] = label
-		}
-		entries = append(entries, entry)
-	}
-	return map[string]any{"entries": entries, "parentAvailable": true}, nil
+	return map[string]any{"entries": values, "parentAvailable": parentAvailable}, nil
 }
 
 // CreateSubagent creates a durable continuable child owned by parentID.
@@ -135,7 +102,14 @@ func (e *Engine) DrainSubagentChildren(ctx context.Context, parentID string, chi
 		selected = append(selected, child)
 	}
 
+	type activationDrain struct {
+		activation *modelSubagentActivation
+		owner      bool
+		done       <-chan struct{}
+	}
 	branches := make([]*Session, 0, len(selected))
+	activations := make([]activationDrain, 0, len(selected))
+	var failures []error
 	defer func() {
 		for _, child := range branches {
 			child.mu.Lock()
@@ -143,11 +117,26 @@ func (e *Engine) DrainSubagentChildren(ctx context.Context, parentID string, chi
 			child.mu.Unlock()
 		}
 	}()
-	for _, child := range selected {
+	schedule := func(child *Session) {
+		child.mu.Lock()
+		childID := child.Header.ID
+		child.mu.Unlock()
+		e.modelSubagentMu.Lock()
+		activation := e.modelSubagentActivations[childID]
+		e.modelSubagentMu.Unlock()
+		if activation != nil && activation.session == child {
+			owner, done := e.beginModelSubagentDisposal(activation)
+			activations = append(activations, activationDrain{activation: activation, owner: owner, done: done})
+			return
+		}
 		if err := e.beginSubagentDrain(child); err != nil {
-			return err
+			failures = append(failures, err)
+			return
 		}
 		branches = append(branches, child)
+	}
+	for _, child := range selected {
+		schedule(child)
 	}
 	for index := 0; index < len(branches); index++ {
 		parent := branches[index]
@@ -162,27 +151,50 @@ func (e *Engine) DrainSubagentChildren(ctx context.Context, parentID string, chi
 				continue
 			}
 			seen[childID] = true
-			if err := e.beginSubagentDrain(child); err != nil {
-				return err
-			}
-			branches = append(branches, child)
+			schedule(child)
 		}
+	}
+	activationResults := make(chan error, len(activations))
+	for _, item := range activations {
+		item := item
+		go func() {
+			if item.owner {
+				activationResults <- e.finishModelSubagentActivation(item.activation)
+				return
+			}
+			<-item.done
+			e.modelSubagentMu.Lock()
+			err := item.activation.finishErr
+			e.modelSubagentMu.Unlock()
+			activationResults <- err
+		}()
 	}
 	for _, child := range branches {
 		child.mu.Lock()
 		id := child.Header.ID
 		child.mu.Unlock()
 		if err := e.WaitForIdle(ctx, id); err != nil {
-			return err
+			failures = append(failures, err)
+			break
 		}
 	}
-	var failures []error
 	for index := len(branches) - 1; index >= 0; index-- {
 		branches[index].mu.Lock()
 		id := branches[index].Header.ID
 		branches[index].mu.Unlock()
 		if err := detachSDKSession(e, id); err != nil {
 			failures = append(failures, err)
+		}
+	}
+	for range activations {
+		select {
+		case err := <-activationResults:
+			if err != nil {
+				failures = append(failures, err)
+			}
+		case <-ctx.Done():
+			failures = append(failures, ctx.Err())
+			return errors.Join(failures...)
 		}
 	}
 	return errors.Join(failures...)
@@ -226,7 +238,7 @@ func (e *Engine) beginSubagentDrain(session *Session) error {
 	var events []Event
 	if len(session.pending) > 0 {
 		event, err := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{},
+			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{}, "outcome": "canceled",
 		}, nil, nil, false)
 		if err != nil {
 			session.draining = false
@@ -237,7 +249,7 @@ func (e *Engine) beginSubagentDrain(session *Session) error {
 	}
 	if len(session.steering) > 0 {
 		event, err := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{},
+			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{}, "outcome": "canceled",
 		}, nil, nil, false)
 		if err != nil {
 			session.draining = false
@@ -248,7 +260,9 @@ func (e *Engine) beginSubagentDrain(session *Session) error {
 	}
 	pending := append(append([]*queuedPrompt(nil), session.pending...), session.steering...)
 	session.pending, session.steering = nil, nil
-	id, cancel, maintenanceCancel := session.Header.ID, session.Cancel, session.maintenanceCancel
+	id, activity, cancel, maintenanceCancel := session.Header.ID, session.activity, session.Cancel, session.maintenanceCancel
+	session.activity = nil
+	session.Cancel = nil
 	session.mu.Unlock()
 	for _, event := range events {
 		e.publishEvent(id, event)
@@ -256,7 +270,9 @@ func (e *Engine) beginSubagentDrain(session *Session) error {
 	if len(events) > 0 {
 		e.emitQueue(session)
 	}
-	if cancel != nil {
+	if activity != nil {
+		activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
+	} else if cancel != nil {
 		cancel()
 	}
 	if maintenanceCancel != nil {
@@ -294,6 +310,13 @@ func (e *Engine) ReportFromSubagent(ctx context.Context, childID string, content
 	child.mu.Unlock()
 	if !attached || draining || header.Origin != "subagent" || header.Mode != "continuable" || header.ParentSession == "" {
 		return "", errors.New("subagent-unauthorized: reporting requires a resident continuable child")
+	}
+	e.modelSubagentMu.Lock()
+	activation := e.modelSubagentActivations[childID]
+	authorized := activation != nil && activation.session == child && !activation.disposing
+	e.modelSubagentMu.Unlock()
+	if !authorized {
+		return "", errors.New("subagent-unauthorized: reporting requires the exact resident continuable activation")
 	}
 	parent, err := e.getSession(header.ParentSession)
 	if err != nil {
@@ -383,23 +406,37 @@ func (e *Engine) subagentPrompt(ctx context.Context, p map[string]any, rpcIDs ..
 		}
 		clientTimeZone = canonical
 	}
-	job, _, enqueueErr := e.enqueuePrompt(ctx, childID, PromptRequest{
-		SessionID: childID, Mode: "queue", Content: content, ClientTimeZone: clientTimeZone, RPCID: firstRPCID(rpcIDs),
-		Source: map[string]any{"kind": "coordinator", "form": "relay", "senderSessionId": parentID},
-	}, false)
+	prepared, prepareErr := e.durablePromptContentContext(ctx, content)
+	if prepareErr != nil {
+		return nil, errorToRPC(prepareErr)
+	}
+	source := map[string]any{"kind": "coordinator", "form": "relay", "senderSessionId": parentID}
+	if clientTimeZone != "" {
+		source["clientTimeZone"] = clientTimeZone
+	}
+	if rpcID := firstRPCID(rpcIDs); rpcID != "" {
+		source["rpcId"] = rpcID
+	}
+	messageID, enqueueErr := e.promptContinuableModelSubagent(ctx, parentID, childID, prepared, source)
 	if enqueueErr != nil {
 		return nil, errorToRPC(enqueueErr)
 	}
-	return map[string]any{"messageId": job.id}, nil
+	return map[string]any{"messageId": messageID}, nil
 }
 
 func (e *Engine) subagentInterrupt(p map[string]any) (any, *RPCError) {
 	parentID, _ := p["parentSessionId"].(string)
 	childID, _ := p["childSessionId"].(string)
-	if _, err := e.childFor(parentID, childID); err != nil {
-		return nil, err
+	e.modelSubagentMu.Lock()
+	activation := e.modelSubagentActivations[childID]
+	e.modelSubagentMu.Unlock()
+	if activation == nil || activation.disposing {
+		return map[string]any{"accepted": true}, nil
 	}
-	if err := e.CancelSession(childID); err != nil {
+	if activation.parentID != parentID {
+		return nil, rpcError("subagent-unauthorized", "subagent does not belong to this parent", map[string]any{"childSessionId": childID})
+	}
+	if err := e.CancelAgent(childID, AgentCancelCause{Kind: "user"}, CancelAgentOptions{KeepInbox: true, ParkInbox: true}); err != nil {
 		return nil, errorToRPC(err)
 	}
 	return map[string]any{"accepted": true}, nil

@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // sessionQueryToolNames is kept in one place so preset discovery and the
@@ -23,9 +27,11 @@ var sessionQueryToolNames = []string{
 }
 
 const (
-	defaultSessionQueryMaxResults = 100
-	maxSessionQueryResults        = 500
-	maxSessionQueryWindow         = 1000
+	defaultSessionQueryMaxResults    = 100
+	defaultSessionQuerySearchTimeout = 30 * time.Second
+	maxSessionQuerySafeInteger       = 9_007_199_254_740_991
+	maxSessionQueryResults           = 500
+	maxSessionQueryWindow            = 50
 )
 
 type sessionQueryEventSurface string
@@ -56,7 +62,32 @@ type sessionQuerySessionSnapshot struct {
 	title     string
 	events    []Event
 	archived  bool
+	live      bool
 	persisted bool
+}
+
+type sessionQueryCollection struct {
+	items     []map[string]any
+	capped    bool
+	sessionID string
+	title     string
+}
+
+type sessionQueryMatchRank struct {
+	matchCount     int
+	documentLength int
+	time           int64
+	seq            int
+}
+
+type sessionQueryToken struct {
+	value string
+	start int
+}
+
+type sessionQueryRankedRow struct {
+	row  map[string]any
+	rank sessionQueryMatchRank
 }
 
 type sessionQueryEventFilters struct {
@@ -118,26 +149,87 @@ func sessionQueryFormattedResult(_ any, text string) ToolResult {
 	return ToolResult{Content: []ContentBlock{{Type: "text", Text: text}}, Value: text}
 }
 
+func cloneSessionQueryEvent(event Event) Event {
+	cloned := event
+	cloned.Data = cloneJSON(event.Data)
+	cloned.SurfaceOp = cloneJSON(event.SurfaceOp)
+	cloned.SourceEventSeqs = append([]int(nil), event.SourceEventSeqs...)
+	return cloned
+}
+
+func cloneSessionQueryEvents(events []Event) []Event {
+	cloned := make([]Event, len(events))
+	for index, event := range events {
+		cloned[index] = cloneSessionQueryEvent(event)
+	}
+	return cloned
+}
+
+func sessionQueryOperationError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	code, _, ok := strings.Cut(err.Error(), ":")
+	if !ok {
+		return errors.New("SESSION_QUERY_TOOL_FAILED: session query operation failed")
+	}
+	messages := map[string]string{
+		"SESSION_QUERY_TOOL_MISSING_AGENT":   "session query tools require an agent-bound caller",
+		"SESSION_QUERY_TOOL_UNAUTHORIZED":    "session target is outside the caller workspace",
+		"SESSION_QUERY_TOOL_NO_CURRENT_STEP": "current-session search requires an active step boundary",
+		"SESSION_QUERY_ABORTED":              "session query was cancelled",
+		"SESSION_QUERY_CORRUPT_SESSION":      "session event history is corrupt",
+		"SESSION_QUERY_INDEX_FAILED":         "session search index is unavailable",
+		"SESSION_QUERY_INVALID_CURSOR":       "session search continuation is invalid",
+		"SESSION_QUERY_INVALID_QUERY":        "session query was rejected",
+		"SESSION_QUERY_INVALID_FILTER":       "session query filters were rejected",
+		"SESSION_QUERY_INVALID_RANGE":        "session query filters were rejected",
+		"SESSION_QUERY_INVALID_LIMIT":        "session query result limit was rejected",
+		"SESSION_QUERY_INVALID_LINEAGE":      "session lineage is invalid",
+		"SESSION_QUERY_INVALID_SURFACE":      "session event history is invalid",
+		"SESSION_QUERY_INVALID_WINDOW":       "session event window is invalid",
+		"SESSION_QUERY_EVENT_NOT_FOUND":      "session event was not found",
+		"SESSION_QUERY_PERSISTENCE_FAILED":   "session history storage is unavailable",
+		"SESSION_QUERY_SEARCH_DISABLED":      "session search is disabled in this deployment",
+		"SESSION_QUERY_SESSION_NOT_FOUND":    "session was not found",
+		"SESSION_QUERY_STALE_CURSOR":         "session history changed while paging; retry the complete search call",
+	}
+	message, safe := messages[code]
+	if !safe {
+		return errors.New("SESSION_QUERY_TOOL_FAILED: session query operation failed")
+	}
+	if code == "SESSION_QUERY_INVALID_RANGE" {
+		code = "SESSION_QUERY_INVALID_FILTER"
+	}
+	return fmt.Errorf("%s: %s", code, message)
+}
+
 func sessionCWD(s *Session) string {
 	s.mu.Lock()
 	cwd := s.Header.CWD
 	s.mu.Unlock()
-	return sessionQueryWorkspaceKey(cwd)
+	return cwd
 }
 
 func sessionQueryWorkspaceKey(cwd string) string {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return ""
+	return cwd
+}
+
+func sessionQueryHeadersCompatible(left, right SessionHeader) bool {
+	return left.Version == right.Version &&
+		left.ID == right.ID &&
+		left.CreatedAt == right.CreatedAt &&
+		left.CWD == right.CWD &&
+		left.ParentSession == right.ParentSession &&
+		left.SeedLength == right.SeedLength &&
+		left.DelegationDepth == right.DelegationDepth
+}
+
+func sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID string, header SessionHeader) bool {
+	if header.ID != targetID || header.CWD != callerCWD {
+		return false
 	}
-	abs, err := filepath.Abs(cwd)
-	if err != nil {
-		return filepath.Clean(cwd)
-	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
-	return filepath.Clean(abs)
+	return targetID == callerID || callerCWD != ""
 }
 
 func (e *Engine) authorizeSessionQuery(callerID, targetID string) (*Session, error) {
@@ -148,30 +240,91 @@ func (e *Engine) authorizeSessionQuery(callerID, targetID string) (*Session, err
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(targetID) == "" {
+	if targetID == "" {
 		targetID = callerID
 	}
 	target, err := e.getSession(targetID)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
 	}
 	if callerID == targetID {
 		return target, nil
 	}
 	callerCWD := sessionCWD(caller)
 	if callerCWD == "" || callerCWD != sessionCWD(target) {
-		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: SESSION_QUERY_UNAUTHORIZED: target session is outside the caller workspace")
+		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
 	}
 	return target, nil
 }
 
 func (e *Engine) sessionQuerySnapshots() []sessionQuerySessionSnapshot {
-	persisted := map[string]bool{}
-	if e.sessionStore != nil {
-		if snapshots, err := e.sessionStore.ListSnapshots(context.Background()); err == nil {
-			for _, snapshot := range snapshots {
-				persisted[snapshot.Header.ID] = true
+	snapshots, _ := e.sessionQuerySnapshotsContext(context.Background())
+	return snapshots
+}
+
+func (e *Engine) sessionQueryAuthorizeIDsContext(ctx context.Context, callerCWD string, ids map[string]bool) (map[string]bool, error) {
+	if len(ids) == 0 {
+		return map[string]bool{}, nil
+	}
+	e.mu.RLock()
+	sessions := make(map[string]*Session, len(e.sessions))
+	for id, session := range e.sessions {
+		sessions[id] = session
+	}
+	e.mu.RUnlock()
+	headers := make(map[string]SessionHeader, len(sessions))
+	authorized := make(map[string]bool, len(ids))
+	for id, session := range sessions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		session.mu.Lock()
+		header := session.Header
+		session.mu.Unlock()
+		headers[id] = header
+		if ids[id] && header.CWD == callerCWD {
+			authorized[id] = true
+		}
+	}
+	if e.sessionStore == nil {
+		return authorized, nil
+	}
+	persisted, err := e.sessionStore.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, snapshot := range persisted {
+		if live, ok := headers[snapshot.Header.ID]; ok {
+			if !sessionQueryHeadersCompatible(live, snapshot.Header) {
+				return nil, fmt.Errorf("SESSION_QUERY_SOURCE_CONFLICT: session source headers conflict for session %q", live.ID)
 			}
+			continue
+		}
+		if ids[snapshot.Header.ID] && snapshot.Header.CWD == callerCWD {
+			authorized[snapshot.Header.ID] = true
+		}
+	}
+	return authorized, nil
+}
+
+func (e *Engine) sessionQuerySnapshotsContext(ctx context.Context) ([]sessionQuerySessionSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	persisted := map[string]SessionPersistenceSnapshot{}
+	if e.sessionStore != nil {
+		snapshots, err := e.sessionStore.ListSnapshots(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, snapshot := range snapshots {
+			persisted[snapshot.Header.ID] = snapshot
 		}
 	}
 	e.mu.RLock()
@@ -187,16 +340,60 @@ func (e *Engine) sessionQuerySnapshots() []sessionQuerySessionSnapshot {
 
 	result := make([]sessionQuerySessionSnapshot, 0, len(sessions))
 	for _, session := range sessions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		session.mu.Lock()
 		snapshot := sessionQuerySessionSnapshot{
 			header:   session.Header,
 			title:    session.Title,
-			events:   append([]Event(nil), session.Events...),
+			events:   cloneSessionQueryEvents(session.Events),
 			archived: archived[session.Header.ID],
+			live:     session.attached,
 		}
 		session.mu.Unlock()
-		snapshot.persisted = persisted[snapshot.header.ID]
+		if durable, ok := persisted[snapshot.header.ID]; ok {
+			if !sessionQueryHeadersCompatible(snapshot.header, durable.Header) {
+				return nil, fmt.Errorf("SESSION_QUERY_SOURCE_CONFLICT: session source headers conflict for session %q", snapshot.header.ID)
+			}
+			snapshot.persisted = true
+			delete(persisted, snapshot.header.ID)
+			if !snapshot.live {
+				inspection, err := e.sessionStore.Inspect(ctx, snapshot.header.ID)
+				if err != nil {
+					return nil, err
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if !sessionQueryHeadersCompatible(inspection.Meta, durable.Header) {
+					return nil, fmt.Errorf("SESSION_QUERY_SOURCE_CONFLICT: session source headers conflict for session %q", snapshot.header.ID)
+				}
+				snapshot.header = inspection.Meta
+				snapshot.title = sessionTitleFromEvents(inspection.Events)
+				snapshot.events = cloneSessionQueryEvents(inspection.Events)
+			}
+		}
 		result = append(result, snapshot)
+	}
+	for id, durable := range persisted {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		inspection, err := e.sessionStore.Inspect(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !sessionQueryHeadersCompatible(inspection.Meta, durable.Header) {
+			return nil, fmt.Errorf("SESSION_QUERY_SOURCE_CONFLICT: session source headers conflict for session %q", id)
+		}
+		result = append(result, sessionQuerySessionSnapshot{
+			header: inspection.Meta, title: sessionTitleFromEvents(inspection.Events),
+			events: cloneSessionQueryEvents(inspection.Events), archived: archived[id], persisted: true,
+		})
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].header.CreatedAt != result[j].header.CreatedAt {
@@ -204,7 +401,7 @@ func (e *Engine) sessionQuerySnapshots() []sessionQuerySessionSnapshot {
 		}
 		return result[i].header.ID < result[j].header.ID
 	})
-	return result
+	return result, nil
 }
 
 func normalizeSessionQueryMax(max int) int {
@@ -228,19 +425,11 @@ func normalizeSessionQueryString(value string) (string, error) {
 	return strings.ToLower(value), nil
 }
 
-func normalizeSessionQueryText(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
-}
-
-func queryTextMatches(text, query string) bool {
-	return strings.Contains(normalizeSessionQueryText(text), query)
-}
-
 func clipQueryText(text string) string {
 	text = strings.TrimSpace(strings.Join(strings.Fields(text), " "))
 	runes := []rune(text)
-	if len(runes) > 500 {
-		return string(runes[:500]) + "..."
+	if len(runes) > 240 {
+		return string(runes[:239]) + "…"
 	}
 	return text
 }
@@ -250,60 +439,237 @@ func querySnippet(text, query string) string {
 	if text == "" {
 		return ""
 	}
-	if len([]rune(text)) <= 500 {
+	characters := []rune(text)
+	if len(characters) <= 240 {
 		return text
 	}
-	// Search on the normalized string so a multi-word query remains useful
-	// even when the event stores line breaks between semantic fields.
-	match := strings.Index(strings.ToLower(text), query)
+	_, match := sessionQueryPhraseMatches(text, query)
 	if match < 0 {
 		return clipQueryText(text)
 	}
-	start := match - 180
+	start := match - 80
 	if start < 0 {
 		start = 0
 	}
-	end := match + len(query) + 260
-	if end > len(text) {
-		end = len(text)
+	prefix := ""
+	if start > 0 {
+		prefix = "…"
 	}
-	for start < end && !utf8.RuneStart(text[start]) {
-		start++
+	contentLength := 240 - len([]rune(prefix)) - 1
+	end := start + contentLength
+	if end >= len(characters) {
+		end = len(characters)
+		prefixLength := len([]rune(prefix))
+		start = end - (240 - prefixLength)
+		if start < 0 {
+			start = 0
+		}
+		return prefix + string(characters[start:end])
 	}
-	for end > start && !utf8.RuneStart(text[end-1]) {
-		end--
+	if match >= end {
+		start = match - contentLength + 1
+		end = start + contentLength
 	}
-	return clipQueryText(text[start:end])
+	return prefix + string(characters[start:end]) + "…"
 }
 
-func parseSessionQueryTime(name, value string) (int64, error) {
+func sessionQueryTextRank(text, query string, record sessionQueryEventRecord) (sessionQueryMatchRank, bool) {
+	matchCount, _ := sessionQueryPhraseMatches(text, query)
+	if matchCount == 0 {
+		return sessionQueryMatchRank{}, false
+	}
+	return sessionQueryMatchRank{
+		matchCount: matchCount, documentLength: utf8.RuneCountInString(text),
+		time: record.Time, seq: record.Seq,
+	}, true
+}
+
+func sessionQueryPhraseMatches(text, query string) (int, int) {
+	textTokens := sessionQueryTokens(text)
+	queryTokens := sessionQueryTokens(query)
+	if len(queryTokens) == 0 || len(queryTokens) > len(textTokens) {
+		return 0, -1
+	}
+	count, first := 0, -1
+	for start := 0; start+len(queryTokens) <= len(textTokens); start++ {
+		matches := true
+		for offset, queryToken := range queryTokens {
+			if textTokens[start+offset].value != queryToken.value {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			count++
+			if first < 0 {
+				first = textTokens[start].start
+			}
+		}
+	}
+	return count, first
+}
+
+func sessionQueryTokens(value string) []sessionQueryToken {
+	characters := []rune(value)
+	tokens := make([]sessionQueryToken, 0)
+	start := -1
+	flush := func(end int) {
+		if start < 0 {
+			return
+		}
+		var normalized strings.Builder
+		for _, character := range norm.NFD.String(string(characters[start:end])) {
+			if unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Me, character) {
+				continue
+			}
+			normalized.WriteRune(unicode.ToLower(character))
+		}
+		if normalized.Len() > 0 {
+			tokens = append(tokens, sessionQueryToken{value: normalized.String(), start: start})
+		}
+		start = -1
+	}
+	for index, character := range characters {
+		if unicode.IsLetter(character) || unicode.IsNumber(character) || start >= 0 && unicode.IsMark(character) {
+			if start < 0 {
+				start = index
+			}
+			continue
+		}
+		flush(index)
+	}
+	flush(len(characters))
+	return tokens
+}
+
+func sessionQueryRankBetter(left, right sessionQueryMatchRank) bool {
+	if left.matchCount != right.matchCount {
+		return left.matchCount > right.matchCount
+	}
+	if left.documentLength != right.documentLength {
+		return left.documentLength < right.documentLength
+	}
+	if left.time != right.time {
+		return left.time > right.time
+	}
+	return left.seq > right.seq
+}
+
+var sessionQueryISOTime = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:\d{2})$`)
+
+type sessionQueryExactTime struct {
+	millisecond int64
+	remainder   string
+}
+
+func parseSessionQueryTime(name, value string) (sessionQueryExactTime, error) {
 	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s must be a timestamp", name)
+	match := sessionQueryISOTime.FindStringSubmatch(value)
+	if match == nil {
+		return sessionQueryExactTime{}, fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s must be an ISO 8601 timestamp with Z or a numeric offset", name)
 	}
-	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	part := func(index int) int {
+		value, _ := strconv.Atoi(match[index])
+		return value
+	}
+	year, month, day := part(1), part(2), part(3)
+	hour, minute := part(4), part(5)
+	second := 0
+	if match[6] != "" {
+		second = part(6)
+	}
+	if month < 1 || month > 12 || day < 1 || day > daysInSessionQueryMonth(year, month) || hour > 23 || minute > 59 || second > 59 {
+		return sessionQueryExactTime{}, fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s must be a valid ISO 8601 timestamp", name)
+	}
+	fraction := match[7]
+	millisecondDigits := fraction
+	if len(millisecondDigits) > 3 {
+		millisecondDigits = millisecondDigits[:3]
+	}
+	for len(millisecondDigits) < 3 {
+		millisecondDigits += "0"
+	}
+	normalized := fmt.Sprintf("%s-%s-%sT%s:%s:%02d.%s%s", match[1], match[2], match[3], match[4], match[5], second, millisecondDigits, match[8])
+	timestamp, err := time.Parse("2006-01-02T15:04:05.000Z07:00", normalized)
 	if err != nil {
-		return 0, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s must be an ISO 8601 timestamp with timezone", name)
+		return sessionQueryExactTime{}, fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s must be a valid ISO 8601 timestamp", name)
 	}
-	return timestamp.UnixMilli(), nil
+	remainder := ""
+	if len(fraction) > 3 {
+		remainder = strings.TrimRight(fraction[3:], "0")
+	}
+	return sessionQueryExactTime{millisecond: timestamp.UnixMilli(), remainder: remainder}, nil
+}
+
+func daysInSessionQueryMonth(year, month int) int {
+	if month == 2 {
+		if year%4 == 0 && (year%100 != 0 || year%400 == 0) {
+			return 29
+		}
+		return 28
+	}
+	if month == 4 || month == 6 || month == 9 || month == 11 {
+		return 30
+	}
+	return 31
+}
+
+func compareSessionQueryTimes(left, right sessionQueryExactTime) int {
+	if left.millisecond < right.millisecond {
+		return -1
+	}
+	if left.millisecond > right.millisecond {
+		return 1
+	}
+	length := len(left.remainder)
+	if len(right.remainder) > length {
+		length = len(right.remainder)
+	}
+	for index := 0; index < length; index++ {
+		leftDigit, rightDigit := byte('0'), byte('0')
+		if index < len(left.remainder) {
+			leftDigit = left.remainder[index]
+		}
+		if index < len(right.remainder) {
+			rightDigit = right.remainder[index]
+		}
+		if leftDigit < rightDigit {
+			return -1
+		}
+		if leftDigit > rightDigit {
+			return 1
+		}
+	}
+	return 0
+}
+
+func sessionQueryLowerBound(value sessionQueryExactTime) int64 {
+	if value.remainder == "" {
+		return value.millisecond
+	}
+	return value.millisecond + 1
+}
+
+func sessionQueryUpperBound(value sessionQueryExactTime) int64 {
+	return value.millisecond
 }
 
 func validateQueryRange(name string, from, to *int) error {
-	if from != nil && *from < 0 {
-		return fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s_from must be non-negative", name)
+	if from != nil && (*from < 0 || int64(*from) > maxSessionQuerySafeInteger) {
+		return fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s_from must be a non-negative safe integer", name)
 	}
-	if to != nil && *to < 0 {
-		return fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s_to must be non-negative", name)
+	if to != nil && (*to < 0 || int64(*to) > maxSessionQuerySafeInteger) {
+		return fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s_to must be a non-negative safe integer", name)
 	}
 	if from != nil && to != nil && *from > *to {
-		return fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s_from must be less than or equal to %s_to", name, name)
+		return fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s_from must be less than or equal to %s_to", name, name)
 	}
 	return nil
 }
 
-func validateQueryTimeRange(name string, from, to *int64) error {
-	if from != nil && to != nil && *from > *to {
-		return fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s_from must be less than or equal to %s_to", name, name)
+func validateSessionQuerySafeInteger(name string, value int) error {
+	if value < 0 || int64(value) > maxSessionQuerySafeInteger {
+		return fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s must be a non-negative safe integer", name)
 	}
 	return nil
 }
@@ -312,16 +678,12 @@ func cloneStringSet(values []string, name string) (map[string]bool, error) {
 	if values == nil {
 		return nil, nil
 	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("SESSION_QUERY_INVALID_FILTER: %s must contain at least one value when supplied", name)
+	}
 	set := make(map[string]bool, len(values))
 	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return nil, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s must not contain empty values", name)
-		}
 		set[value] = true
-	}
-	if len(set) == 0 {
-		return nil, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: %s must not be empty", name)
 	}
 	return set, nil
 }
@@ -332,27 +694,33 @@ func buildSessionQueryEventFilters(seqFrom, seqTo *int, timeFrom, timeTo *string
 		return filters, err
 	}
 	filters.seqFrom, filters.seqTo = seqFrom, seqTo
+	var exactFrom, exactTo *sessionQueryExactTime
 	if timeFrom != nil {
 		value, err := parseSessionQueryTime("time_from", *timeFrom)
 		if err != nil {
 			return filters, err
 		}
-		filters.timeFrom = &value
+		exactFrom = &value
+		bound := sessionQueryLowerBound(value)
+		filters.timeFrom = &bound
 	}
 	if timeTo != nil {
 		value, err := parseSessionQueryTime("time_to", *timeTo)
 		if err != nil {
 			return filters, err
 		}
-		filters.timeTo = &value
+		exactTo = &value
+		bound := sessionQueryUpperBound(value)
+		filters.timeTo = &bound
 	}
-	if err := validateQueryTimeRange("time", filters.timeFrom, filters.timeTo); err != nil {
+	if exactFrom != nil && exactTo != nil && compareSessionQueryTimes(*exactFrom, *exactTo) > 0 {
+		return filters, errors.New("SESSION_QUERY_INVALID_FILTER: session time range from must be less than or equal to to")
+	}
+	types, err := cloneStringSet(eventTypes, "event_types")
+	if err != nil {
 		return filters, err
 	}
-	filters.types, _ = cloneStringSet(eventTypes, "event_types")
-	if len(eventTypes) > 0 && filters.types == nil {
-		return filters, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: event_types must not be empty")
-	}
+	filters.types = types
 	if surfaces != nil {
 		filters.surfaces = make(map[sessionQueryEventSurface]bool, len(surfaces))
 		for _, value := range surfaces {
@@ -365,7 +733,7 @@ func buildSessionQueryEventFilters(seqFrom, seqTo *int, timeFrom, timeTo *string
 			}
 		}
 		if len(filters.surfaces) == 0 {
-			return filters, errors.New("SESSION_QUERY_INVALID_RANGE: surfaces must not be empty")
+			return filters, errors.New("SESSION_QUERY_INVALID_FILTER: surfaces must contain at least one value when supplied")
 		}
 	}
 	return filters, nil
@@ -611,11 +979,14 @@ func sessionQueryRecordMap(record sessionQueryEventRecord) map[string]any {
 
 func sessionQueryAvailability(snapshot sessionQuerySessionSnapshot) string {
 	values := []string{}
-	// A session in the engine is the live source, including a cold session
-	// loaded from disk. Persisted is reported independently when a log exists.
-	values = append(values, "live")
+	if snapshot.live {
+		values = append(values, "live")
+	}
 	if snapshot.persisted {
 		values = append(values, "persisted")
+	}
+	if len(values) == 0 {
+		return "unavailable"
 	}
 	return strings.Join(values, ", ")
 }
@@ -651,26 +1022,51 @@ func (e *Engine) sessionQuerySearch(callerID, query string, max int) ([]map[stri
 }
 
 func (e *Engine) sessionQuerySearchWithOptions(callerID, query string, options sessionQuerySearchOptions) ([]map[string]any, error) {
+	collection, err := e.sessionQuerySearchWithOptionsContext(context.Background(), callerID, query, options)
+	return collection.items, err
+}
+
+func (e *Engine) sessionQuerySearchWithOptionsContext(ctx context.Context, callerID, query string, options sessionQuerySearchOptions) (sessionQueryCollection, error) {
+	if err := ctx.Err(); err != nil {
+		return sessionQueryCollection{}, err
+	}
 	query, err := normalizeSessionQueryString(query)
 	if err != nil {
-		return nil, err
+		return sessionQueryCollection{}, err
 	}
 	caller, err := e.getSession(callerID)
 	if err != nil {
 		if strings.TrimSpace(callerID) == "" {
-			return nil, errors.New("SESSION_QUERY_TOOL_MISSING_AGENT: session query tools require an agent-bound caller")
+			return sessionQueryCollection{}, errors.New("SESSION_QUERY_TOOL_MISSING_AGENT: session query tools require an agent-bound caller")
 		}
-		return nil, err
+		return sessionQueryCollection{}, err
 	}
 	callerCWD := sessionCWD(caller)
 	if callerCWD == "" {
-		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: caller session has no workspace")
+		return sessionQueryCollection{}, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: caller session has no workspace")
+	}
+	if len(options.filters.parents) > 0 {
+		authorized, err := e.sessionQueryAuthorizeIDsContext(ctx, callerCWD, options.filters.parents)
+		if err != nil {
+			return sessionQueryCollection{}, err
+		}
+		options.filters.parents = authorized
+		if len(authorized) == 0 && !options.filters.includeRoots {
+			return sessionQueryCollection{items: []map[string]any{}}, nil
+		}
 	}
 	if options.max <= 0 {
 		options.max = defaultSessionQueryMaxResults
 	}
-	rows := make([]map[string]any, 0, options.max)
-	for _, snapshot := range e.sessionQuerySnapshots() {
+	rankedRows := make([]sessionQueryRankedRow, 0, options.max)
+	snapshots, err := e.sessionQuerySnapshotsContext(ctx)
+	if err != nil {
+		return sessionQueryCollection{}, err
+	}
+	for _, snapshot := range snapshots {
+		if err := ctx.Err(); err != nil {
+			return sessionQueryCollection{}, err
+		}
 		if snapshot.archived || (options.excludeCaller && snapshot.header.ID == callerID) {
 			continue
 		}
@@ -679,28 +1075,24 @@ func (e *Engine) sessionQuerySearchWithOptions(callerID, query string, options s
 		}
 		analysis, err := e.sessionQueryAnalyzeEvents(snapshot.header.ID, snapshot.events)
 		if err != nil {
-			return nil, err
+			return sessionQueryCollection{}, err
 		}
 		var best *sessionQueryEventRecord
 		var bestText string
-		bestScore := int(^uint(0) >> 1)
+		var bestRank sessionQueryMatchRank
 		for _, event := range snapshot.events {
 			record := analysis.records[event.Seq]
-			if !options.filters.event.matches(record, sessionQueryEventText(event)) {
-				continue
-			}
 			text := sessionQueryEventText(event)
-			if !queryTextMatches(text, query) {
+			if !options.filters.event.matches(record, text) {
 				continue
 			}
-			normalized := normalizeSessionQueryText(text)
-			score := strings.Index(normalized, query)
-			if score < 0 {
-				score = len(normalized)
+			rank, matches := sessionQueryTextRank(text, query, record)
+			if !matches {
+				continue
 			}
-			if best == nil || score < bestScore || score == bestScore && event.Seq < best.Seq {
+			if best == nil || sessionQueryRankBetter(rank, bestRank) {
 				copyRecord := record
-				best, bestText, bestScore = &copyRecord, text, score
+				best, bestText, bestRank = &copyRecord, text, rank
 			}
 		}
 		if best == nil {
@@ -711,20 +1103,38 @@ func (e *Engine) sessionQuerySearchWithOptions(callerID, query string, options s
 		row := sessionQuerySessionMap(snapshot)
 		row["bestMatch"] = bestMatch
 		row["snippet"] = bestMatch["snippet"]
-		rows = append(rows, row)
+		rankedRows = append(rankedRows, sessionQueryRankedRow{row: row, rank: bestRank})
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		left := rows[i]["bestMatch"].(map[string]any)
-		right := rows[j]["bestMatch"].(map[string]any)
-		if left["time"].(int64) != right["time"].(int64) {
-			return left["time"].(int64) > right["time"].(int64)
+	parentIDs := map[string]bool{}
+	for _, ranked := range rankedRows {
+		if parent := mapString(ranked.row, "parentSession"); parent != "" {
+			parentIDs[parent] = true
 		}
-		return rows[i]["sessionId"].(string) < rows[j]["sessionId"].(string)
-	})
-	if len(rows) > options.max {
-		rows = rows[:options.max]
 	}
-	return rows, nil
+	authorizedParents, err := e.sessionQueryAuthorizeIDsContext(ctx, callerCWD, parentIDs)
+	if err != nil {
+		return sessionQueryCollection{}, err
+	}
+	for _, ranked := range rankedRows {
+		if parent := mapString(ranked.row, "parentSession"); parent != "" {
+			ranked.row["parentAuthorized"] = authorizedParents[parent]
+		}
+	}
+	sort.SliceStable(rankedRows, func(i, j int) bool {
+		if rankedRows[i].rank != rankedRows[j].rank {
+			return sessionQueryRankBetter(rankedRows[i].rank, rankedRows[j].rank)
+		}
+		return mapString(rankedRows[i].row, "sessionId") < mapString(rankedRows[j].row, "sessionId")
+	})
+	capped := len(rankedRows) > options.max
+	if capped {
+		rankedRows = rankedRows[:options.max]
+	}
+	rows := make([]map[string]any, len(rankedRows))
+	for index, ranked := range rankedRows {
+		rows[index] = ranked.row
+	}
+	return sessionQueryCollection{items: rows, capped: capped}, nil
 }
 
 func sessionQuerySessionFiltersMatch(filters sessionQuerySessionFilters, snapshot sessionQuerySessionSnapshot) bool {
@@ -751,13 +1161,8 @@ func sessionQuerySessionFiltersMatch(filters sessionQuerySessionFilters, snapsho
 		return false
 	}
 	if len(filters.availability) > 0 {
-		live := filters.availability["live"]
-		persisted := filters.availability["persisted"]
-		if live && !persisted {
-			// All in-memory sessions are live.
-		} else if persisted && !live && !snapshot.persisted {
-			return false
-		} else if !live && !persisted {
+		if !(filters.availability["live"] && snapshot.live) &&
+			!(filters.availability["persisted"] && snapshot.persisted) {
 			return false
 		}
 	}
@@ -771,25 +1176,44 @@ func (e *Engine) sessionQueryEventSearch(callerID, targetID, query string, max i
 }
 
 func (e *Engine) sessionQueryEventSearchWithOptions(callerID, targetID, query string, options sessionQueryEventSearchOptions) ([]map[string]any, error) {
+	collection, err := e.sessionQueryEventSearchWithOptionsContext(context.Background(), callerID, targetID, query, options)
+	return collection.items, err
+}
+
+func (e *Engine) sessionQueryEventSearchWithOptionsContext(ctx context.Context, callerID, targetID, query string, options sessionQueryEventSearchOptions) (sessionQueryCollection, error) {
+	if err := ctx.Err(); err != nil {
+		return sessionQueryCollection{}, err
+	}
 	query, err := normalizeSessionQueryString(query)
 	if err != nil {
-		return nil, err
+		return sessionQueryCollection{}, err
 	}
+	caller, err := e.getSession(callerID)
+	if err != nil {
+		return sessionQueryCollection{}, err
+	}
+	callerCWD := sessionCWD(caller)
 	session, err := e.authorizeSessionQuery(callerID, targetID)
 	if err != nil {
-		return nil, err
+		return sessionQueryCollection{}, err
 	}
+	targetID = targetIDOrCaller(callerID, targetID)
 	session.mu.Lock()
-	events := append([]Event(nil), session.Events...)
+	header := session.Header
+	title := session.Title
+	events := cloneSessionQueryEvents(session.Events)
 	session.mu.Unlock()
+	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, header) {
+		return sessionQueryCollection{}, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
+	}
 	if options.max <= 0 {
 		options.max = defaultSessionQueryMaxResults
 	}
-	analysis, err := e.sessionQueryAnalyzeEvents(targetIDOrCaller(callerID, targetID), events)
+	analysis, err := e.sessionQueryAnalyzeEvents(targetID, events)
 	if err != nil {
-		return nil, err
+		return sessionQueryCollection{}, err
 	}
-	if options.excludeActiveStep && strings.TrimSpace(targetID) == "" || options.excludeActiveStep && targetID == callerID {
+	if options.excludeActiveStep && targetID == callerID {
 		boundary := -1
 		for _, event := range events {
 			if event.Type == "step/start" {
@@ -797,45 +1221,123 @@ func (e *Engine) sessionQueryEventSearchWithOptions(callerID, targetID, query st
 			}
 		}
 		if boundary < 0 {
-			return nil, errors.New("SESSION_QUERY_TOOL_NO_CURRENT_STEP: current-session search requires an active step boundary")
+			return sessionQueryCollection{}, errors.New("SESSION_QUERY_TOOL_NO_CURRENT_STEP: current-session search requires an active step boundary")
 		}
 		if options.filters.seqTo == nil || *options.filters.seqTo >= boundary {
 			value := boundary - 1
 			options.filters.seqTo = &value
 		}
+		if options.filters.seqFrom != nil && options.filters.seqTo != nil && *options.filters.seqFrom > *options.filters.seqTo {
+			return sessionQueryCollection{items: []map[string]any{}, sessionID: targetID, title: title}, nil
+		}
 	}
-	rows := make([]map[string]any, 0, options.max)
+	rankedRows := make([]sessionQueryRankedRow, 0, len(events))
 	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return sessionQueryCollection{}, err
+		}
 		record := analysis.records[event.Seq]
 		text := sessionQueryEventText(event)
-		if !options.filters.matches(record, text) || !queryTextMatches(text, query) {
+		if !options.filters.matches(record, text) {
+			continue
+		}
+		rank, matches := sessionQueryTextRank(text, query, record)
+		if !matches {
 			continue
 		}
 		row := sessionQueryRecordMap(record)
 		row["snippet"] = querySnippet(text, query)
-		rows = append(rows, row)
-		if len(rows) >= options.max {
-			break
-		}
+		rankedRows = append(rankedRows, sessionQueryRankedRow{row: row, rank: rank})
 	}
-	return rows, nil
+	sort.SliceStable(rankedRows, func(i, j int) bool {
+		return sessionQueryRankBetter(rankedRows[i].rank, rankedRows[j].rank)
+	})
+	capped := len(rankedRows) > options.max
+	if capped {
+		rankedRows = rankedRows[:options.max]
+	}
+	rows := make([]map[string]any, len(rankedRows))
+	for index, ranked := range rankedRows {
+		rows[index] = ranked.row
+	}
+	return sessionQueryCollection{items: rows, capped: capped, sessionID: targetID, title: title}, nil
 }
 
 func targetIDOrCaller(callerID, targetID string) string {
-	if strings.TrimSpace(targetID) == "" {
+	if targetID == "" {
 		return callerID
 	}
 	return targetID
 }
 
+func sessionQueryToolTarget(_ string, target *string) (string, error) {
+	if target == nil {
+		return "", nil
+	}
+	if *target == "" {
+		return "", errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
+	}
+	return *target, nil
+}
+
+func sessionQueryPresentationMeta(call ToolCall, _ any) (any, error) {
+	arguments := map[string]any{}
+	if len(strings.TrimSpace(string(call.Arguments))) > 0 {
+		if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
+			return nil, err
+		}
+		if arguments == nil {
+			arguments = map[string]any{}
+		}
+	}
+	sessionID, hasSessionID := arguments["session_id"].(string)
+	switch call.Name {
+	case "session_search":
+		return map[string]any{"card": "generic", "kind": "search", "title": "Search prior sessions", "rawInput": arguments["query"]}, nil
+	case "session_event_search":
+		return map[string]any{"card": "generic", "kind": "search", "title": "Search session events", "rawInput": arguments["query"]}, nil
+	case "session_trace":
+		if !hasSessionID {
+			return map[string]any{"card": "generic", "kind": "read", "title": "Trace current session"}, nil
+		}
+		return map[string]any{"card": "generic", "kind": "read", "title": "Trace session " + sessionID, "rawInput": sessionID}, nil
+	case "session_event_trace", "session_event_read":
+		action := "Trace event"
+		if call.Name == "session_event_read" {
+			action = "Read event"
+		}
+		rawInput := map[string]any{"seq": arguments["seq"]}
+		if hasSessionID {
+			rawInput["session_id"] = sessionID
+		}
+		return map[string]any{"card": "generic", "kind": "read", "title": fmt.Sprintf("%s %v", action, arguments["seq"]), "rawInput": rawInput}, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (e *Engine) sessionQueryTrace(callerID, targetID string) (map[string]any, error) {
-	target, err := e.authorizeSessionQuery(callerID, targetID)
+	return e.sessionQueryTraceContext(context.Background(), callerID, targetID)
+}
+
+func (e *Engine) sessionQueryTraceContext(ctx context.Context, callerID, targetID string) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	caller, err := e.getSession(callerID)
+	if err != nil {
+		return nil, err
+	}
+	callerCWD := sessionCWD(caller)
+	_, err = e.authorizeSessionQuery(callerID, targetID)
 	if err != nil {
 		return nil, err
 	}
 	targetID = targetIDOrCaller(callerID, targetID)
-	_ = target
-	snapshots := e.sessionQuerySnapshots()
+	snapshots, err := e.sessionQuerySnapshotsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	byID := make(map[string]sessionQuerySessionSnapshot, len(snapshots))
 	for _, snapshot := range snapshots {
 		if !snapshot.archived {
@@ -846,19 +1348,39 @@ func (e *Engine) sessionQueryTrace(callerID, targetID string) (map[string]any, e
 	if !ok {
 		return nil, fmt.Errorf("SESSION_QUERY_SESSION_NOT_FOUND: session %q not found", targetID)
 	}
-	callerCWD := sessionCWD(target)
+	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, targetSnapshot.header) {
+		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
+	}
+	lineageSeen := map[string]bool{targetID: true}
+	for parentID := targetSnapshot.header.ParentSession; parentID != ""; {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if lineageSeen[parentID] {
+			return nil, fmt.Errorf("SESSION_QUERY_INVALID_LINEAGE: session lineage contains a cycle at %q", parentID)
+		}
+		lineageSeen[parentID] = true
+		parent, exists := byID[parentID]
+		if !exists {
+			break
+		}
+		parentID = parent.header.ParentSession
+	}
 	ancestors := make([]map[string]any, 0)
 	seen := map[string]bool{targetID: true}
 	parentID := targetSnapshot.header.ParentSession
 	complete := true
 	var unresolved string
 	for parentID != "" {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if seen[parentID] {
 			return nil, fmt.Errorf("SESSION_QUERY_INVALID_LINEAGE: session lineage contains a cycle at %q", parentID)
 		}
 		seen[parentID] = true
 		parent, exists := byID[parentID]
-		if !exists || sessionQueryWorkspaceKey(parent.header.CWD) != callerCWD {
+		if !exists || callerCWD == "" || parent.header.CWD != callerCWD {
 			complete = false
 			unresolved = parentID
 			break
@@ -881,36 +1403,16 @@ func (e *Engine) sessionQueryTrace(callerID, targetID string) (map[string]any, e
 			return children[parent][i].header.ID < children[parent][j].header.ID
 		})
 	}
-	var buildDescendants func(string, map[string]bool) []map[string]any
-	buildDescendants = func(id string, lineage map[string]bool) []map[string]any {
-		result := []map[string]any{}
-		for _, child := range children[id] {
-			if sessionQueryWorkspaceKey(child.header.CWD) != callerCWD {
-				result = append(result, map[string]any{"outsideWorkspace": true})
-				continue
-			}
-			if lineage[child.header.ID] {
-				result = append(result, map[string]any{"session": sessionQuerySessionMap(child), "invalidLineage": true})
-				continue
-			}
-			nextLineage := make(map[string]bool, len(lineage)+1)
-			for key, value := range lineage {
-				nextLineage[key] = value
-			}
-			nextLineage[child.header.ID] = true
-			result = append(result, map[string]any{
-				"session":     sessionQuerySessionMap(child),
-				"descendants": buildDescendants(child.header.ID, nextLineage),
-			})
-		}
-		return result
+	descendants, err := buildSessionQueryDescendants(ctx, targetID, callerCWD, children)
+	if err != nil {
+		return nil, err
 	}
 	result := map[string]any{
 		"sessionId":   targetID,
 		"target":      sessionQuerySessionMap(targetSnapshot),
 		"session":     sessionQuerySessionMap(targetSnapshot),
 		"ancestors":   ancestors,
-		"descendants": buildDescendants(targetID, map[string]bool{targetID: true}),
+		"descendants": descendants,
 		"complete":    complete,
 	}
 	if complete {
@@ -927,18 +1429,80 @@ func (e *Engine) sessionQueryTrace(callerID, targetID string) (map[string]any, e
 	return result, nil
 }
 
-func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map[string]any, error) {
-	if seq < 0 {
-		return nil, errors.New("SESSION_QUERY_INVALID_RANGE: seq must be non-negative")
+func buildSessionQueryDescendants(ctx context.Context, targetID, callerCWD string, children map[string][]sessionQuerySessionSnapshot) ([]map[string]any, error) {
+	type frame struct {
+		target   *[]map[string]any
+		owner    map[string]any
+		children []sessionQuerySessionSnapshot
+		index    int
+		entered  string
 	}
+	result := []map[string]any{}
+	lineage := map[string]bool{targetID: true}
+	stack := []frame{{target: &result, children: children[targetID]}}
+	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		current := &stack[len(stack)-1]
+		if current.index >= len(current.children) {
+			if current.owner != nil {
+				current.owner["descendants"] = *current.target
+			}
+			if current.entered != "" {
+				delete(lineage, current.entered)
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		child := current.children[current.index]
+		current.index++
+		if callerCWD == "" || child.header.CWD != callerCWD {
+			*current.target = append(*current.target, map[string]any{"outsideWorkspace": true})
+			continue
+		}
+		if lineage[child.header.ID] {
+			*current.target = append(*current.target, map[string]any{"session": sessionQuerySessionMap(child), "invalidLineage": true})
+			continue
+		}
+		lineage[child.header.ID] = true
+		nodeChildren := []map[string]any{}
+		node := map[string]any{"session": sessionQuerySessionMap(child), "descendants": nodeChildren}
+		*current.target = append(*current.target, node)
+		stack = append(stack, frame{target: &nodeChildren, owner: node, children: children[child.header.ID], entered: child.header.ID})
+	}
+	return result, nil
+}
+
+func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map[string]any, error) {
+	return e.sessionQueryEventTraceContext(context.Background(), callerID, targetID, seq)
+}
+
+func (e *Engine) sessionQueryEventTraceContext(ctx context.Context, callerID, targetID string, seq int) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateSessionQuerySafeInteger("seq", seq); err != nil {
+		return nil, err
+	}
+	caller, err := e.getSession(callerID)
+	if err != nil {
+		return nil, err
+	}
+	callerCWD := sessionCWD(caller)
 	session, err := e.authorizeSessionQuery(callerID, targetID)
 	if err != nil {
 		return nil, err
 	}
 	targetID = targetIDOrCaller(callerID, targetID)
 	session.mu.Lock()
-	events := append([]Event(nil), session.Events...)
+	header := session.Header
+	title := session.Title
+	events := cloneSessionQueryEvents(session.Events)
 	session.mu.Unlock()
+	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, header) {
+		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
+	}
 	if seq >= len(events) || events[seq].Seq != seq {
 		return nil, fmt.Errorf("SESSION_QUERY_EVENT_NOT_FOUND: session %q has no event at seq %d", targetID, seq)
 	}
@@ -949,6 +1513,9 @@ func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map
 	target := events[seq]
 	replacementChain := []int{}
 	for replacement, ok := analysis.replacedBy[seq]; ok; replacement, ok = analysis.replacedBy[replacement] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		replacementChain = append(replacementChain, replacement)
 		if len(replacementChain) > len(events) {
 			return nil, errors.New("SESSION_QUERY_INVALID_LINEAGE: replacement chain contains a cycle")
@@ -956,6 +1523,9 @@ func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map
 	}
 	derived := []int{}
 	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if event.Seq <= seq {
 			continue
 		}
@@ -971,6 +1541,7 @@ func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map
 	targetRecord := sessionQueryRecordMap(analysis.records[seq])
 	result := map[string]any{
 		"sessionId":         targetID,
+		"title":             sessionQueryTitle(title),
 		"target":            targetRecord,
 		"event":             target,
 		"replacedBy":        nil,
@@ -988,20 +1559,43 @@ func (e *Engine) sessionQueryEventTrace(callerID, targetID string, seq int) (map
 }
 
 func (e *Engine) sessionQueryEventRead(callerID, targetID string, seq, before, after int) (map[string]any, error) {
-	if seq < 0 || before < 0 || after < 0 {
-		return nil, errors.New("SESSION_QUERY_INVALID_RANGE: seq, before, and after must be non-negative")
+	return e.sessionQueryEventReadContext(context.Background(), callerID, targetID, seq, before, after)
+}
+
+func (e *Engine) sessionQueryEventReadContext(ctx context.Context, callerID, targetID string, seq, before, after int) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateSessionQuerySafeInteger("seq", seq); err != nil {
+		return nil, err
+	}
+	if err := validateSessionQuerySafeInteger("before", before); err != nil {
+		return nil, err
+	}
+	if err := validateSessionQuerySafeInteger("after", after); err != nil {
+		return nil, err
 	}
 	if before > maxSessionQueryWindow || after > maxSessionQueryWindow {
-		return nil, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: before and after must be no greater than %d", maxSessionQueryWindow)
+		return nil, fmt.Errorf("SESSION_QUERY_INVALID_WINDOW: before and after must be no greater than %d", maxSessionQueryWindow)
 	}
+	caller, err := e.getSession(callerID)
+	if err != nil {
+		return nil, err
+	}
+	callerCWD := sessionCWD(caller)
 	session, err := e.authorizeSessionQuery(callerID, targetID)
 	if err != nil {
 		return nil, err
 	}
 	targetID = targetIDOrCaller(callerID, targetID)
 	session.mu.Lock()
-	events := append([]Event(nil), session.Events...)
+	header := session.Header
+	title := session.Title
+	events := cloneSessionQueryEvents(session.Events)
 	session.mu.Unlock()
+	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, header) {
+		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
+	}
 	if seq >= len(events) || events[seq].Seq != seq {
 		return nil, fmt.Errorf("SESSION_QUERY_EVENT_NOT_FOUND: session %q has no event at seq %d", targetID, seq)
 	}
@@ -1016,6 +1610,9 @@ func (e *Engine) sessionQueryEventRead(callerID, targetID string, seq, before, a
 	body := append([]Event(nil), events[start:end+1]...)
 	neighbors := make([]map[string]any, 0, len(body)-1)
 	for _, event := range body {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if event.Seq == seq {
 			continue
 		}
@@ -1027,6 +1624,7 @@ func (e *Engine) sessionQueryEventRead(callerID, targetID string, seq, before, a
 	}
 	return map[string]any{
 		"sessionId": targetID,
+		"title":     sessionQueryTitle(title),
 		"target":    events[seq],
 		"event":     events[seq],
 		"events":    body,
@@ -1061,7 +1659,7 @@ func formatSessionQueryTime(value any) string {
 	return time.UnixMilli(milliseconds).UTC().Format(time.RFC3339Nano)
 }
 
-func formatSessionSearchResults(rows []map[string]any) string {
+func formatSessionSearchResults(rows []map[string]any, capped bool) string {
 	if len(rows) == 0 {
 		return "No prior session matches found."
 	}
@@ -1071,6 +1669,8 @@ func formatSessionSearchResults(rows []map[string]any) string {
 		parent := mapString(row, "parentSession")
 		if parent == "" {
 			parent = "root"
+		} else if authorized, _ := row["parentAuthorized"].(bool); !authorized {
+			parent = "[outside workspace]"
 		}
 		lines = append(lines, "", fmt.Sprintf("%d. Session %s - %s", index+1, mapString(row, "sessionId"), sessionQueryTitle(mapString(row, "title"))))
 		lines = append(lines,
@@ -1081,10 +1681,13 @@ func formatSessionSearchResults(rows []map[string]any) string {
 			fmt.Sprintf("   Snippet: %s", mapString(best, "snippet")),
 		)
 	}
+	if capped {
+		lines = append(lines, "", "Result cap reached. Narrow the query or add filters to find additional matches.")
+	}
 	return strings.Join(lines, "\n")
 }
 
-func formatEventSearchResults(rows []map[string]any, sessionID, title string) string {
+func formatEventSearchResults(rows []map[string]any, sessionID, title string, capped bool) string {
 	lines := []string{fmt.Sprintf("Session %s - %s", sessionID, sessionQueryTitle(title))}
 	if len(rows) == 0 {
 		return strings.Join(append(lines, "", "No prior event matches found."), "\n")
@@ -1095,6 +1698,9 @@ func formatEventSearchResults(rows []map[string]any, sessionID, title string) st
 			fmt.Sprintf("%d. seq %d | %s | %s | %s", index+1, mapInt(row, "seq"), mapString(row, "type"), mapString(row, "surface"), formatSessionQueryTime(row["time"])),
 			fmt.Sprintf("   Snippet: %s", mapString(row, "snippet")),
 		)
+	}
+	if capped {
+		lines = append(lines, "", "Result cap reached. Narrow the query or add filters to find additional matches.")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1133,8 +1739,21 @@ func formatSessionTraceResult(trace map[string]any) string {
 }
 
 func formatDescendantLines(lines *[]string, nodes []map[string]any, depth int) {
-	indent := strings.Repeat("  ", depth)
-	for _, node := range nodes {
+	type frame struct {
+		nodes []map[string]any
+		index int
+		depth int
+	}
+	stack := []frame{{nodes: nodes, depth: depth}}
+	for len(stack) > 0 {
+		current := &stack[len(stack)-1]
+		if current.index >= len(current.nodes) {
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		node := current.nodes[current.index]
+		current.index++
+		indent := strings.Repeat("  ", current.depth)
 		if outside, _ := node["outsideWorkspace"].(bool); outside {
 			*lines = append(*lines, indent+"- [outside workspace subtree]")
 			continue
@@ -1143,7 +1762,7 @@ func formatDescendantLines(lines *[]string, nodes []map[string]any, depth int) {
 		*lines = append(*lines, fmt.Sprintf("%s- %s - %s | %s | %s", indent, mapString(session, "sessionId"), sessionQueryTitle(mapString(session, "title")), formatSessionQueryTime(session["createdAt"]), mapString(session, "availability")))
 		children, _ := node["descendants"].([]map[string]any)
 		if len(children) > 0 {
-			formatDescendantLines(lines, children, depth+1)
+			stack = append(stack, frame{nodes: children, depth: current.depth + 1})
 		}
 	}
 }
@@ -1166,7 +1785,7 @@ func formatEventTraceResult(trace map[string]any) string {
 		replacedBy = fmt.Sprintf("%d", value)
 	}
 	return strings.Join([]string{
-		fmt.Sprintf("Session %s - event trace", mapString(trace, "sessionId")),
+		fmt.Sprintf("Session %s - %s", mapString(trace, "sessionId"), sessionQueryTitle(mapString(trace, "title"))),
 		fmt.Sprintf("Target: seq %d | %s | %s | %s", mapInt(target, "seq"), mapString(target, "type"), mapString(target, "surface"), formatSessionQueryTime(target["time"])),
 		"Replaced by: " + replacedBy,
 		"Replacement chain: " + seqList(trace["replacementChain"]),
@@ -1180,7 +1799,7 @@ func formatEventReadResult(value map[string]any) string {
 	target, _ := value["target"].(Event)
 	encoded, _ := json.MarshalIndent(target, "", "  ")
 	lines := []string{
-		fmt.Sprintf("Session %s - event read", mapString(value, "sessionId")),
+		fmt.Sprintf("Session %s - %s", mapString(value, "sessionId"), sessionQueryTitle(mapString(value, "title"))),
 		fmt.Sprintf("Target event seq %d:", target.Seq),
 		"```json",
 		string(encoded),
@@ -1203,6 +1822,8 @@ func formatEventReadResult(value map[string]any) string {
 			line := fmt.Sprintf("- seq %d | %s | %s", seq, mapString(neighbor, "type"), formatSessionQueryTime(neighbor["time"]))
 			if snippet := mapString(neighbor, "snippet"); snippet != "" {
 				line += "\n  " + strings.ReplaceAll(snippet, "\n", "\n  ")
+			} else {
+				line += " | (no semantic text)"
 			}
 			sectionLines = append(sectionLines, line)
 		}
@@ -1216,7 +1837,7 @@ func formatEventReadResult(value map[string]any) string {
 
 func registerSessionQueryTools(e *Engine) error {
 	type eventSearchInput struct {
-		SessionID  string   `json:"session_id"`
+		SessionID  *string  `json:"session_id"`
 		Query      string   `json:"query"`
 		SeqFrom    *int     `json:"seq_from"`
 		SeqTo      *int     `json:"seq_to"`
@@ -1226,21 +1847,22 @@ func registerSessionQueryTools(e *Engine) error {
 		Surfaces   []string `json:"surfaces"`
 	}
 	type targetInput struct {
-		SessionID string `json:"session_id"`
+		SessionID *string `json:"session_id"`
 	}
 	type eventTargetInput struct {
-		SessionID string `json:"session_id"`
-		Seq       int    `json:"seq"`
+		SessionID *string `json:"session_id"`
+		Seq       int     `json:"seq"`
 	}
 	type eventReadInput struct {
-		SessionID string `json:"session_id"`
-		Seq       int    `json:"seq"`
-		Before    *int   `json:"before"`
-		After     *int   `json:"after"`
+		SessionID *string `json:"session_id"`
+		Seq       int     `json:"seq"`
+		Before    *int    `json:"before"`
+		After     *int    `json:"after"`
 	}
 
 	tools := []Tool{
 		{
+			Timeout: defaultSessionQuerySearchTimeout,
 			Schema: ToolSchema{Name: "session_search", Description: "Search prior sessions in the caller workspace and return the strongest matching event from each session.", Parameters: objectSchema(map[string]any{
 				"query": map[string]any{"type": "string"}, "session_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				"created_at_from": map[string]any{"type": "string"}, "created_at_to": map[string]any{"type": "string"},
@@ -1260,16 +1882,17 @@ func registerSessionQueryTools(e *Engine) error {
 				}
 				filters, err := buildSessionQueryFilters(in)
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
-				rows, err := e.sessionQuerySearchWithOptions(call.SessionID, in.Query, sessionQuerySearchOptions{max: defaultSessionQueryMaxResults, filters: filters, excludeCaller: true})
+				collection, err := e.sessionQuerySearchWithOptionsContext(ctx, call.SessionID, in.Query, sessionQuerySearchOptions{max: defaultSessionQueryMaxResults, filters: filters, excludeCaller: true})
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
-				return sessionQueryFormattedResult(rows, formatSessionSearchResults(rows)), nil
+				return sessionQueryFormattedResult(collection.items, formatSessionSearchResults(collection.items, collection.capped)), nil
 			},
 		},
 		{
+			Timeout: defaultSessionQuerySearchTimeout,
 			Schema: ToolSchema{Name: "session_event_search", Description: "Search prior events in one authorized session; the current session excludes the active step performing this call.", Parameters: objectSchema(map[string]any{
 				"session_id": map[string]any{"type": "string"}, "query": map[string]any{"type": "string"}, "seq_from": map[string]any{"type": "integer"}, "seq_to": map[string]any{"type": "integer"},
 				"time_from": map[string]any{"type": "string"}, "time_to": map[string]any{"type": "string"}, "event_types": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "surfaces": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"current", "shadowed", "log-only"}}},
@@ -1282,22 +1905,19 @@ func registerSessionQueryTools(e *Engine) error {
 				if err := decodeToolArguments(call, &in); err != nil {
 					return ToolResult{}, err
 				}
+				targetID, err := sessionQueryToolTarget(call.SessionID, in.SessionID)
+				if err != nil {
+					return ToolResult{}, sessionQueryOperationError(err)
+				}
 				filters, err := buildEventSearchInputFilters(in.SeqFrom, in.SeqTo, in.TimeFrom, in.TimeTo, in.EventTypes, in.Surfaces)
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
-				rows, err := e.sessionQueryEventSearchWithOptions(call.SessionID, in.SessionID, in.Query, sessionQueryEventSearchOptions{max: defaultSessionQueryMaxResults, filters: filters, excludeActiveStep: true})
+				collection, err := e.sessionQueryEventSearchWithOptionsContext(ctx, call.SessionID, targetID, in.Query, sessionQueryEventSearchOptions{max: defaultSessionQueryMaxResults, filters: filters, excludeActiveStep: true})
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
-				target, _ := e.authorizeSessionQuery(call.SessionID, in.SessionID)
-				title := ""
-				if target != nil {
-					target.mu.Lock()
-					title = target.Title
-					target.mu.Unlock()
-				}
-				return sessionQueryFormattedResult(rows, formatEventSearchResults(rows, targetIDOrCaller(call.SessionID, in.SessionID), title)), nil
+				return sessionQueryFormattedResult(collection.items, formatEventSearchResults(collection.items, collection.sessionID, collection.title, collection.capped)), nil
 			},
 		},
 		{
@@ -1310,9 +1930,13 @@ func registerSessionQueryTools(e *Engine) error {
 				if err := decodeToolArguments(call, &in); err != nil {
 					return ToolResult{}, err
 				}
-				value, err := e.sessionQueryTrace(call.SessionID, in.SessionID)
+				targetID, err := sessionQueryToolTarget(call.SessionID, in.SessionID)
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
+				}
+				value, err := e.sessionQueryTraceContext(ctx, call.SessionID, targetID)
+				if err != nil {
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
 				return sessionQueryFormattedResult(value, formatSessionTraceResult(value)), nil
 			},
@@ -1327,9 +1951,13 @@ func registerSessionQueryTools(e *Engine) error {
 				if err := decodeToolArguments(call, &in); err != nil {
 					return ToolResult{}, err
 				}
-				value, err := e.sessionQueryEventTrace(call.SessionID, in.SessionID, in.Seq)
+				targetID, err := sessionQueryToolTarget(call.SessionID, in.SessionID)
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
+				}
+				value, err := e.sessionQueryEventTraceContext(ctx, call.SessionID, targetID, in.Seq)
+				if err != nil {
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
 				return sessionQueryFormattedResult(value, formatEventTraceResult(value)), nil
 			},
@@ -1344,6 +1972,10 @@ func registerSessionQueryTools(e *Engine) error {
 				if err := decodeToolArguments(call, &in); err != nil {
 					return ToolResult{}, err
 				}
+				targetID, err := sessionQueryToolTarget(call.SessionID, in.SessionID)
+				if err != nil {
+					return ToolResult{}, sessionQueryOperationError(err)
+				}
 				before, after := 0, 0
 				if in.Before != nil {
 					before = *in.Before
@@ -1351,15 +1983,19 @@ func registerSessionQueryTools(e *Engine) error {
 				if in.After != nil {
 					after = *in.After
 				}
-				value, err := e.sessionQueryEventRead(call.SessionID, in.SessionID, in.Seq, before, after)
+				value, err := e.sessionQueryEventReadContext(ctx, call.SessionID, targetID, in.Seq, before, after)
 				if err != nil {
-					return ToolResult{}, err
+					return ToolResult{}, sessionQueryOperationError(err)
 				}
 				return sessionQueryFormattedResult(value, formatEventReadResult(value)), nil
 			},
 		},
 	}
-	for _, tool := range tools {
+	for index, tool := range tools {
+		tool.PresentationMeta = sessionQueryPresentationMeta
+		if index >= 2 {
+			tool.IsConcurrencySafe = alwaysConcurrencySafe
+		}
 		if err := e.RegisterTool(tool); err != nil {
 			return err
 		}
@@ -1392,22 +2028,27 @@ func buildSessionQueryFilters(in sessionQuerySearchInput) (sessionQuerySessionFi
 			return filters, fmt.Errorf("SESSION_QUERY_INVALID_RANGE: unsupported availability %q", value)
 		}
 	}
+	var exactFrom, exactTo *sessionQueryExactTime
 	if in.CreatedAtFrom != nil {
 		value, parseErr := parseSessionQueryTime("created_at_from", *in.CreatedAtFrom)
 		if parseErr != nil {
 			return filters, parseErr
 		}
-		filters.createdFrom = &value
+		exactFrom = &value
+		bound := sessionQueryLowerBound(value)
+		filters.createdFrom = &bound
 	}
 	if in.CreatedAtTo != nil {
 		value, parseErr := parseSessionQueryTime("created_at_to", *in.CreatedAtTo)
 		if parseErr != nil {
 			return filters, parseErr
 		}
-		filters.createdTo = &value
+		exactTo = &value
+		bound := sessionQueryUpperBound(value)
+		filters.createdTo = &bound
 	}
-	if err := validateQueryTimeRange("created_at", filters.createdFrom, filters.createdTo); err != nil {
-		return filters, err
+	if exactFrom != nil && exactTo != nil && compareSessionQueryTimes(*exactFrom, *exactTo) > 0 {
+		return filters, errors.New("SESSION_QUERY_INVALID_FILTER: session created_at range from must be less than or equal to to")
 	}
 	filters.event, err = buildSessionQueryEventFilters(in.EventSeqFrom, in.EventSeqTo, in.EventTimeFrom, in.EventTimeTo, in.EventTypes, in.EventSurfaces)
 	return filters, err

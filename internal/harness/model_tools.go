@@ -38,43 +38,63 @@ type SkillDefinition struct {
 }
 
 func registerModelTools(e *Engine) error {
-	tools := []Tool{
-		builtinAskUserTool(e),
-		builtinGetGoalTool(e),
-		builtinCreateGoalTool(e),
-		builtinUpdateGoalTool(e),
-		subagentReportTool(e),
+	tools := make([]Tool, 0, 12)
+	if e.hostPluginActive("@deepseek-ai/dsh-user-questions") {
+		tools = append(tools, builtinAskUserTool(e))
 	}
-	if e.agentTeams == nil {
+	if e.hostPluginActive("@deepseek-ai/dsh-plan-mode") {
+		tools = append(tools, builtinExitPlanModeTool(e))
+	}
+	if e.hostPluginActive("@deepseek-ai/dsh-tool-goal") {
+		tools = append(tools, builtinGetGoalTool(e), builtinCreateGoalTool(e), builtinUpdateGoalTool(e))
+	}
+	if e.hostPluginActive("@deepseek-ai/dsh-tool-subagent-report") {
+		tools = append(tools, subagentReportTool(e))
+	}
+	if e.agentTeams == nil && e.hostPluginActive("@deepseek-ai/dsh-tool-subagent-control") {
 		tools = append(tools, builtinSendMessageTool(e), builtinInterruptAgentTool(e), builtinListAgentsTool(e))
-	} else {
-		tools = append(tools, builtinAgentTeamTools(e)...)
+	} else if e.agentTeams != nil && e.hostPluginActive("@deepseek-ai/dsh-experimental-tool-agent-team") {
+		for _, teamTool := range builtinAgentTeamTools(e) {
+			if legacy, ok := legacyToolShadowedByAgentTeam(e, teamTool.Schema.Name); ok {
+				teamTool = muxAgentTeamTool(e, teamTool, legacy)
+			}
+			tools = append(tools, teamTool)
+		}
 	}
+	if err := registerTools(e, tools); err != nil {
+		return err
+	}
+	if e.hostPluginActive("@deepseek-ai/dsh-tool-subagent") {
+		configs := make([]SubagentToolConfig, 0, 2)
+		for _, config := range e.cfg.SubagentTools {
+			if config.Provider == "spawn" || config.Provider == "fork" {
+				configs = append(configs, config)
+			}
+		}
+		if len(configs) == 0 {
+			foregroundOnly := false
+			maxDepth := 3
+			configs = []SubagentToolConfig{
+				{Provider: "spawn", ToolName: "subagent", BackgroundMode: "continuable", MaxDepth: &maxDepth},
+				{Provider: "fork", ToolName: "subagent_fork", BackgroundMode: "continuable", EnableRunInBackground: &foregroundOnly, MaxDepth: &maxDepth},
+			}
+		}
+		for _, config := range configs {
+			if err := e.RegisterSubagentTool(config); err != nil {
+				return err
+			}
+		}
+	}
+	return registerDynamicCordisTools(e)
+}
+
+func registerTools(e *Engine, tools []Tool) error {
 	for _, tool := range tools {
 		if err := e.RegisterTool(tool); err != nil {
 			return err
 		}
 	}
-	configs := make([]SubagentToolConfig, 0, 2)
-	for _, config := range e.cfg.SubagentTools {
-		if config.Provider == "spawn" || config.Provider == "fork" {
-			configs = append(configs, config)
-		}
-	}
-	if len(configs) == 0 {
-		foregroundOnly := false
-		maxDepth := 3
-		configs = []SubagentToolConfig{
-			{Provider: "spawn", ToolName: "subagent", BackgroundMode: "continuable", MaxDepth: &maxDepth},
-			{Provider: "fork", ToolName: "subagent_fork", BackgroundMode: "continuable", EnableRunInBackground: &foregroundOnly, MaxDepth: &maxDepth},
-		}
-	}
-	for _, config := range configs {
-		if err := e.RegisterSubagentTool(config); err != nil {
-			return err
-		}
-	}
-	return registerDynamicCordisTools(e)
+	return nil
 }
 
 func jsonToolResult(value any) (ToolResult, error) {
@@ -161,6 +181,9 @@ func builtinAskUserTool(e *Engine) Tool {
 			if err := decodeToolArguments(call, &in); err != nil {
 				return ToolResult{}, err
 			}
+			if err := ctx.Err(); err != nil {
+				return ToolResult{}, err
+			}
 			if len(in.Questions) == 0 {
 				return ToolResult{}, errors.New("ask_user_question requires at least one question")
 			}
@@ -212,11 +235,14 @@ func builtinAskUserTool(e *Engine) Tool {
 func builtinGetGoalTool(e *Engine) Tool {
 	return Tool{
 		Schema: ToolSchema{Name: "get_goal", Description: "Read the current same-session goal, including its exact id and revision.", Parameters: objectSchema(map[string]any{}), Output: goalToolOutputSchema()},
-		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
-			if err := ctx.Err(); err != nil {
+		ExecuteRuntime: func(exec *ToolRunContext) (ToolResult, error) {
+			if err := decodeToolArguments(exec.Call, &struct{}{}); err != nil {
 				return ToolResult{}, err
 			}
-			goal, err := e.GetGoal(call.SessionID)
+			if _, _, _, err := goalToolExecution(e, exec.Call.SessionID); err != nil {
+				return ToolResult{}, err
+			}
+			goal, err := e.GetGoal(exec.Call.SessionID)
 			if err != nil {
 				return ToolResult{}, err
 			}
@@ -243,18 +269,18 @@ func builtinCreateGoalTool(e *Engine) Tool {
 			}, "objective"),
 			Output: goalToolOutputSchema(),
 		},
-		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		ExecuteRuntime: func(exec *ToolRunContext) (ToolResult, error) {
 			var in input
-			if err := decodeToolArguments(call, &in); err != nil {
+			if err := decodeToolArguments(exec.Call, &in); err != nil {
 				return ToolResult{}, err
 			}
-			if err := requireDirectHumanGoalTurn(e, call.SessionID); err != nil {
+			if err := requireDirectHumanGoalTurn(e, exec.Call.SessionID); err != nil {
 				return ToolResult{}, err
 			}
-			if _, err := e.goalMutation(call.SessionID, "", "create", in.Objective, "", 0, in.MaxGoalRounds); err != nil {
-				return ToolResult{}, err
+			if _, err := e.goalMutation(exec.Call.SessionID, "", "create", in.Objective, "", 0, in.MaxGoalRounds); err != nil {
+				return ToolResult{}, goalToolDomainError(err)
 			}
-			goal, _ := e.GetGoal(call.SessionID)
+			goal, _ := e.GetGoal(exec.Call.SessionID)
 			return jsonToolResult(map[string]any{"goal": goalWithoutActivation(*goal), "activation": goal.Activation})
 		},
 	}
@@ -283,14 +309,17 @@ func builtinUpdateGoalTool(e *Engine) Tool {
 			}, "goal_id", "revision", "action"),
 			Output: goalToolOutputSchema(),
 		},
-		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		ExecuteRuntime: func(exec *ToolRunContext) (ToolResult, error) {
 			var in input
-			if err := decodeToolArguments(call, &in); err != nil {
+			if err := decodeToolArguments(exec.Call, &in); err != nil {
 				return ToolResult{}, err
 			}
-			authority, err := goalToolAuthority(e, call.SessionID)
+			authority, err := goalToolAuthority(e, exec.Call.SessionID)
 			if err != nil {
 				return ToolResult{}, err
+			}
+			if in.GoalID == "" || strings.TrimSpace(in.GoalID) != in.GoalID || in.Revision < 1 {
+				return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "goal_id must be non-empty and revision must be a positive integer")
 			}
 			op := in.Action
 			if op == "blocked" {
@@ -299,62 +328,105 @@ func builtinUpdateGoalTool(e *Engine) Tool {
 			switch op {
 			case "edit":
 				if authority != "direct-human" {
-					return ToolResult{}, errors.New("this goal operation requires a direct human turn on a top-level agent")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_AUTHORITY_REQUIRED", "this goal operation requires a direct human turn on a top-level agent")
 				}
 				if in.BlockedReason != "" {
-					return ToolResult{}, errors.New("blocked_reason is valid only with action blocked")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "blocked_reason is valid only with action blocked")
 				}
 			case "pause", "resume":
 				if authority != "direct-human" {
-					return ToolResult{}, errors.New("this goal operation requires a direct human turn on a top-level agent")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_AUTHORITY_REQUIRED", "this goal operation requires a direct human turn on a top-level agent")
 				}
 				if in.Objective != "" || in.MaxGoalRounds != 0 || in.BlockedReason != "" {
-					return ToolResult{}, errors.New("objective and max_goal_rounds are valid only with action edit; blocked_reason is valid only with action blocked")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "objective and max_goal_rounds are valid only with action edit; blocked_reason is valid only with action blocked")
 				}
 			case "complete":
 				if in.Objective != "" || in.MaxGoalRounds != 0 || in.BlockedReason != "" {
-					return ToolResult{}, errors.New("complete accepts no replacement fields")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "complete accepts no replacement fields")
 				}
 			case "block":
 				if in.Objective != "" || in.MaxGoalRounds != 0 {
-					return ToolResult{}, errors.New("objective and max_goal_rounds are valid only with action edit")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "objective and max_goal_rounds are valid only with action edit")
 				}
 				if strings.TrimSpace(in.BlockedReason) == "" {
-					return ToolResult{}, errors.New("blocked_reason is required with action blocked")
+					return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "blocked_reason is required with action blocked")
 				}
 				if authority == "goal-round" {
-					goal, getErr := e.GetGoal(call.SessionID)
+					goal, getErr := e.GetGoal(exec.Call.SessionID)
 					if getErr != nil {
 						return ToolResult{}, getErr
 					}
-					if goal == nil || goal.RoundsStarted < goalBlockThreshold {
-						return ToolResult{}, fmt.Errorf("blocked requires at least %d consecutive goal rounds; current round is %d", goalBlockThreshold, goal.RoundsStarted)
+					s, _ := e.getSession(exec.Call.SessionID)
+					runtimeConfig, runtimeErr := e.runtimeForSession(s)
+					if runtimeErr != nil {
+						return ToolResult{}, runtimeErr
+					}
+					threshold := runtimeConfig.goalBlockThreshold
+					currentRound := 0
+					if goal != nil {
+						currentRound = goal.RoundsStarted
+					}
+					if currentRound < threshold {
+						return ToolResult{}, goalToolPolicyError("GOAL_TOOL_BLOCK_THRESHOLD", fmt.Sprintf("blocked requires at least %d consecutive goal rounds; current round is %d", threshold, currentRound))
 					}
 				}
 			default:
-				return ToolResult{}, errors.New("goal-invalid-operation")
+				return ToolResult{}, goalToolPolicyError("GOAL_TOOL_INVALID_UPDATE", "goal-invalid-operation")
 			}
-			if _, err := e.goalMutation(call.SessionID, in.GoalID, op, in.Objective, in.BlockedReason, in.Revision, in.MaxGoalRounds); err != nil {
-				return ToolResult{}, err
+			before, getErr := e.GetGoal(exec.Call.SessionID)
+			if getErr != nil {
+				return ToolResult{}, getErr
 			}
-			goal, _ := e.GetGoal(call.SessionID)
+			if _, err := e.goalMutation(exec.Call.SessionID, in.GoalID, op, in.Objective, in.BlockedReason, in.Revision, in.MaxGoalRounds); err != nil {
+				return ToolResult{}, goalToolDomainError(err)
+			}
+			goal, _ := e.GetGoal(exec.Call.SessionID)
+			if authority == "goal-round" && before != nil && (op == "complete" || op == "block") {
+				exec.DeferContext(goalWrapupContext(before.Objective, in.Action, in.BlockedReason))
+			}
 			return jsonToolResult(map[string]any{"goal": goalWithoutActivation(*goal), "activation": goal.Activation})
 		},
 	}
 }
 
 func goalToolAuthority(e *Engine, id string) (string, error) {
-	s, err := e.getSession(id)
+	s, events, start, err := goalToolExecution(e, id)
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
-	if s.Header.Origin == "subagent" {
-		s.mu.Unlock()
-		return "", errors.New("this goal operation requires a direct human turn on a top-level agent")
+	isRoot := s.Header.Origin != "subagent"
+	s.mu.Unlock()
+	goal, _ := e.GetGoal(id)
+	for _, event := range events[start+1:] {
+		if event.Type != "user/message" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		source, _ := data["source"].(map[string]any)
+		if isRoot && source["kind"] == "user" {
+			return "direct-human", nil
+		}
+		goalID, revision, round, ok := goalSource(source)
+		if ok && goal != nil && goal.ID == goalID && goal.Revision == revision && goal.RoundsStarted == round {
+			return "goal-round", nil
+		}
 	}
+	return "", goalToolPolicyError("GOAL_TOOL_AUTHORITY_REQUIRED", "complete and blocked require a direct human turn or the current goal round")
+}
+
+func goalToolExecution(e *Engine, id string) (*Session, []Event, int, error) {
+	s, err := e.getSession(id)
+	if err != nil {
+		return nil, nil, -1, err
+	}
+	s.mu.Lock()
+	running := s.Running
 	events := append([]Event(nil), s.Events...)
 	s.mu.Unlock()
+	if !running {
+		return nil, nil, -1, goalToolPolicyError("GOAL_TOOL_DRIVER_REQUIRED", "goal tools require the exact live calling agent inside its active driver")
+	}
 	start := -1
 	for i := len(events) - 1; i >= 0; i-- {
 		if events[i].Type == "turn/end" {
@@ -366,24 +438,9 @@ func goalToolAuthority(e *Engine, id string) (string, error) {
 		}
 	}
 	if start < 0 {
-		return "direct-human", nil
+		return nil, nil, -1, goalToolPolicyError("GOAL_TOOL_DRIVER_REQUIRED", "goal tools require an open model turn")
 	}
-	goal, _ := e.GetGoal(id)
-	for _, event := range events[start+1:] {
-		if event.Type != "user/message" {
-			continue
-		}
-		data, _ := event.Data.(map[string]any)
-		source, _ := data["source"].(map[string]any)
-		if source["kind"] == "user" {
-			return "direct-human", nil
-		}
-		goalID, revision, round, ok := goalSource(source)
-		if ok && goal != nil && goal.ID == goalID && goal.Revision == revision && goal.RoundsStarted == round {
-			return "goal-round", nil
-		}
-	}
-	return "", errors.New("complete and blocked require a direct human turn or the current goal round")
+	return s, events, start, nil
 }
 
 func requireDirectHumanGoalTurn(e *Engine, id string) error {
@@ -392,9 +449,57 @@ func requireDirectHumanGoalTurn(e *Engine, id string) error {
 		return err
 	}
 	if authority != "direct-human" {
-		return errors.New("this goal operation requires a direct human turn on a top-level agent")
+		return goalToolPolicyError("GOAL_TOOL_AUTHORITY_REQUIRED", "this goal operation requires a direct human turn on a top-level agent")
 	}
 	return nil
+}
+
+func goalToolPolicyError(code, message string) error {
+	return fmt.Errorf("%s: %s", code, message)
+}
+
+func goalToolDomainError(err error) error {
+	code := map[string]string{
+		"goal-not-found":          "GOAL_NOT_FOUND",
+		"goal-conflict":           "GOAL_STALE_REVISION",
+		"goal-already-exists":     "GOAL_ALREADY_EXISTS",
+		"goal-invalid-objective":  "GOAL_INVALID_OBJECTIVE",
+		"goal-invalid-max-rounds": "GOAL_INVALID_MAX_ROUNDS",
+		"goal-invalid-edit":       "GOAL_INVALID_EDIT",
+		"goal-invalid-transition": "GOAL_INVALID_TRANSITION",
+		"goal-invalid-block":      "GOAL_INVALID_BLOCK_REASON",
+		"goal-invalid-operation":  "GOAL_INVALID_OPERATION",
+	}[err.Error()]
+	if code == "" {
+		if strings.HasPrefix(err.Error(), "goal-persist-failed:") {
+			code = "GOAL_PERSIST_FAILED"
+		} else {
+			return err
+		}
+	}
+	return goalToolPolicyError(code, err.Error())
+}
+
+func goalWrapupContext(objective, operation, blockedReason string) ToolContext {
+	heading := fmt.Sprintf("Objective: %q\n", objective)
+	text := ""
+	if operation == "complete" {
+		text = "<goal_complete>\n" + heading +
+			"The goal is marked complete and this autonomous run is ending. Write the closing message to the user now: state the outcome, summarize what was done and how it was verified, and point to the concrete results (files, commits, or other artifacts). " +
+			"Report only what earlier rounds and tool results in this session actually establish; when a detail is not in the session, say so instead of inventing it. " +
+			"Note anything the user should review or do next. Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_complete>"
+	} else {
+		text = "<goal_blocked>\n" + heading + fmt.Sprintf("Blocked: %q\n", strings.TrimSpace(blockedReason)) +
+			"The goal is marked blocked and this autonomous run is ending. Write the closing message to the user now: state what has been completed so far, describe the concrete blocking condition and what you tried, and say exactly what you need from the user to continue. " +
+			"Report only what earlier rounds and tool results in this session actually establish; when a detail is not in the session, say so instead of inventing it. " +
+			"Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_blocked>"
+	}
+	return ToolContext{
+		Content: []ContentBlock{{Type: "text", Text: text}},
+		Source: map[string]any{
+			"kind": "plugin", "plugin": "tool-goal", "form": "notice", "summary": operation + ": " + objective,
+		},
+	}
 }
 
 func goalWithoutActivation(goal GoalView) map[string]any {
@@ -433,10 +538,14 @@ func inProcessSubagentTool(e *Engine, config SubagentToolConfig, fork bool) Tool
 		description += " This call waits for the result."
 	}
 	return Tool{
-		Schema: ToolSchema{Name: name, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
+		Schema:            ToolSchema{Name: name, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
+		IsConcurrencySafe: alwaysConcurrencySafe,
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
+				return ToolResult{}, err
+			}
+			if err := ctx.Err(); err != nil {
 				return ToolResult{}, err
 			}
 			in.Description, in.Prompt = strings.TrimSpace(in.Description), strings.TrimSpace(in.Prompt)
@@ -455,7 +564,12 @@ func inProcessSubagentTool(e *Engine, config SubagentToolConfig, fork bool) Tool
 				}
 			}
 			if background && !continuable {
-				jobID, err := startBackgroundInProcessSubagent(e, call.SessionID, in.Description, in.Prompt, fork, config)
+				request := SubagentStartRequest{
+					ParentSessionID: call.SessionID, CWD: call.Workspace, Label: in.Description,
+					Prompt: []ContentBlock{{Type: "text", Text: in.Prompt}}, MaxDepth: config.MaxDepth,
+					AgentOptions: config.AgentOptions, Persona: config.Persona, ToolFilter: config.ToolFilter,
+				}
+				jobID, err := startBackgroundSubagent(e, call.SessionID, in.Description, config.Provider, request)
 				if err != nil {
 					return ToolResult{}, err
 				}
@@ -463,31 +577,31 @@ func inProcessSubagentTool(e *Engine, config SubagentToolConfig, fork bool) Tool
 				result.Value = map[string]any{"kind": "background", "jobId": jobID}
 				return result, nil
 			}
-			mode := "one-shot"
-			if continuable {
-				mode = "continuable"
-			}
-			child, err := e.createModelSubagent(ctx, call.SessionID, in.Description, fork, mode, config)
-			if err != nil {
-				return ToolResult{}, err
-			}
-			request := PromptRequest{SessionID: child, Mode: "queue", Literal: true, Content: []PromptContentPart{{Type: "text", Text: in.Prompt}}}
 			if background {
-				go e.runContinuableModelSubagent(call.SessionID, child, request)
+				child, _, err := e.startContinuableModelSubagent(ctx, call.SessionID, in.Description, in.Prompt, fork, config)
+				if err != nil {
+					return ToolResult{}, err
+				}
 				result := textToolResult("started subagent " + child)
 				result.Value = map[string]any{"kind": "continuable", "subagentId": child}
 				return result, nil
 			}
-			output, err := e.Run(ctx, child, request)
+			request := SubagentStartRequest{
+				ParentSessionID: call.SessionID, CWD: call.Workspace, Label: in.Description,
+				Prompt: []ContentBlock{{Type: "text", Text: in.Prompt}}, MaxDepth: config.MaxDepth,
+				AgentOptions: config.AgentOptions, Persona: config.Persona, ToolFilter: config.ToolFilter,
+			}
+			run, err := e.StartSubagent(ctx, config.Provider, request)
 			if err != nil {
 				return ToolResult{}, err
 			}
-			blocks := []ContentBlock{}
-			if output != "" {
-				blocks = append(blocks, ContentBlock{Type: "text", Text: output})
+			settled, err := settleForegroundSubagent(run)
+			if err != nil {
+				return ToolResult{}, err
 			}
+			output := contentValueText(settled.Output)
 			result := textToolResult(output)
-			result.Value = map[string]any{"kind": "foreground", "runId": child, "output": blocks}
+			result.Value = map[string]any{"kind": "foreground", "runId": run.ID, "output": settled.Output}
 			return result, nil
 		},
 	}
@@ -498,6 +612,36 @@ type sessionToolRestriction struct {
 	deny     map[string]bool
 	allowSet bool
 	denySet  bool
+}
+
+type delegatedPolicyOverrides struct {
+	sandboxMode string
+}
+
+func captureDelegatedPolicyOverrides(events []Event) delegatedPolicyOverrides {
+	overrides := delegatedPolicyOverrides{}
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].Type != "sandbox/mode" {
+			continue
+		}
+		data, _ := events[index].Data.(map[string]any)
+		mode, _ := data["mode"].(string)
+		if sandboxPresetModes[mode] != "" {
+			overrides.sandboxMode = mode
+		}
+		break
+	}
+	return overrides
+}
+
+func (e *Engine) appendDelegatedPolicyOverrides(child *Session, overrides delegatedPolicyOverrides) error {
+	if overrides.sandboxMode != "" {
+		if _, err := e.appendEvent(child, "sandbox/mode", map[string]any{"mode": overrides.sandboxMode, "source": "delegation"}); err != nil {
+			return err
+		}
+	}
+	_, err := e.appendEvent(child, "approval/policy", map[string]any{"policy": "never", "source": "delegation"})
+	return err
 }
 
 func (restriction *sessionToolRestriction) allows(name string) bool {
@@ -548,54 +692,49 @@ func (e *Engine) resolveSessionToolRestriction(filter *SubagentToolFilter) (*ses
 }
 
 func (e *Engine) createModelSubagent(ctx context.Context, parentID, label string, fork bool, mode string, config SubagentToolConfig) (string, error) {
-	return e.createModelSubagentWithID(ctx, parentID, "", label, fork, mode, config)
+	return e.createModelSubagentWithSetup(ctx, parentID, label, fork, mode, config, nil)
 }
 
-func modelSubagentDescriptor(mode, label string, selection ModelSelection, config SubagentToolConfig) map[string]any {
-	descriptor := map[string]any{
-		"version":  SubagentDescriptorVersion,
-		"mode":     mode,
-		"provider": config.Provider,
+func (e *Engine) createModelSubagentWithSetup(ctx context.Context, parentID, label string, fork bool, mode string, config SubagentToolConfig, setup func(*Session) error) (string, error) {
+	childID := newID("ses")
+	unlock := e.lockModelSubagent(childID)
+	defer unlock()
+	return e.createModelSubagentWithIDLocked(ctx, parentID, childID, label, fork, mode, config, setup)
+}
+
+func modelSubagentDescriptor(mode, label string, selection ModelSelection, config SubagentToolConfig) (SubagentDescriptorData, error) {
+	descriptor := SubagentDescriptorData{Mode: mode, Provider: config.Provider}
+	if label != "" || mode == "continuable" {
+		descriptor.Label = descriptorString(label)
 	}
-	if label != "" {
-		descriptor["label"] = label
-	}
-	if mode != "continuable" {
-		return descriptor
-	}
-	descriptor["agentProvider"], descriptor["agentModel"] = selection.Provider, selection.Model
-	if config.Persona != "" {
-		descriptor["persona"] = config.Persona
-	}
-	if config.ToolFilter != nil {
-		filter := map[string]any{}
-		if config.ToolFilter.Allow != nil {
-			filter["allow"] = append([]string(nil), config.ToolFilter.Allow...)
+	if mode == "continuable" {
+		descriptor.AgentProvider = descriptorString(selection.Provider)
+		descriptor.AgentModel = descriptorString(selection.Model)
+		if config.Persona != "" {
+			descriptor.Persona = descriptorString(config.Persona)
 		}
-		if config.ToolFilter.Deny != nil {
-			filter["deny"] = append([]string(nil), config.ToolFilter.Deny...)
-		}
-		descriptor["toolFilter"] = filter
+		descriptor.ToolFilter = config.ToolFilter
 	}
-	return descriptor
+	return SnapshotSubagentDescriptor(descriptor)
 }
 
 func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childID, label string, fork bool, mode string, config SubagentToolConfig) (string, error) {
-	if config.MaxDepth != nil {
-		depth, err := e.sessionDepth(parentID)
-		if err != nil {
-			return "", err
-		}
-		if depth >= *config.MaxDepth {
-			return "", fmt.Errorf("subagent maximum depth %d reached", *config.MaxDepth)
-		}
+	if childID == "" {
+		childID = newID("ses")
 	}
+	unlock := e.lockModelSubagent(childID)
+	defer unlock()
+	return e.createModelSubagentWithIDLocked(ctx, parentID, childID, label, fork, mode, config, nil)
+}
+
+func (e *Engine) createModelSubagentWithIDLocked(ctx context.Context, parentID, childID, label string, fork bool, mode string, config SubagentToolConfig, setup func(*Session) error) (string, error) {
 	parent, err := e.getSession(parentID)
 	if err != nil {
 		return "", err
 	}
 	parent.mu.Lock()
 	cwd, preset, depth, selection := parent.Header.CWD, sessionAgentPreset(parent.Header, parent.Events), parent.Header.DelegationDepth, parent.Model
+	inheritedPolicy := captureDelegatedPolicyOverrides(parent.Events)
 	available := parent.attached && !parent.draining
 	var events []Event
 	if fork {
@@ -605,6 +744,13 @@ func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childI
 	if !available {
 		return "", errors.New("subagent-parent-unavailable: parent session is not resident")
 	}
+	if int64(depth) >= maxJSONSafeInteger {
+		return "", errors.New("subagent child depth exceeds the safe-integer range")
+	}
+	childDepth := depth + 1
+	if config.MaxDepth != nil && childDepth > *config.MaxDepth {
+		return "", fmt.Errorf("subagent depth %d exceeds maxDepth %d", childDepth, *config.MaxDepth)
+	}
 	if fork {
 		cut := completedTurnCut(events, nil)
 		if cut >= 0 {
@@ -612,6 +758,12 @@ func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childI
 		} else {
 			events = nil
 		}
+	}
+	e.mu.RLock()
+	existing := e.sessions[childID]
+	e.mu.RUnlock()
+	if existing != nil {
+		return "", fmt.Errorf("subagent %q already exists", childID)
 	}
 	restriction, err := e.resolveSessionToolRestriction(config.ToolFilter)
 	if err != nil {
@@ -628,18 +780,23 @@ func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childI
 			selection.MaxTokens = config.AgentOptions.MaxTokens
 		}
 	}
-	pinPermission := shouldPinPermissionSnapshot(preset)
-	if fork {
-		pinPermission = len(events) == 0
-	}
-	childID, err = e.createSession(ctx, SessionHeader{
+	childID, err = e.createSessionWithPresetAdoption(ctx, SessionHeader{
 		ID: childID, CWD: cwd, ParentSession: parentID, SeedLength: len(events), Origin: "subagent",
-		DelegationDepth: depth + 1, AgentPreset: preset, Mode: mode,
-	}, pinPermission)
+		DelegationDepth: childDepth, AgentPreset: preset, Mode: mode,
+	}, false, false, false)
 	if err != nil {
 		return "", err
 	}
 	child, _ := e.getSession(childID)
+	child.mu.Lock()
+	child.attached = false
+	child.mu.Unlock()
+	committed := false
+	defer func() {
+		if !committed {
+			e.rollbackUnpublishedModelSubagent(childID, child)
+		}
+	}()
 	child.mu.Lock()
 	child.Model = selection
 	child.Title = label
@@ -654,7 +811,18 @@ func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childI
 			return "", err
 		}
 	}
-	if _, err := e.appendEvent(child, "subagent/descriptor", modelSubagentDescriptor(mode, label, selection, config)); err != nil {
+	if err := e.appendDelegatedPolicyOverrides(child, inheritedPolicy); err != nil {
+		return "", err
+	}
+	descriptor, err := modelSubagentDescriptor(mode, label, selection, config)
+	if err != nil {
+		return "", err
+	}
+	if mode == "one-shot" {
+		child.mu.Lock()
+		child.initialSubagentDescriptor = &descriptor
+		child.mu.Unlock()
+	} else if _, err := e.appendEvent(child, "subagent/descriptor", descriptor.eventData()); err != nil {
 		return "", err
 	}
 	if label = NormalizeSessionTitle(label, defaultTitleMaxBytes); label != "" {
@@ -662,7 +830,51 @@ func (e *Engine) createModelSubagentWithID(ctx context.Context, parentID, childI
 			return "", err
 		}
 	}
+	if setup != nil {
+		if err := setup(child); err != nil {
+			return "", err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	committed = true
+	e.publishDeferredSession(child)
 	return childID, nil
+}
+
+func (e *Engine) rollbackUnpublishedModelSubagent(childID string, child *Session) {
+	if child == nil {
+		return
+	}
+	child.mu.Lock()
+	child.attached = false
+	child.mu.Unlock()
+	e.releaseSessionScopedTools(childID)
+	_ = e.subagentActivationSetups.releaseChild(child)
+	_ = e.terminals.closeOwner(childID)
+	e.shells.closeOwner(childID)
+	e.mu.Lock()
+	if e.sessions[childID] == child {
+		delete(e.sessions, childID)
+	}
+	_ = e.saveStateLocked()
+	e.mu.Unlock()
+	rollbackSessionStoreCreate(child.store, childID)
+}
+
+func (e *Engine) rollbackCreatedModelSubagent(childID string, child *Session) {
+	if child == nil {
+		return
+	}
+	_ = detachSDKSession(e, childID)
+	e.mu.Lock()
+	if e.sessions[childID] == child {
+		delete(e.sessions, childID)
+	}
+	_ = e.saveStateLocked()
+	e.mu.Unlock()
+	rollbackSessionStoreCreate(child.store, childID)
 }
 
 func startBackgroundInProcessSubagent(e *Engine, owner, label, prompt string, fork bool, config SubagentToolConfig) (string, error) {
@@ -677,7 +889,15 @@ func startBackgroundInProcessSubagent(e *Engine, owner, label, prompt string, fo
 		var mu sync.Mutex
 		finished := false
 		go func() {
-			output, runErr := e.Run(ctx, child, PromptRequest{SessionID: child, Mode: "queue", Literal: true, Content: []PromptContentPart{{Type: "text", Text: prompt}}})
+			startSeq := e.modelSubagentEventCount(child)
+			runOutput, runErr := e.Run(ctx, child, PromptRequest{SessionID: child, Mode: "queue", Literal: true, Content: []PromptContentPart{{Type: "text", Text: prompt}}})
+			blocks := e.modelSubagentOutputSince(child, startSeq)
+			output := contentValueText(blocks)
+			if output == "" {
+				output = runOutput
+			}
+			disposeErr := e.disposeOneShotModelSubagent(child)
+			runErr = errors.Join(runErr, disposeErr)
 			result := managedJobResult{Status: jobCompleted, Output: output}
 			if runErr != nil {
 				result.Status, result.Output, result.Detail = jobFailed, "", runErr.Error()
@@ -707,13 +927,32 @@ func startBackgroundInProcessSubagent(e *Engine, owner, label, prompt string, fo
 	})
 }
 
-func (e *Engine) runContinuableModelSubagent(parentID, childID string, request PromptRequest) {
-	output, err := e.Run(context.Background(), childID, request)
-	e.notifyModelSubagentSettlement(parentID, childID, output, err)
+func (e *Engine) modelSubagentEventCount(id string) int {
+	session, err := e.getSession(id)
+	if err != nil {
+		return 0
+	}
+	session.mu.Lock()
+	count := len(session.Events)
+	session.mu.Unlock()
+	return count
 }
 
-func (e *Engine) notifyModelSubagentSettlement(parentID, childID, output string, runErr error) {
-	reason := e.modelSubagentStopReason(childID, runErr)
+func (e *Engine) modelSubagentOutputSince(id string, start int) []ContentBlock {
+	session, err := e.getSession(id)
+	if err != nil {
+		return nil
+	}
+	session.mu.Lock()
+	events := append([]Event(nil), session.Events...)
+	session.mu.Unlock()
+	if start < 0 || start > len(events) {
+		return nil
+	}
+	return finalAssistantOutput(events[start:])
+}
+
+func (e *Engine) notifyModelSubagentSettlement(parentID, childID string, output []ContentBlock, reason string) {
 	subject := "Background subagent " + childID
 	summary := map[string]string{
 		"completed":  subject + " finished and will do no further work unless you send it more.",
@@ -725,29 +964,39 @@ func (e *Engine) notifyModelSubagentSettlement(parentID, childID, output string,
 	if summary == "" {
 		summary = subject + " ended abnormally (" + reason + ") before it finished."
 	}
-	content := []PromptContentPart{{Type: "text", Text: summary}}
-	if strings.TrimSpace(output) == "" {
-		content = append(content, PromptContentPart{Type: "text", Text: "It left no closing message."})
+	content := []ContentBlock{{Type: "text", Text: summary}}
+	if len(output) == 0 {
+		content = append(content, ContentBlock{Type: "text", Text: "It left no closing message."})
 	} else {
-		content = append(content, PromptContentPart{Type: "text", Text: "Its closing message:"}, PromptContentPart{Type: "text", Text: output})
+		content = append(content, ContentBlock{Type: "text", Text: "Its closing message:"})
+		content = append(content, cloneContentBlocks(output)...)
 	}
 	parent, err := e.getSession(parentID)
 	if err != nil {
 		return
 	}
 	parent.mu.Lock()
-	running := parent.Running
+	running, attached := parent.Running, parent.attached
 	parent.mu.Unlock()
-	request := PromptRequest{SessionID: parentID, Mode: "queue", Literal: true, Content: content, Source: map[string]any{
+	if !attached {
+		return
+	}
+	e.modelSubagentMu.Lock()
+	parentActivation := e.modelSubagentActivations[parentID]
+	parentDisposing := parentActivation != nil && parentActivation.disposing
+	e.modelSubagentMu.Unlock()
+	source := map[string]any{
 		"kind": "subagent-settled", "form": "notice", "summary": summary, "senderSessionId": childID,
-	}}
+	}
+	if parentDisposing {
+		_, _ = e.enqueueTeamPrompt(parent, content, source, "next-step", false)
+		return
+	}
+	target := "next-turn"
 	if running {
-		request.Mode = "steer"
+		target = "next-step"
 	}
-	if _, _, err := e.enqueuePrompt(context.Background(), parentID, request, false); err != nil && request.Mode == "steer" {
-		request.Mode = "queue"
-		_, _, _ = e.enqueuePrompt(context.Background(), parentID, request, false)
-	}
+	_, _ = e.enqueueTeamPrompt(parent, content, source, target, true)
 }
 
 func (e *Engine) modelSubagentStopReason(childID string, runErr error) string {
@@ -793,30 +1042,6 @@ func (e *Engine) setSessionTitle(id, title string) {
 	_, _ = e.appendEvent(s, "session/title", map[string]any{"title": title, "messageSeqs": []int{}, "source": map[string]any{"kind": "user"}})
 }
 
-func (e *Engine) sessionDepth(id string) (int, error) {
-	depth := 0
-	seen := map[string]bool{}
-	for id != "" {
-		if seen[id] {
-			return 0, errors.New("subagent lineage cycle")
-		}
-		seen[id] = true
-		s, err := e.getSession(id)
-		if err != nil {
-			return 0, err
-		}
-		s.mu.Lock()
-		parent := s.Header.ParentSession
-		s.mu.Unlock()
-		if parent == "" {
-			return depth, nil
-		}
-		depth++
-		id = parent
-	}
-	return depth, nil
-}
-
 func builtinSendMessageTool(e *Engine) Tool {
 	type input struct {
 		SubagentID string `json:"subagent_id"`
@@ -855,6 +1080,14 @@ func builtinInterruptAgentTool(e *Engine) Tool {
 			if err := ctx.Err(); err != nil {
 				return ToolResult{}, err
 			}
+			e.modelSubagentMu.Lock()
+			activation := e.modelSubagentActivations[in.AgentID]
+			e.modelSubagentMu.Unlock()
+			if activation == nil || activation.disposing {
+				result := textToolResult("interrupt requested for agent " + in.AgentID)
+				result.Value = map[string]any{"accepted": true}
+				return result, nil
+			}
 			ok, err := e.isDescendant(call.SessionID, in.AgentID)
 			if err != nil {
 				return ToolResult{}, err
@@ -862,7 +1095,7 @@ func builtinInterruptAgentTool(e *Engine) Tool {
 			if !ok {
 				return ToolResult{}, errors.New("target agent is not a descendant of the caller")
 			}
-			if err := e.CancelSession(in.AgentID); err != nil {
+			if err := e.CancelAgent(in.AgentID, AgentCancelCause{Kind: "parent"}, CancelAgentOptions{KeepInbox: true}); err != nil {
 				return ToolResult{}, err
 			}
 			result := textToolResult("interrupt requested for agent " + in.AgentID)
@@ -905,8 +1138,22 @@ type agentListEntry struct {
 	ID     string `json:"id"`
 	Label  string `json:"label"`
 	Status string `json:"status"`
+	Reason string `json:"reason"`
 	Parent string `json:"parent,omitempty"`
 	Depth  int    `json:"depth,omitempty"`
+}
+
+func (entry agentListEntry) value(descendants bool) map[string]any {
+	value := map[string]any{"kind": entry.Kind, "id": entry.ID}
+	if entry.Kind == "diagnostic" {
+		value["reason"] = entry.Reason
+	} else {
+		value["label"], value["status"] = entry.Label, entry.Status
+	}
+	if descendants {
+		value["parent"], value["depth"] = entry.Parent, entry.Depth
+	}
+	return value
 }
 
 func builtinListAgentsTool(e *Engine) Tool {
@@ -914,10 +1161,16 @@ func builtinListAgentsTool(e *Engine) Tool {
 		Scope string `json:"scope"`
 	}
 	return Tool{
-		Schema: ToolSchema{Name: "list_agents", Description: "List continuable background subagents by durable id and label.", Parameters: objectSchema(map[string]any{"scope": map[string]any{"type": "string", "enum": []string{"children", "descendants"}}}), Output: map[string]any{"type": "array", "items": objectSchema(map[string]any{
-			"kind": map[string]any{"type": "string"}, "id": map[string]any{"type": "string"}, "label": map[string]any{"type": "string"}, "status": map[string]any{"type": "string"},
-			"parent": map[string]any{"type": "string"}, "depth": map[string]any{"type": "integer"},
-		}, "kind", "id", "label", "status")}},
+		Schema: ToolSchema{Name: "list_agents", Description: "List continuable background subagents by durable id and label. Status is running for active work, idle for a resident agent between turns, and ready for a resumable conversation that is only in storage. Children that cannot be interpreted are returned as diagnostics. Scope descendants walks the complete session tree in stable pre-order; only depth-1 children accept send_message.", Parameters: objectSchema(map[string]any{"scope": map[string]any{"type": "string", "enum": []string{"children", "descendants"}}}), Output: map[string]any{"type": "array", "items": map[string]any{"oneOf": []any{
+			objectSchema(map[string]any{
+				"kind": map[string]any{"type": "string", "const": "child"}, "id": map[string]any{"type": "string"}, "label": map[string]any{"type": "string"},
+				"status": map[string]any{"type": "string", "enum": []string{"running", "idle", "ready"}}, "parent": map[string]any{"type": "string"}, "depth": map[string]any{"type": "integer"},
+			}, "kind", "id", "label", "status"),
+			objectSchema(map[string]any{
+				"kind": map[string]any{"type": "string", "const": "diagnostic"}, "id": map[string]any{"type": "string"},
+				"reason": map[string]any{"type": "string", "enum": []string{"corrupt", "unsupported", "unavailable"}}, "parent": map[string]any{"type": "string"}, "depth": map[string]any{"type": "integer"},
+			}, "kind", "id", "reason"),
+		}}}},
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
@@ -929,86 +1182,66 @@ func builtinListAgentsTool(e *Engine) Tool {
 			if in.Scope != "children" && in.Scope != "descendants" {
 				return ToolResult{}, errors.New("scope must be children or descendants")
 			}
+			if call.SessionID == "" {
+				return ToolResult{}, errors.New("list_agents requires a calling agent session")
+			}
 			entries, err := e.listModelAgents(ctx, call.SessionID, in.Scope == "descendants")
 			if err != nil {
 				return ToolResult{}, err
 			}
 			if len(entries) == 0 {
 				result := textToolResult("(no subagents)")
-				result.Value = []agentListEntry{}
+				result.Value = []map[string]any{}
 				return result, nil
 			}
 			lines := make([]string, 0, len(entries))
+			values := make([]map[string]any, 0, len(entries))
 			for _, entry := range entries {
 				at := ""
 				if in.Scope == "descendants" {
 					at = fmt.Sprintf(" parent=%s depth=%d", entry.Parent, entry.Depth)
 				}
-				lines = append(lines, fmt.Sprintf("%s [%s]%s — %s", entry.ID, entry.Status, at, entry.Label))
+				if entry.Kind == "diagnostic" {
+					lines = append(lines, fmt.Sprintf("%s [diagnostic: %s]%s", entry.ID, entry.Reason, at))
+				} else {
+					lines = append(lines, fmt.Sprintf("%s [%s]%s — %s", entry.ID, entry.Status, at, entry.Label))
+				}
+				values = append(values, entry.value(in.Scope == "descendants"))
 			}
 			result := textToolResult(strings.Join(lines, "\n"))
-			result.Value = entries
+			result.Value = values
 			return result, nil
 		},
 	}
 }
 
 func (e *Engine) listModelAgents(ctx context.Context, parentID string, descendants bool) ([]agentListEntry, error) {
-	if _, err := e.getSession(parentID); err != nil {
+	rows, _, err := e.listSubagentEntries(ctx, parentID, descendants)
+	if err != nil {
 		return nil, err
 	}
-	type row struct {
-		id, parent, origin, mode, label string
-		created                         int64
-		running, attached               bool
-	}
-	e.mu.RLock()
-	sessions := make([]*Session, 0, len(e.sessions))
-	for _, session := range e.sessions {
-		sessions = append(sessions, session)
-	}
-	e.mu.RUnlock()
-	rows := make([]row, 0, len(sessions))
-	for _, session := range sessions {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	result := make([]agentListEntry, 0, len(rows))
+	for _, row := range rows {
+		entry := agentListEntry{Kind: row.Kind, ID: row.ID}
+		if descendants {
+			entry.Parent, entry.Depth = row.ParentID, row.Depth
 		}
-		session.mu.Lock()
-		rows = append(rows, row{id: session.Header.ID, parent: session.Header.ParentSession, origin: session.Header.Origin, mode: session.Header.Mode, label: session.Title, created: session.Header.CreatedAt, running: session.Running, attached: session.attached})
-		session.mu.Unlock()
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].created != rows[j].created {
-			return rows[i].created < rows[j].created
-		}
-		return rows[i].id < rows[j].id
-	})
-	children := map[string][]row{}
-	for _, item := range rows {
-		if item.origin == "subagent" && item.mode == "continuable" {
-			children[item.parent] = append(children[item.parent], item)
-		}
-	}
-	result := []agentListEntry{}
-	var visit func(string, int)
-	visit = func(parent string, depth int) {
-		for _, item := range children[parent] {
-			status := "ready"
-			if item.running {
-				status = "running"
-			} else if item.attached {
-				status = "idle"
-			}
-			entry := agentListEntry{Kind: "child", ID: item.id, Label: item.label, Status: status}
-			if descendants {
-				entry.Parent, entry.Depth = parent, depth
-			}
+		if row.Kind == "diagnostic" {
+			entry.Reason = row.Reason
 			result = append(result, entry)
-			if descendants {
-				visit(item.id, depth+1)
-			}
+			continue
 		}
+		if row.Mode != "continuable" {
+			continue
+		}
+		entry.Label = row.Label
+		entry.Status = "ready"
+		if row.running {
+			entry.Status = "running"
+		} else if row.attached {
+			entry.Status = "idle"
+		}
+		result = append(result, entry)
 	}
-	visit(parentID, 1)
 	return result, nil
 }

@@ -11,6 +11,20 @@ import (
 	harness "github.com/xxnuo/deepseek-harness-go"
 )
 
+func stringPointerValue(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func intPointerValue(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
 func TestRuntimeProfileMapsE2BHooksWebAndAllPromptsTitle(t *testing.T) {
 	composed := testComposition(t, `
 - id: e2b-owner
@@ -37,6 +51,9 @@ func TestRuntimeProfileMapsE2BHooksWebAndAllPromptsTitle(t *testing.T) {
 - id: exa
   name: '@deepseek-ai/dsh-web-search-exa'
   config: {apiKey: exa-key, baseURL: https://exa.test, searchType: neural, numResults: 9, highlightsPerResult: 2}
+- id: deepseek-search
+  name: '@deepseek-ai/dsh-web-search-deepseek'
+  config: {apiKey: search-key, apiKeyEnv: SEARCH_KEY, baseURL: https://deepseek-search.test/v1, model: search-model, apiVersion: '2025-01-01', maxTokens: 123, maxUses: 4}
 - id: perplexity
   name: '@deepseek-ai/dsh-web-search-perplexity'
   config: {apiKey: pplx-key, baseURL: https://pplx.test, model: sonar-pro, maxTokens: 2048, searchRecency: week}
@@ -45,7 +62,7 @@ func TestRuntimeProfileMapsE2BHooksWebAndAllPromptsTitle(t *testing.T) {
   config: {maxUrlLength: 4096, maxResponseBytes: 12345, maxBodyChars: 678, timeoutMs: 1234, maxRedirects: 0, userAgent: custom-fetch-agent}
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
-  config: {search: false, fetch: true, searchMaxResults: 7, fetchTimeoutMs: 1500, searchTimeoutMs: 1600, fetchMaxOutputChars: 900}
+  config: {search: false, fetch: true, searchMaxResults: 7, searchMaxQueries: 3, fetchTimeoutMs: 1500, searchTimeoutMs: 1600, fetchMaxOutputChars: 900}
 `)
 	if err := composed.validate(); err != nil {
 		t.Fatal(err)
@@ -66,13 +83,17 @@ func TestRuntimeProfileMapsE2BHooksWebAndAllPromptsTitle(t *testing.T) {
 	if cfg.ExaSearch.APIKey != "exa-key" || cfg.ExaSearch.BaseURL != "https://exa.test" || cfg.ExaSearch.SearchType != "neural" || cfg.ExaSearch.NumResults != 9 || cfg.ExaSearch.HighlightsPerResult != 2 {
 		t.Fatalf("Exa config = %#v", cfg.ExaSearch)
 	}
+	deepseek := cfg.DeepSeekWebSearch
+	if deepseek.APIKey == nil || *deepseek.APIKey != "search-key" || deepseek.APIKeyEnv == nil || *deepseek.APIKeyEnv != "SEARCH_KEY" || deepseek.BaseURL == nil || *deepseek.BaseURL != "https://deepseek-search.test/v1" || deepseek.Model == nil || *deepseek.Model != "search-model" || deepseek.APIVersion == nil || *deepseek.APIVersion != "2025-01-01" || deepseek.MaxTokens == nil || *deepseek.MaxTokens != 123 || deepseek.MaxUses == nil || *deepseek.MaxUses != 4 {
+		t.Fatalf("DeepSeek web search config = apiKey=%v apiKeyEnv=%v baseURL=%v model=%v apiVersion=%v maxTokens=%v maxUses=%v", stringPointerValue(deepseek.APIKey), stringPointerValue(deepseek.APIKeyEnv), stringPointerValue(deepseek.BaseURL), stringPointerValue(deepseek.Model), stringPointerValue(deepseek.APIVersion), intPointerValue(deepseek.MaxTokens), intPointerValue(deepseek.MaxUses))
+	}
 	if cfg.PerplexitySearch.APIKey != "pplx-key" || cfg.PerplexitySearch.BaseURL != "https://pplx.test" || cfg.PerplexitySearch.Model != "sonar-pro" || cfg.PerplexitySearch.MaxTokens != 2048 || cfg.PerplexitySearch.SearchRecency != "week" {
 		t.Fatalf("Perplexity config = %#v", cfg.PerplexitySearch)
 	}
 	if cfg.HTTPWebFetch.MaxURLLength != 4096 || cfg.HTTPWebFetch.MaxResponseBytes != 12345 || cfg.HTTPWebFetch.MaxBodyChars != 678 || cfg.HTTPWebFetch.Timeout != 1234*time.Millisecond || cfg.HTTPWebFetch.MaxRedirects != 0 || cfg.HTTPWebFetch.UserAgent != "custom-fetch-agent" {
 		t.Fatalf("HTTP fetch config = %#v", cfg.HTTPWebFetch)
 	}
-	if cfg.WebTools == nil || cfg.WebTools.SearchEnabled || !cfg.WebTools.FetchEnabled || cfg.WebTools.SearchMaxResults != 7 || cfg.WebTools.FetchTimeout != 1500*time.Millisecond || cfg.WebTools.SearchTimeout != 1600*time.Millisecond || cfg.WebTools.FetchMaxOutputChars != 900 {
+	if cfg.WebTools == nil || cfg.WebTools.SearchEnabled || !cfg.WebTools.FetchEnabled || cfg.WebTools.SearchMaxResults != 7 || cfg.WebTools.SearchMaxQueries != 3 || cfg.WebTools.FetchTimeout != 1500*time.Millisecond || cfg.WebTools.SearchTimeout != 1600*time.Millisecond || cfg.WebTools.FetchMaxOutputChars != 900 {
 		t.Fatalf("web tool config = %#v", cfg.WebTools)
 	}
 
@@ -87,6 +108,51 @@ func TestRuntimeProfileMapsE2BHooksWebAndAllPromptsTitle(t *testing.T) {
 	defer engine.Close()
 	if !hasTool(engine.ListTools(), "web_fetch") {
 		t.Fatal("HTTP fetch profile did not register web_fetch")
+	}
+}
+
+func TestRuntimeProfileMapsOptionalToolPolicies(t *testing.T) {
+	composed := testComposition(t, `
+- id: timeout
+  name: '@deepseek-ai/dsh-tool-call-timeout-policy'
+- id: todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config: {allowParallelInProgress: false}
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	if cfg.ToolTimeoutPolicyEnabled == nil || !*cfg.ToolTimeoutPolicyEnabled {
+		t.Fatal("timeout policy should be enabled")
+	}
+	if cfg.TodoAllowParallelInProgress == nil || *cfg.TodoAllowParallelInProgress {
+		t.Fatal("todo parallel policy should be disabled")
+	}
+}
+
+func TestRuntimeProfileRequiresTodoParallelPolicy(t *testing.T) {
+	composed := testComposition(t, `
+- id: todo
+  name: '@deepseek-ai/dsh-tool-todo'
+`)
+	if err := composed.validate(); err == nil || !strings.Contains(err.Error(), "allowParallelInProgress is required") {
+		t.Fatalf("missing todo policy error = %v", err)
+	}
+}
+
+func TestRuntimeProfileMapsJobDeliveryPolicy(t *testing.T) {
+	composed := testComposition(t, `
+- id: jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+  config: {waitTimeoutMs: 1200, maxWaitTimeoutMs: 5000, completionDelivery: quiet, maxConsecutiveWakes: 4}
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	config := engineConfig(&profileLoader{home: t.TempDir()}, composed).Jobs
+	if config.WaitTimeoutMs != 1200*time.Millisecond || config.MaxWaitTimeoutMs != 5*time.Second || config.CompletionDelivery != "quiet" || config.MaxConsecutiveWakes != 4 {
+		t.Fatalf("jobs config = %#v", config)
 	}
 }
 
@@ -306,6 +372,7 @@ func TestRuntimeProfileRejectsUnsupportedOrIncompleteConfig(t *testing.T) {
 		{"storage service", "- id: sqlite\n  name: '@deepseek-ai/dsh-storage-sqlite'\n  config: {path: ':memory:'}\n", "require an enabled"},
 		{"storage route", "- id: storage\n  name: '@deepseek-ai/dsh-storage'\n- id: domain\n  name: '@deepseek-ai/dsh-storage-domain'\n  config: {backend: sqlite}\n", "is not mounted"},
 		{"HTTP limits", "- id: fetch\n  name: '@deepseek-ai/dsh-web-fetch-http'\n  config: {timeoutMs: 0}\n", "must be positive"},
+		{"web query limit", "- id: tools\n  name: '@deepseek-ai/dsh-tool-web'\n  config: {searchMaxQueries: 0}\n", "must be positive integers"},
 		{"file reference max results", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {maxResults: 0}\n", "maxResults must be a positive safe integer"},
 		{"file reference max entries", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {maxEntries: 0}\n", "maxEntries must be a positive safe integer"},
 		{"file reference excluded directory", "- id: refs\n  name: '@deepseek-ai/dsh-file-reference-local'\n  config: {excludedDirectories: ['bad/path']}\n", "must be non-empty directory basenames"},
@@ -313,7 +380,6 @@ func TestRuntimeProfileRejectsUnsupportedOrIncompleteConfig(t *testing.T) {
 		{"Agent Teams fractional task limit", "- id: teams\n  name: '@deepseek-ai/dsh-experimental-agent-team'\n  config: {maxTasks: 1.5}\n", "invalid config"},
 		{"Agent Teams tool owner", "- id: tools\n  name: '@deepseek-ai/dsh-experimental-tool-agent-team'\n", "requires an enabled"},
 		{"Agent Teams provider", "- id: teams\n  name: '@deepseek-ai/dsh-experimental-agent-team'\n- id: tools\n  name: '@deepseek-ai/dsh-experimental-tool-agent-team'\n  config: {freshProvider: ''}\n", "freshProvider must be non-empty"},
-		{"missing selected provider", "- id: web\n  name: '@deepseek-ai/dsh-web'\n  config: {searchProvider: exa}\n", "is not mounted"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -322,6 +388,43 @@ func TestRuntimeProfileRejectsUnsupportedOrIncompleteConfig(t *testing.T) {
 				t.Fatalf("validate() = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestProfileWebProviderSelectionDefersToRuntime(t *testing.T) {
+	t.Setenv("DSH_WEB_SEARCH_PROVIDER", "env-provider")
+	t.Setenv("DSH_WEB_FETCH_PROVIDER", "")
+	composed := testComposition(t, "- id: web\n  name: '@deepseek-ai/dsh-web'\n")
+	if err := composed.validate(); err != nil {
+		t.Fatalf("profile with no provider config was rejected: %v", err)
+	}
+	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	if cfg.WebSearchProvider != "env-provider" || cfg.WebFetchProvider != "" {
+		t.Fatalf("environment provider selection = %q/%q", cfg.WebSearchProvider, cfg.WebFetchProvider)
+	}
+
+	composed = testComposition(t, "- id: web\n  name: '@deepseek-ai/dsh-web'\n  config: {searchProvider: custom-search, fetchProvider: custom-fetch}\n")
+	if err := composed.validate(); err != nil {
+		t.Fatalf("custom provider profile was rejected during composition: %v", err)
+	}
+	cfg = engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	if cfg.WebSearchProvider != "custom-search" || cfg.WebFetchProvider != "custom-fetch" {
+		t.Fatalf("profile provider selection = %q/%q", cfg.WebSearchProvider, cfg.WebFetchProvider)
+	}
+
+	t.Setenv("DSH_WEB_SEARCH_PROVIDER", "")
+	composed = testComposition(t, "- id: web\n  name: '@deepseek-ai/dsh-web'\n")
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg = engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	engine, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	if got := engine.Config().WebSearchProvider; got != "" {
+		t.Fatalf("runtime normalized an unset profile provider to %q", got)
 	}
 }
 

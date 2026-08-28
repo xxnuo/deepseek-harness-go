@@ -193,6 +193,16 @@ func (s *SQLiteSessionStore) Append(ctx context.Context, id string, events []Eve
 	return s.appendImmediate(ctx, id, events)
 }
 
+func (s *SQLiteSessionStore) Flush(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.coordinator != nil {
+		return s.coordinator.flush(ctx, id)
+	}
+	return nil
+}
+
 func (s *SQLiteSessionStore) appendImmediate(ctx context.Context, id string, events []Event) error {
 	end, err := s.begin(ctx)
 	if err != nil {

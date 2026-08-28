@@ -6,14 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -22,13 +20,7 @@ import (
 )
 
 const (
-	workflowMaxAgents      = 1000
-	workflowMaxItems       = 4096
-	workflowSyncTimeout    = 5 * time.Second
-	workflowResultMaxChars = 50_000
-	ralphMaxRounds         = 64
-	ralphMaxHandoffChars   = 16_384
-	ralphMaxResultChars    = 16_384
+	workflowDefaultSyncTimeout = 5 * time.Second
 )
 
 const workflowDescription = "Run a JavaScript workflow script that orchestrates subagents at scale. Use this for work that fans out across many independent pieces, where orchestration as a script is clearer than delegating turn by turn. The script is a plain JavaScript async-function body and must end with return <value>. Available globals are agent(prompt, opts?), pipeline(items, ...stages), parallel(thunks), phase(title), log(message), and args. agent options are label, phase, schema, provider, and model. No filesystem, network, timers, or Node.js APIs are exposed; agents do the work and the script only coordinates them."
@@ -62,23 +54,56 @@ type workflowAgentOptions struct {
 }
 
 type workflowChildRequest struct {
-	parentID string
-	runID    string
-	seq      int
-	label    string
-	phase    string
-	prompt   string
-	provider string
-	model    string
-	schema   map[string]any
-	record   bool
-	runInfo  map[string]any
+	parentID         string
+	runID            string
+	seq              int
+	label            string
+	phase            string
+	prompt           string
+	subagentProvider string
+	disposeGrace     time.Duration
+	provider         string
+	model            string
+	schema           map[string]any
+	recorder         *workflowRecordState
+	runInfo          map[string]any
+}
+
+type workflowRecordState struct {
+	mu      sync.Mutex
+	enabled bool
+}
+
+func (state *workflowRecordState) append(e *Engine, session *Session, event string, data map[string]any) bool {
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.enabled {
+		return false
+	}
+	if _, err := e.appendEvent(session, event, data); err != nil {
+		state.enabled = false
+		return false
+	}
+	return true
 }
 
 type jsTask func() error
 
 func registerWorkflowTools(e *Engine) error {
-	for _, tool := range []Tool{builtinWorkflowTool(e), builtinRalphTool(e), builtinRunCodeTool(e)} {
+	tools := make([]Tool, 0, 3)
+	if e.hostPluginActive("@deepseek-ai/dsh-tool-workflow") {
+		tools = append(tools, builtinWorkflowTool(e))
+	}
+	if e.hostPluginActive("@deepseek-ai/dsh-tool-ralph") {
+		tools = append(tools, builtinRalphTool(e))
+	}
+	if e.hostPluginActive("@deepseek-ai/dsh-tools") {
+		tools = append(tools, builtinRunCodeTool(e))
+	}
+	for _, tool := range tools {
 		if err := e.RegisterTool(tool); err != nil {
 			return err
 		}
@@ -137,16 +162,19 @@ func builtinWorkflowTool(e *Engine) Tool {
 			if err != nil {
 				return ToolResult{}, err
 			}
-			runID := newID("workflow")
-			record := call.ParentCallID == ""
-			if record {
-				if _, err := e.appendEvent(session, "tool-workflow/run-start", map[string]any{"runId": runID, "name": meta.Name}); err != nil {
-					return ToolResult{}, err
-				}
+			runtimeConfig, err := e.runtimeForSession(session)
+			if err != nil {
+				return ToolResult{}, err
 			}
+			if e.GetSubagentProvider(runtimeConfig.workflowProvider) == nil {
+				return ToolResult{}, fmt.Errorf("no subagent provider registered for %q", runtimeConfig.workflowProvider)
+			}
+			runID := newID("workflow")
+			recorder := &workflowRecordState{enabled: call.ParentCallID == ""}
+			recorder.append(e, session, "tool-workflow/run-start", map[string]any{"runId": runID, "name": meta.Name})
 			runInfo := map[string]any{"id": runID, "meta": meta}
 			e.emitDynamicCordisScopedContained("", "workflow/start", runInfo)
-			value, agents, runErr := e.runWorkflowProgram(ctx, session, runID, runInfo, program, args, hasArgs, workflowMaxAgents, record)
+			value, agents, runErr := e.runWorkflowProgram(ctx, session, runID, runInfo, program, args, hasArgs, runtimeConfig, recorder)
 			stopReason := "completed"
 			if runErr != nil {
 				stopReason = "error"
@@ -159,11 +187,7 @@ func builtinWorkflowTool(e *Engine) Tool {
 				resultInfo["error"] = runErr.Error()
 			}
 			e.emitDynamicCordisScopedContained("", "workflow/end", runInfo, resultInfo)
-			if record {
-				if _, err := e.appendEvent(session, "tool-workflow/run-end", map[string]any{"runId": runID, "stopReason": stopReason}); err != nil {
-					return ToolResult{}, err
-				}
-			}
+			recorder.append(e, session, "tool-workflow/run-end", map[string]any{"runId": runID, "stopReason": stopReason})
 			if runErr != nil {
 				if stopReason == "cancelled" {
 					return ToolResult{}, fmt.Errorf("workflow run was cancelled: %w", runErr)
@@ -175,8 +199,8 @@ func builtinWorkflowTool(e *Engine) Tool {
 				return ToolResult{}, err
 			}
 			text := string(rendered)
-			if len(text) > workflowResultMaxChars {
-				text = fmt.Sprintf("%s\n... [truncated: %d more characters]", text[:workflowResultMaxChars], len(text)-workflowResultMaxChars)
+			if clipped, omitted, truncated := truncateUTF16Units(text, runtimeConfig.workflowMaxResultChars); truncated {
+				text = fmt.Sprintf("%s\n… [truncated: %d more characters]", clipped, omitted)
 			}
 			plural := "agents"
 			if agents == 1 {
@@ -260,18 +284,21 @@ const pipeline = async (items, ...stages) => {
   return Promise.all(items.map(async (item, index) => { let value = item; try { for (const stage of stages) value = await stage(value, item, index); return value; } catch (error) { if (error && error.__workflowFatal) throw error; return null; } }));
 };`
 
-func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID string, runInfo map[string]any, program *goja.Program, args any, hasArgs bool, maxAgents int, record bool) (any, int, error) {
+func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID string, runInfo map[string]any, program *goja.Program, args any, hasArgs bool, runtimeConfig agentRuntime, recorder *workflowRecordState) (any, int, error) {
 	vm := goja.New()
-	tasks := make(chan jsTask, maxAgents+16)
+	tasks := make(chan jsTask, runtimeConfig.workflowMaxAgents+16)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var active sync.WaitGroup
-	concurrency := runtime.GOMAXPROCS(0) - 2
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > 16 {
-		concurrency = 16
+	concurrency := runtimeConfig.workflowMaxConcurrentAgents
+	if concurrency == 0 {
+		concurrency = runtime.GOMAXPROCS(0) - 2
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		if concurrency > 16 {
+			concurrency = 16
+		}
 	}
 	sem := make(chan struct{}, concurrency)
 	started := 0
@@ -282,8 +309,8 @@ func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID
 	})
 	_ = vm.Set("__assertWorkflowItems", func(call goja.FunctionCall) goja.Value {
 		length := int(call.Argument(0).ToInteger())
-		if length > workflowMaxItems {
-			panic(workflowJSError(vm, fmt.Sprintf("%s received %d items, over the per-call cap (%d)", call.Argument(1).String(), length, workflowMaxItems), true))
+		if length > runtimeConfig.workflowMaxItems {
+			panic(workflowJSError(vm, fmt.Sprintf("%s received %d items, over the per-call cap (%d)", call.Argument(1).String(), length, runtimeConfig.workflowMaxItems), true))
 		}
 		return goja.Undefined()
 	})
@@ -323,8 +350,8 @@ func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID
 			}
 			return vm.ToValue(promise)
 		}
-		if started >= maxAgents {
-			if rejectErr := reject(workflowJSError(vm, fmt.Sprintf("this run reached its total agent cap (%d)", maxAgents), true)); rejectErr != nil {
+		if started >= runtimeConfig.workflowMaxAgents {
+			if rejectErr := reject(workflowJSError(vm, fmt.Sprintf("this run reached its total agent cap (%d)", runtimeConfig.workflowMaxAgents), true)); rejectErr != nil {
 				panic(rejectErr)
 			}
 			return vm.ToValue(promise)
@@ -339,7 +366,7 @@ func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID
 		if phase == "" {
 			phase = currentPhase
 		}
-		request := workflowChildRequest{parentID: session.Header.ID, runID: runID, seq: seq, label: label, phase: phase, prompt: prompt, provider: opts.Provider, model: opts.Model, schema: opts.Schema, record: record, runInfo: runInfo}
+		request := workflowChildRequest{parentID: session.Header.ID, runID: runID, seq: seq, label: label, phase: phase, prompt: prompt, subagentProvider: runtimeConfig.workflowProvider, disposeGrace: runtimeConfig.workflowDisposeGrace, provider: opts.Provider, model: opts.Model, schema: opts.Schema, recorder: recorder, runInfo: runInfo}
 		active.Add(1)
 		go func() {
 			defer active.Done()
@@ -366,7 +393,7 @@ func (e *Engine) runWorkflowProgram(ctx context.Context, session *Session, runID
 		_ = vm.Set("args", goja.Undefined())
 	}
 
-	promise, err := runJSProgram(ctx, vm, program, tasks)
+	promise, err := runJSProgram(ctx, vm, program, tasks, runtimeConfig.workflowSyncTimeout)
 	cancel()
 	active.Wait()
 	if err != nil {
@@ -387,9 +414,9 @@ func sendJSTask(ctx context.Context, tasks chan<- jsTask, task jsTask) {
 	}
 }
 
-func runJSProgram(ctx context.Context, vm *goja.Runtime, program *goja.Program, tasks <-chan jsTask) (*goja.Promise, error) {
+func runJSProgram(ctx context.Context, vm *goja.Runtime, program *goja.Program, tasks <-chan jsTask, syncTimeout time.Duration) (*goja.Promise, error) {
 	var value goja.Value
-	err := runVMOperation(vm, func() error {
+	err := runVMOperation(vm, syncTimeout, func() error {
 		var runErr error
 		value, runErr = vm.RunProgram(program)
 		return runErr
@@ -406,7 +433,7 @@ func runJSProgram(ctx context.Context, vm *goja.Runtime, program *goja.Program, 
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case task := <-tasks:
-			if err := runVMOperation(vm, task); err != nil {
+			if err := runVMOperation(vm, syncTimeout, task); err != nil {
 				return nil, err
 			}
 		}
@@ -417,12 +444,15 @@ func runJSProgram(ctx context.Context, vm *goja.Runtime, program *goja.Program, 
 	return promise, nil
 }
 
-func runVMOperation(vm *goja.Runtime, operation func() error) error {
+func runVMOperation(vm *goja.Runtime, timeout time.Duration, operation func() error) error {
+	if timeout <= 0 {
+		timeout = workflowDefaultSyncTimeout
+	}
 	finished := make(chan struct{})
 	watchdogDone := make(chan struct{})
 	go func() {
 		select {
-		case <-time.After(workflowSyncTimeout):
+		case <-time.After(timeout):
 			vm.Interrupt(errors.New("JavaScript synchronous execution timed out"))
 		case <-finished:
 		}
@@ -507,35 +537,28 @@ func (e *Engine) executeWorkflowChild(ctx context.Context, request workflowChild
 	if err != nil {
 		return nil, err
 	}
-	parent.mu.Lock()
-	preset := sessionAgentPreset(parent.Header, parent.Events)
-	parent.mu.Unlock()
-	if request.provider != "" {
-		e.mu.RLock()
-		provider := e.providers[request.provider]
-		e.mu.RUnlock()
-		if provider == nil {
-			return nil, fmt.Errorf("agent() could not start a child: provider %q is not registered", request.provider)
-		}
+	provider := e.GetSubagentProvider(request.subagentProvider)
+	if provider == nil {
+		return nil, fmt.Errorf("agent() could not start a child: no subagent provider registered for %q", request.subagentProvider)
 	}
-	childID, err := e.CreateSubagent(ctx, request.parentID, "", preset)
+	if request.schema != nil && !provider.Capabilities().OutputSchema {
+		return nil, fmt.Errorf("agent() could not start a child: subagent provider %q does not support structured output", request.subagentProvider)
+	}
+	var agentOptions *SubagentAgentOptions
+	if request.provider != "" || request.model != "" {
+		agentOptions = &SubagentAgentOptions{Provider: request.provider, Model: request.model}
+	}
+	run, err := e.StartSubagent(ctx, request.subagentProvider, SubagentStartRequest{
+		ParentSessionID: request.parentID,
+		Label:           request.label,
+		Prompt:          []ContentBlock{{Type: "text", Text: request.prompt}},
+		OutputSchema:    request.schema,
+		AgentOptions:    agentOptions,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("agent() could not start a child: %w", err)
 	}
-	e.setSessionTitle(childID, request.label)
-	child, _ := e.getSession(childID)
-	if request.provider != "" || request.model != "" {
-		child.mu.Lock()
-		selection := child.Model
-		if request.provider != "" {
-			selection.Provider = request.provider
-		}
-		if request.model != "" {
-			selection.Model = request.model
-		}
-		child.Model = selection
-		child.mu.Unlock()
-	}
+	childID := run.ID
 	agentInfo := map[string]any{"seq": request.seq, "label": request.label, "childId": childID}
 	if request.phase != "" {
 		agentInfo["phase"] = request.phase
@@ -554,71 +577,95 @@ func (e *Engine) executeWorkflowChild(ctx context.Context, request workflowChild
 		}
 		e.emitDynamicCordisScopedContained("", "workflow/agent-end", request.runInfo, end)
 	}()
-	recordStarted := false
-	if request.record {
-		data := map[string]any{"runId": request.runID, "seq": request.seq, "label": request.label, "childId": childID}
-		if request.phase != "" {
-			data["phase"] = request.phase
-		}
-		if _, err := e.appendEvent(parent, "tool-workflow/agent-start", data); err != nil {
-			return nil, err
-		}
-		recordStarted = true
+	data := map[string]any{"runId": request.runID, "seq": request.seq, "label": request.label, "childId": childID}
+	if request.phase != "" {
+		data["phase"] = request.phase
 	}
+	recordStarted := request.recorder.append(e, parent, "tool-workflow/agent-start", data)
 	defer func() {
 		if recordStarted {
-			_, _ = e.appendEvent(parent, "tool-workflow/agent-end", map[string]any{"runId": request.runID, "seq": request.seq, "outcome": outcome})
+			request.recorder.append(e, parent, "tool-workflow/agent-end", map[string]any{"runId": request.runID, "seq": request.seq, "outcome": outcome})
 		}
 	}()
-	prompt := request.prompt
-	if request.schema != nil {
-		schema, _ := json.Marshal(request.schema)
-		prompt += "\n\nReturn only one JSON object matching this schema exactly, with no markdown fence or extra text:\n" + string(schema)
-	}
-	done := make(chan struct{})
-	var output string
-	var runErr error
-	go func() {
-		output, runErr = e.Run(context.Background(), childID, PromptRequest{SessionID: childID, Mode: "queue", Literal: true, Content: []PromptContentPart{{Type: "text", Text: prompt}}})
-		close(done)
-	}()
-	select {
-	case <-ctx.Done():
+	result, waitErr := run.Wait(ctx)
+	disposeErr := disposeSubagentRun(run, request.disposeGrace)
+	if waitErr != nil {
 		outcome = "cancelled"
-		_ = e.CancelSession(childID)
-		select {
-		case <-done:
-		case <-time.After(workflowSyncTimeout):
-		}
-		return nil, ctx.Err()
-	case <-done:
+		return nil, waitErr
 	}
-	if runErr != nil {
+	if disposeErr != nil {
+		return nil, disposeErr
+	}
+	if result.StopReason != SubagentCompleted {
 		outcome = "failed"
 		return nil, nil
 	}
 	if request.schema == nil {
 		outcome = "completed"
-		return output, nil
+		return contentValueText(result.Output), nil
 	}
-	var value any
-	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(output)))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		outcome = "failed"
-		return nil, nil
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		outcome = "failed"
-		return nil, nil
-	}
-	if err := validateJSONAgainstSchema(value, request.schema); err != nil {
+	if result.Structured == nil || validateJSONAgainstSchema(result.Structured, request.schema) != nil {
 		outcome = "failed"
 		return nil, nil
 	}
 	outcome = "completed"
-	return value, nil
+	return result.Structured, nil
+}
+
+func disposeSubagentRun(run *SubagentRun, grace time.Duration) error {
+	if grace <= 0 {
+		return run.Dispose()
+	}
+	done := make(chan error, 1)
+	go func() { done <- run.Dispose() }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return errors.New("subagent disposal exceeded workflow dispose grace")
+	}
+}
+
+// executeRalphChild uses the provider registry directly. Ralph requires a
+// genuinely fresh child and structured output; embedding the schema in a
+// prompt would make those deployment capabilities advisory instead of real.
+func (e *Engine) executeRalphChild(ctx context.Context, parentID, providerName, label, prompt string, schema map[string]any) (any, error) {
+	provider := e.GetSubagentProvider(providerName)
+	if provider == nil {
+		return nil, fmt.Errorf("Ralph subagent provider %q is not registered", providerName)
+	}
+	if !provider.Capabilities().OutputSchema {
+		return nil, fmt.Errorf("Ralph subagent provider %q does not support structured output", providerName)
+	}
+	if provider.InheritsParentContext() {
+		return nil, fmt.Errorf("Ralph subagent provider %q inherits parent context; Ralph requires a fresh provider", providerName)
+	}
+	run, err := e.StartSubagent(ctx, providerName, SubagentStartRequest{
+		ParentSessionID: parentID,
+		Label:           label,
+		Prompt:          []ContentBlock{{Type: "text", Text: prompt}},
+		OutputSchema:    schema,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, waitErr := run.Wait(ctx)
+	disposeErr := run.Dispose()
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	if disposeErr != nil {
+		return nil, disposeErr
+	}
+	if result.StopReason != SubagentCompleted || result.Structured == nil {
+		if result.Diagnostic != "" {
+			return nil, fmt.Errorf("Ralph child did not produce structured output: stopReason=%s diagnostic=%s", result.StopReason, result.Diagnostic)
+		}
+		return nil, nil
+	}
+	return result.Structured, nil
 }
 
 func materializeJSON(value any) (any, error) {
@@ -636,7 +683,7 @@ func materializeJSON(value any) (any, error) {
 }
 
 func validateWorkflowSchema(schema map[string]any, root bool) error {
-	allowed := map[string]bool{"type": true, "properties": true, "required": true, "additionalProperties": true, "items": true, "enum": true, "const": true, "oneOf": true, "description": true, "title": true, "default": true, "examples": true}
+	allowed := map[string]bool{"type": true, "properties": true, "required": true, "additionalProperties": true, "items": true, "enum": true, "const": true, "oneOf": true, "anyOf": true, "description": true, "title": true, "default": true, "examples": true}
 	for key := range schema {
 		if !allowed[key] {
 			return fmt.Errorf("unsupported keyword %q", key)
@@ -654,6 +701,22 @@ func validateWorkflowSchema(schema map[string]any, root bool) error {
 			child, ok := item.(map[string]any)
 			if !ok {
 				return errors.New("oneOf entries must be schemas")
+			}
+			if err := validateWorkflowSchema(child, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if branches, ok := schema["anyOf"]; ok {
+		items, ok := branches.([]any)
+		if !ok || len(items) < 2 {
+			return errors.New("anyOf must contain at least two schemas")
+		}
+		for _, item := range items {
+			child, ok := item.(map[string]any)
+			if !ok {
+				return errors.New("anyOf entries must be schemas")
 			}
 			if err := validateWorkflowSchema(child, false); err != nil {
 				return err
@@ -705,6 +768,14 @@ func validateJSONAgainstSchema(value any, schema map[string]any) error {
 			return errors.New("value must match exactly one oneOf branch")
 		}
 		return nil
+	}
+	if branches, ok := schema["anyOf"].([]any); ok {
+		for _, raw := range branches {
+			if child, ok := raw.(map[string]any); ok && validateJSONAgainstSchema(value, child) == nil {
+				return nil
+			}
+		}
+		return errors.New("value must match one anyOf branch")
 	}
 	typ, _ := schema["type"].(string)
 	switch typ {
@@ -833,21 +904,29 @@ func builtinRalphTool(e *Engine) Tool {
 			if in.Objective == nil || strings.TrimSpace(*in.Objective) == "" {
 				return ToolResult{}, errors.New("Ralph objective must be a non-empty string")
 			}
-			maxRounds := ralphMaxRounds
-			if in.MaxRounds != nil {
-				maxRounds = *in.MaxRounds
-			}
-			if maxRounds < 1 || maxRounds > ralphMaxRounds {
-				return ToolResult{}, fmt.Errorf("Ralph maxRounds must be between 1 and %d", ralphMaxRounds)
-			}
 			if call.SessionID == "" {
 				return ToolResult{}, errors.New("Ralph tool requires a calling agent")
 			}
-			result, err := e.runRalph(ctx, call.SessionID, strings.TrimSpace(*in.Objective), maxRounds)
+			session, err := e.getSession(call.SessionID)
 			if err != nil {
 				return ToolResult{}, err
 			}
-			toolResult := textToolResult(boundText(renderRalphResult(result), ralphMaxResultChars))
+			runtimeConfig, err := e.runtimeForSession(session)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			maxRounds := runtimeConfig.ralphMaxRounds
+			if in.MaxRounds != nil {
+				maxRounds = *in.MaxRounds
+			}
+			if maxRounds < 1 || int64(maxRounds) > maxJSONSafeInteger || maxRounds > runtimeConfig.ralphMaxRounds {
+				return ToolResult{}, fmt.Errorf("Ralph maxRounds must be between 1 and %d", runtimeConfig.ralphMaxRounds)
+			}
+			result, err := e.runRalph(ctx, call.SessionID, runtimeConfig.ralphSubagentProvider, strings.TrimSpace(*in.Objective), maxRounds, runtimeConfig.ralphMaxHandoffChars, runtimeConfig.ralphMaxResultChars)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			toolResult := textToolResult(boundText(renderRalphResult(result), runtimeConfig.ralphMaxResultChars))
 			toolResult.Value = map[string]any{"runId": newID("workflow"), "agentsStarted": result.RoundsStarted, "result": result}
 			return toolResult, nil
 		},
@@ -860,7 +939,7 @@ type ralphResult struct {
 	Report        ralphReport `json:"report"`
 }
 
-func (e *Engine) runRalph(ctx context.Context, parentID, objective string, maxRounds int) (ralphResult, error) {
+func (e *Engine) runRalph(ctx context.Context, parentID, providerName, objective string, maxRounds, maxHandoffChars, maxResultChars int) (ralphResult, error) {
 	schema := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
@@ -887,16 +966,19 @@ func (e *Engine) runRalph(ctx context.Context, parentID, objective string, maxRo
 			"Previous structured handoff:\n" + prior,
 			"Use status continue with at least one nextSteps entry while useful work remains; complete only with concrete evidence and no nextSteps; blocked only when no meaningful progress is possible without human input or an external-state change. blocker must be empty unless blocked.",
 		}, "\n\n")
-		value, fatal := e.executeWorkflowChild(ctx, workflowChildRequest{parentID: parentID, seq: round, label: fmt.Sprintf("Ralph round %d", round), phase: "Fresh-agent rounds", prompt: prompt, schema: schema})
+		value, fatal := e.executeRalphChild(ctx, parentID, providerName, fmt.Sprintf("Ralph round %d", round), prompt, schema)
 		if fatal != nil {
 			return ralphResult{}, fatal
 		}
 		if value == nil {
 			if previous == nil {
-				return ralphResult{}, fmt.Errorf("Ralph round %d child failed before producing a structured report; no previous handoff was available", round)
+				return ralphResult{}, errors.New(boundText(fmt.Sprintf("Ralph round %d child failed before producing a structured report.\nNo previous handoff was available.", round), maxResultChars))
 			}
 			data, _ := json.MarshalIndent(previous, "", "  ")
-			return ralphResult{}, fmt.Errorf("Ralph round %d child failed before producing a structured report; last successful handoff:\n%s", round, data)
+			return ralphResult{}, errors.New(boundText(fmt.Sprintf("Ralph round %d child failed before producing a structured report.\nLast successful handoff:\n%s", round, data), maxResultChars))
+		}
+		if err := validateJSONAgainstSchema(value, schema); err != nil {
+			return ralphResult{}, errors.New("Ralph workflow returned a malformed round report")
 		}
 		data, _ := json.Marshal(value)
 		var report ralphReport
@@ -906,8 +988,8 @@ func (e *Engine) runRalph(ctx context.Context, parentID, objective string, maxRo
 		if err := validateRalphReport(report); err != nil {
 			return ralphResult{}, err
 		}
-		if jsonUTF16Length(data) > ralphMaxHandoffChars {
-			return ralphResult{}, fmt.Errorf("Ralph round report exceeds maxHandoffChars (%d > %d)", jsonUTF16Length(data), ralphMaxHandoffChars)
+		if jsonUTF16Length(data) > maxHandoffChars {
+			return ralphResult{}, fmt.Errorf("Ralph round report exceeds maxHandoffChars (%d > %d)", jsonUTF16Length(data), maxHandoffChars)
 		}
 		switch report.Status {
 		case "complete", "blocked":
@@ -973,14 +1055,40 @@ func renderRalphResult(result ralphResult) string {
 }
 
 func boundText(text string, max int) string {
-	const notice = "\n... [truncated]"
-	if len(text) <= max {
+	const notice = "\n… [truncated]"
+	if jsonUTF16Length([]byte(text)) <= max {
 		return text
 	}
-	if max <= len(notice) {
-		return notice[:max]
+	noticeUnits := jsonUTF16Length([]byte(notice))
+	if max <= noticeUnits {
+		clipped, _, _ := truncateUTF16Units(notice, max)
+		return clipped
 	}
-	return text[:max-len(notice)] + notice
+	clipped, _, _ := truncateUTF16Units(text, max-noticeUnits)
+	return clipped + notice
+}
+
+func truncateUTF16Units(text string, max int) (string, int, bool) {
+	total := len(utf16.Encode([]rune(text)))
+	if total <= max {
+		return text, 0, false
+	}
+	if max <= 0 {
+		return "", total, true
+	}
+	used, end := 0, 0
+	for index, value := range text {
+		units := 1
+		if value > 0xffff {
+			units = 2
+		}
+		if used+units > max {
+			break
+		}
+		used += units
+		end = index + len(string(value))
+	}
+	return text[:end], total - max, true
 }
 
 func builtinRunCodeTool(e *Engine) Tool {
@@ -993,7 +1101,8 @@ func builtinRunCodeTool(e *Engine) Tool {
 			"code":        map[string]any{"type": "string", "description": "The program: the body of an async TypeScript function."},
 			"description": map[string]any{"type": "string", "description": "Clear, concise description of what this program does in active voice, 5-10 words."},
 		}, "code", "description"), Output: objectSchema(map[string]any{"logs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "result": map[string]any{}}, "logs")},
-		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		ExecuteRuntime: func(exec *ToolRunContext) (ToolResult, error) {
+			call := exec.Call
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
 				return ToolResult{}, err
@@ -1004,12 +1113,13 @@ func builtinRunCodeTool(e *Engine) Tool {
 			if strings.TrimSpace(*in.Description) == "" {
 				return ToolResult{}, errors.New("invalid description: expected a non-empty string")
 			}
-			return e.executeRunCode(ctx, call, *in.Code)
+			return e.executeRunCode(exec, call, *in.Code)
 		},
 	}
 }
 
-func (e *Engine) executeRunCode(ctx context.Context, call ToolCall, code string) (ToolResult, error) {
+func (e *Engine) executeRunCode(outer *ToolRunContext, call ToolCall, code string) (ToolResult, error) {
+	ctx := outer.Context
 	if call.SessionID == "" {
 		return ToolResult{}, errors.New("run_code requires a calling agent")
 	}
@@ -1029,12 +1139,8 @@ func (e *Engine) executeRunCode(ctx context.Context, call ToolCall, code string)
 	tasks := make(chan jsTask, 1024)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var active sync.WaitGroup
-	var sequence atomic.Int64
-	// ponytail: RWMutex preserves read overlap and exclusive mutations; use a ticketed scheduler if exact writer submission order becomes observable.
-	var dispatchGate sync.RWMutex
-	var outputMu sync.Mutex
-	var attachments []ContentBlock
+	dispatcher := newCodeToolDispatcher(e, session, outer, runCtx, tasks, call)
+	sequence := int64(0)
 	logs := []string{}
 
 	console := vm.NewObject()
@@ -1055,7 +1161,7 @@ func (e *Engine) executeRunCode(ctx context.Context, call ToolCall, code string)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		name, tool := name, tools[name]
+		name := name
 		_ = toolObject.Set(name, func(invocation goja.FunctionCall) goja.Value {
 			promise, resolve, reject := vm.NewPromise()
 			arguments, normalizeErr := materializeJSON(invocation.Argument(0).Export())
@@ -1073,85 +1179,39 @@ func (e *Engine) executeRunCode(ctx context.Context, call ToolCall, code string)
 				return vm.ToValue(promise)
 			}
 			rawArguments, _ := json.Marshal(argumentObject)
-			subCallID := fmt.Sprintf("%s:code:%d", call.ID, sequence.Add(1))
-			startData := map[string]any{"rootCallId": call.ID, "parentCallId": call.ID, "subCallId": subCallID, "name": name, "arguments": argumentObject}
-			if _, appendErr := e.appendEvent(session, "tool/code-dispatch-start", startData); appendErr != nil {
-				if err := reject(toolCallJSError(vm, name, appendErr.Error())); err != nil {
+			sequence++
+			subCallID := fmt.Sprintf("%s:code:%d", call.ID, sequence)
+			entry := &codeToolDispatchEntry{
+				call: ToolCall{
+					ID: subCallID, Name: name, Arguments: rawArguments,
+					Workspace: call.Workspace, SessionID: call.SessionID, ParentCallID: call.ID,
+				},
+				arguments: argumentObject, vm: vm, resolve: resolve, reject: reject,
+			}
+			if !dispatcher.submit(entry) {
+				if err := reject(toolCallJSError(vm, name, fmt.Sprintf("run_code run is over (run_code settled); %s not dispatched", name))); err != nil {
 					panic(err)
 				}
-				return vm.ToValue(promise)
 			}
-			active.Add(1)
-			go func() {
-				defer active.Done()
-				parallel := codeParallelTool(name)
-				if parallel {
-					dispatchGate.RLock()
-					defer dispatchGate.RUnlock()
-				} else {
-					dispatchGate.Lock()
-					defer dispatchGate.Unlock()
-				}
-				result, executeErr := executeTool(runCtx, tool, ToolCall{ID: subCallID, Name: name, Arguments: rawArguments, Workspace: call.Workspace, SessionID: call.SessionID, ParentCallID: call.ID})
-				if executeErr != nil {
-					result.IsError = true
-					if result.Error == nil {
-						result.Error = toolExecutionError(executeErr)
-					}
-					if result.Content == nil {
-						result.Content = []ContentBlock{{Type: "text", Text: executeErr.Error()}}
-					}
-				}
-				if result.Error != nil {
-					result.IsError = true
-				}
-				settled := map[string]any{"rootCallId": call.ID, "parentCallId": call.ID, "subCallId": subCallID, "name": name, "arguments": argumentObject, "isError": result.IsError, "content": result.Content}
-				if _, appendErr := e.appendEvent(session, "tool/code-dispatch", settled); appendErr != nil && executeErr == nil {
-					executeErr = appendErr
-				}
-				if !result.IsError && executeErr == nil {
-					for _, block := range result.Content {
-						if block.Type == "image" || block.Attachment != nil {
-							outputMu.Lock()
-							attachments = append(attachments, block)
-							outputMu.Unlock()
-						}
-					}
-				}
-				value := canonicalCodeToolValue(name, result)
-				sendJSTask(runCtx, tasks, func() error {
-					if executeErr != nil {
-						return reject(toolCallJSError(vm, name, executeErr.Error()))
-					}
-					if result.IsError {
-						message := "tool call failed"
-						if result.Error != nil && result.Error.Message != "" {
-							message = result.Error.Message
-						} else if len(result.Content) > 0 {
-							message = result.Content[0].Text
-						}
-						return reject(toolCallJSError(vm, name, message))
-					}
-					return resolve(value)
-				})
-			}()
 			return vm.ToValue(promise)
 		})
 	}
 	_ = vm.Set("tools", toolObject)
-	promise, runErr := runJSProgram(ctx, vm, program, tasks)
+	promise, runErr := runJSProgram(ctx, vm, program, tasks, workflowDefaultSyncTimeout)
 	cancel()
-	active.Wait()
+	dispatcher.closeAndDrain()
 	if runErr != nil {
-		text := runErr.Error()
-		if len(logs) > 0 {
-			text += "\n" + strings.Join(logs, "\n")
+		kind := "exception"
+		if ctx.Err() != nil {
+			kind = "abort"
+		} else if strings.Contains(strings.ToLower(runErr.Error()), "timed out") {
+			kind = "timeout"
 		}
-		return ToolResult{}, fmt.Errorf("run_code failed: %s", text)
+		return codeRunFailureResult(kind, runErr.Error(), logs), nil
 	}
 	value, err := materializeJSON(promise.Result().Export())
 	if err != nil {
-		return ToolResult{}, fmt.Errorf("run_code result: %w", err)
+		return codeRunFailureResult("exception", "result is not lossless JSON: "+err.Error(), logs), nil
 	}
 	parts := append([]string(nil), logs...)
 	if promise.Result() != nil && !goja.IsUndefined(promise.Result()) {
@@ -1162,14 +1222,23 @@ func (e *Engine) executeRunCode(ctx context.Context, call ToolCall, code string)
 		text = strings.Join(parts, "\n")
 	}
 	content := []ContentBlock{{Type: "text", Text: text}}
-	outputMu.Lock()
-	content = append(content, attachments...)
-	outputMu.Unlock()
-	result := ToolResult{Content: content, Value: map[string]any{"logs": append([]string(nil), logs...)}}
+	result := ToolResult{Content: content, Value: map[string]any{"logs": append([]string{}, logs...)}}
 	if promise.Result() != nil && !goja.IsUndefined(promise.Result()) {
 		result.Value.(map[string]any)["result"] = value
 	}
 	return result, nil
+}
+
+func codeRunFailureResult(kind, message string, logs []string) ToolResult {
+	text := fmt.Sprintf("code run failed (%s): %s", kind, message)
+	if len(logs) > 0 {
+		text += "\nCaptured output:\n" + strings.Join(logs, "\n")
+	}
+	return ToolResult{
+		Content: []ContentBlock{{Type: "text", Text: "Error: " + text}},
+		IsError: true,
+		Error:   &ToolError{Name: "CodeRunFailedError", Code: "CODE_RUN_FAILED", Message: text},
+	}
 }
 
 func compileRunCode(body string) (*goja.Program, error) {
@@ -1192,13 +1261,6 @@ func toolCallJSError(vm *goja.Runtime, name, message string) *goja.Object {
 	return object
 }
 
-func codeParallelTool(name string) bool {
-	return map[string]bool{
-		"read": true, "glob": true, "grep": true, "get_goal": true, "list_agents": true,
-		"job_list": true, "job_output": true, "skill": true, "web_search": true, "web_fetch": true,
-	}[name]
-}
-
 func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) {
 	runtimeConfig, err := e.runtimeForSession(session)
 	if err != nil {
@@ -1209,8 +1271,7 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 	reportVisible := session.Header.Origin == "subagent" && session.Header.Mode == "continuable" && session.attached
 	session.mu.Unlock()
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	tools := make(map[string]Tool)
+	tools := make(map[string]Tool, len(e.tools)+len(e.scopedTools[sessionID]))
 	for name, tool := range e.tools {
 		if name == "run_code" {
 			continue
@@ -1226,6 +1287,13 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 			continue
 		}
 		if !shippedToolNames[name] || runtimeConfig.toolNames == nil || runtimeConfig.toolNames[name] {
+			if runtimeConfig.webTools != nil && (name == "web_search" || name == "web_fetch") {
+				var enabled bool
+				tool, enabled = sessionWebTool(e, name, runtimeConfig.webTools)
+				if !enabled {
+					continue
+				}
+			}
 			if name == shellToolName && runtimeConfig.persistentBash {
 				tool.Schema.Output = map[string]any{"type": "string"}
 				tool.Schema.Description = runtimeConfig.persistentBashDesc
@@ -1237,6 +1305,19 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 			tools[name] = tool
 		}
 	}
+	if runtimeConfig.workflowToolName != "" && runtimeConfig.workflowToolName != "workflow" && runtimeConfig.toolNames[runtimeConfig.workflowToolName] {
+		if workflow, ok := e.tools["workflow"]; ok && restriction.allows(runtimeConfig.workflowToolName) {
+			workflow.Schema.Name = runtimeConfig.workflowToolName
+			delete(tools, "workflow")
+			tools[runtimeConfig.workflowToolName] = workflow
+		}
+	}
+	for name, tool := range e.scopedTools[sessionID] {
+		if name != "run_code" {
+			tools[name] = tool
+		}
+	}
+	e.mu.RUnlock()
 	return tools, nil
 }
 
@@ -1328,6 +1409,17 @@ func (e *Engine) codeModePrompt(session *Session, runtimeConfig agentRuntime) st
 
 func jsonSchemaTypeScript(schema map[string]any) string {
 	if branches, ok := schema["oneOf"].([]any); ok {
+		parts := make([]string, 0, len(branches))
+		for _, raw := range branches {
+			if child, ok := raw.(map[string]any); ok {
+				parts = append(parts, jsonSchemaTypeScript(child))
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, " | ")
+		}
+	}
+	if branches, ok := schema["anyOf"].([]any); ok {
 		parts := make([]string, 0, len(branches))
 		for _, raw := range branches {
 			if child, ok := raw.(map[string]any); ok {

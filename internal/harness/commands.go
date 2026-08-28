@@ -63,6 +63,24 @@ func commandCatalog() []commandDescriptor {
 	}
 }
 
+func (e *Engine) commandCatalogForSession(s *Session) ([]commandDescriptor, error) {
+	runtimeConfig, err := e.runtimeForSession(s)
+	if err != nil {
+		return nil, err
+	}
+	catalog := commandCatalog()
+	if runtimeConfig.compactCommandEnabled {
+		return catalog, nil
+	}
+	filtered := make([]commandDescriptor, 0, len(catalog)-1)
+	for _, command := range catalog {
+		if command.Name != "compact" {
+			filtered = append(filtered, command)
+		}
+	}
+	return filtered, nil
+}
+
 func (e *Engine) commandDefinition(name string) (commandDefinition, bool) {
 	definitions := []commandDefinition{
 		{commandDescriptor: commandCatalog()[0], RecordInput: true, Handler: e.commandClear},
@@ -89,6 +107,15 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, im
 	definition, ok := e.commandDefinition(name)
 	if !ok {
 		return nil, false, nil
+	}
+	if name == "compact" {
+		runtimeConfig, runtimeErr := e.runtimeForSession(s)
+		if runtimeErr != nil {
+			return nil, true, runtimeErr
+		}
+		if !runtimeConfig.compactCommandEnabled {
+			return nil, false, nil
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, true, err
@@ -121,7 +148,7 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, im
 			parts[index] = PromptContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data, Name: image.Name}
 		}
 		var admissionErr error
-		attachments, admissionErr = e.durablePromptContent(parts)
+		attachments, admissionErr = e.durablePromptContentContext(ctx, parts)
 		if admissionErr != nil {
 			result := CommandResult{Kind: "error", Text: admissionErr.Error()}
 			if _, err := e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": result.Kind, "text": result.Text}); err != nil {
@@ -205,7 +232,20 @@ func (e *Engine) commandCompact(ctx context.Context, invocation commandInvocatio
 	}
 	selection := s.Model
 	s.mu.Unlock()
-	result, err := e.compactSession(ctx, s, compactRequest{selection: selection, sourceCommandID: invocation.CommandID})
+	system := ""
+	var tools []ToolSchema
+	if routed, routedSystem, routedTools, ok := routedCompactionRequest(s); ok {
+		selection = routed
+		system, tools = routedSystem, routedTools
+	}
+	runtimeConfig, runtimeErr := e.runtimeForSession(s)
+	if runtimeErr != nil {
+		return CommandResult{}, runtimeErr
+	}
+	if !runtimeConfig.compactionEnabled {
+		return CommandResult{Kind: "error", Text: "Compaction is unavailable because this agent preset does not mount a compaction service."}, nil
+	}
+	result, err := e.compactSession(ctx, s, compactRequest{selection: selection, system: system, tools: tools, sourceCommandID: invocation.CommandID})
 	if errors.Is(err, errNoCompactableHistory) {
 		return CommandResult{Kind: "success", Text: "No compactable history yet."}, nil
 	}
@@ -517,15 +557,10 @@ func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (C
 	if message == "off" && len(invocation.Attachments) > 0 {
 		return CommandResult{Kind: "error", Text: "Image attachments cannot accompany /plan off."}, nil
 	}
-	invocation.Session.mu.Lock()
-	events := append([]Event(nil), invocation.Session.Events...)
-	invocation.Session.mu.Unlock()
-	active := planModeActive(events)
 	wanted := message != "off"
-	if wanted != active {
-		if _, err := e.appendEvent(invocation.Session, "plan/mode", map[string]any{"active": wanted}); err != nil {
-			return CommandResult{}, err
-		}
+	outcome, err := e.setPlanMode(invocation.Session, wanted, true)
+	if err != nil {
+		return CommandResult{}, err
 	}
 	if wanted && (message != "" || len(invocation.Attachments) > 0) {
 		content := append([]ContentBlock(nil), invocation.Attachments...)
@@ -537,15 +572,27 @@ func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (C
 		}
 	}
 	if !wanted {
-		if !active {
+		switch outcome {
+		case planModeCommitted:
+			return CommandResult{Kind: "success", Text: "Plan mode off."}, nil
+		case planModeQueued:
+			return CommandResult{Kind: "success", Text: "Leaving plan mode (applies from the next step)."}, nil
+		case planModeCancelled:
+			return CommandResult{Kind: "success", Text: "Plan mode entry cancelled."}, nil
+		case planModeNoop:
+			invocation.Session.mu.Lock()
+			active := planModeActive(invocation.Session.Events)
+			invocation.Session.mu.Unlock()
+			if active {
+				return CommandResult{Kind: "success", Text: "Leaving plan mode (applies from the next step)."}, nil
+			}
 			return CommandResult{Kind: "success", Text: "Plan mode is already inactive."}, nil
 		}
-		return CommandResult{Kind: "success", Text: "Plan mode off."}, nil
 	}
-	if active {
+	if outcome == planModeCommitted {
 		return CommandResult{Kind: "success", Text: "Plan mode on. Use /plan off to leave."}, nil
 	}
-	return CommandResult{Kind: "success", Text: "Plan mode on. Use /plan off to leave."}, nil
+	return CommandResult{Kind: "success", Text: "Entering plan mode (applies from the next step). Use /plan off to leave."}, nil
 }
 
 func (e *Engine) queueCommandMessage(s *Session, text string) error {

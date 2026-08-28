@@ -294,6 +294,9 @@ func (s *sdkServer) close() error {
 		s.startedSubagents = map[string]string{}
 		s.stateMu.Unlock()
 		failures := make([]error, 0)
+		if err := s.engine.drainModelSubagentDescendants(context.Background(), owned); err != nil {
+			failures = append(failures, err)
+		}
 		for _, id := range owned {
 			if err := detachSDKSession(s.engine, id); err != nil {
 				failures = append(failures, err)
@@ -324,7 +327,7 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	var events []Event
 	if len(session.pending) > 0 {
 		event, appendErr := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{},
+			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{}, "outcome": "canceled",
 		}, nil, nil, false)
 		if appendErr != nil {
 			session.mu.Unlock()
@@ -334,7 +337,7 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	}
 	if len(session.steering) > 0 {
 		event, appendErr := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{},
+			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{}, "outcome": "canceled",
 		}, nil, nil, false)
 		if appendErr != nil {
 			session.mu.Unlock()
@@ -347,9 +350,13 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	session.steering = nil
 	session.attached = false
 	session.requestHeaderLogged = false
+	activity := session.activity
 	cancel := session.Cancel
+	session.activity = nil
+	session.Cancel = nil
 	maintenanceCancel := session.maintenanceCancel
 	session.mu.Unlock()
+	e.releaseSessionScopedTools(id)
 	e.releaseFileReferenceSearch(id)
 	e.scheduleWake(id)
 	for _, event := range events {
@@ -358,7 +365,9 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	if len(events) > 0 {
 		e.emitQueue(session)
 	}
-	if cancel != nil {
+	if activity != nil {
+		activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
+	} else if cancel != nil {
 		cancel()
 	}
 	if maintenanceCancel != nil {
@@ -369,13 +378,16 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 			item.done <- promptOutcome{err: errors.New("SDK server shut down before the prompt ran")}
 		}
 	}
+	setupErr := e.subagentActivationSetups.releaseChild(session)
+	jobsErr := e.jobs.disposeOwner(id, "owner disposed")
 	terminalErr := e.terminals.closeOwner(id)
+	e.shells.closeOwner(id)
 	if origin != nil {
 		_ = e.dispatchDynamicCordisEvent(origin, id, true, "session/disposed", dynamicSessionView(session))
 	} else {
 		e.emitDynamicCordisScopedContained(id, "session/disposed", dynamicSessionView(session))
 	}
-	return terminalErr
+	return errors.Join(setupErr, jobsErr, terminalErr)
 }
 
 type sdkSessionLineage struct {

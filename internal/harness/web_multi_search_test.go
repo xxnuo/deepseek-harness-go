@@ -37,7 +37,7 @@ func webSearchToolForTest(t *testing.T, provider WebSearchProvider, configure fu
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = e.Close() })
-	if err := e.RegisterWebSearchProvider(provider); err != nil {
+	if _, err := e.RegisterWebSearchProvider(provider); err != nil {
 		t.Fatal(err)
 	}
 	e.mu.RLock()
@@ -69,6 +69,9 @@ func TestWebSearchQueryValidationMatchesRC8(t *testing.T) {
 	}
 	if got := DefaultWebToolConfig().SearchMaxQueries; got != 4 {
 		t.Fatalf("default SearchMaxQueries = %d, want 4", got)
+	}
+	if !DefaultWebToolConfig().FetchEnabled {
+		t.Fatal("tool-web plugin default should enable web_fetch")
 	}
 }
 

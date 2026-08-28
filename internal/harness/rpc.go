@@ -145,7 +145,8 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 			s.mu.Unlock()
 		}
 		home, _ := os.UserHomeDir()
-		return map[string]any{"version": e.cfg.Version, "cwd": e.cfg.Workspace, "provider": e.cfg.Provider, "model": e.cfg.Model, "attachedSessions": attached, "home": home, "canOpenPath": openCommand() != ""}, nil
+		cfg := e.Config()
+		return map[string]any{"version": cfg.Version, "cwd": cfg.Workspace, "provider": cfg.Provider, "model": cfg.Model, "attachedSessions": attached, "home": home, "canOpenPath": openCommand() != ""}, nil
 	case "host.listDirectory":
 		path, _ := p["path"].(string)
 		if path == "" {
@@ -632,7 +633,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 	case "goal.clear":
 		return e.goalFromPayload(p, "clear")
 	case "subagent.list":
-		return e.subagentList(p)
+		return e.subagentList(ctx, p)
 	case "subagent.history":
 		return e.subagentHistory(p)
 	case "subagent.prompt":

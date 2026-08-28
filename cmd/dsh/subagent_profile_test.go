@@ -81,7 +81,9 @@ func TestProfileSubagentProvidersReachEngine(t *testing.T) {
 	for index, row := range rows {
 		names[index] = row.Name
 	}
-	want := []string{"acp-profile", "claude-safe", "codex-safe", "sdk-profile"}
+	// SubagentRuntime.list() preserves provider registration order, matching
+	// the Loader effect order from the profile composition.
+	want := []string{"acp-profile", "codex-safe", "claude-safe", "sdk-profile"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("registered providers = %q, want %q", names, want)
 	}
@@ -109,6 +111,64 @@ func TestResolveSubagentProvidersIgnoresOtherPluginConfig(t *testing.T) {
 	providers, err := composed.resolveSubagentProviders()
 	if err != nil || len(providers) != 0 {
 		t.Fatalf("resolveSubagentProviders() = %d, %v", len(providers), err)
+	}
+}
+
+func TestDisabledGroupJSExpressionSuppressesAllPluginResolvers(t *testing.T) {
+	composed := testComposition(t, `
+- id: disabled-group
+  name: cordis:group
+  group: true
+  disabled: !!js process.platform === process.platform
+  config:
+    - id: provider
+      name: '@deepseek-ai/dsh-subagent-acp'
+      config:
+        command: ''
+    - id: tool
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config: {}
+    - id: mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: invalid
+    - id: lsp
+      name: '@deepseek-ai/dsh-lsp-stdio'
+      config:
+        servers: {}
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatalf("disabled group should suppress child resolver validation: %v", err)
+	}
+	if len(composed.subagentProviders) != 0 || len(composed.subagentTools) != 0 || len(composed.mcpConfigs) != 0 || len(composed.lspServers) != 0 {
+		t.Fatalf("disabled group leaked child configuration: providers=%d tools=%d mcp=%d lsp=%d", len(composed.subagentProviders), len(composed.subagentTools), len(composed.mcpConfigs), len(composed.lspServers))
+	}
+}
+
+func TestSubagentToolResolverEvaluatesJSConfigValues(t *testing.T) {
+	composed := testComposition(t, `
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: !!js "'spawn'"
+    toolName: !!js "'delegated'"
+    backgroundMode: !!js "'continuable'"
+    enableRunInBackground: !!js false
+    maxDepth: !!js 2
+    persona: !!js "'profile persona'"
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatalf("JS subagent tool config rejected: %v", err)
+	}
+	if len(composed.subagentTools) != 1 {
+		t.Fatalf("resolved subagent tools = %#v", composed.subagentTools)
+	}
+	tool := composed.subagentTools[0]
+	if tool.Provider != "spawn" || tool.ToolName != "delegated" || tool.BackgroundMode != "continuable" || tool.Persona != "profile persona" || tool.MaxDepth == nil || *tool.MaxDepth != 2 {
+		t.Fatalf("resolved JS subagent tool = %#v", tool)
+	}
+	if tool.EnableRunInBackground == nil || *tool.EnableRunInBackground {
+		t.Fatalf("resolved JS background flag = %#v", tool.EnableRunInBackground)
 	}
 }
 

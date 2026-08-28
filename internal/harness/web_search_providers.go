@@ -16,7 +16,9 @@ const webSearchProviderUserAgent = "deepseek-harness/0.0.1"
 
 type ExaSearchProviderOptions struct {
 	APIKey              string
+	APIKeyConfigured    *string
 	BaseURL             string
+	BaseURLConfigured   *string
 	SearchType          string
 	NumResults          int
 	HighlightsPerResult int
@@ -28,10 +30,14 @@ type ExaSearchProvider struct {
 }
 
 func NewExaSearchProvider(options ExaSearchProviderOptions) *ExaSearchProvider {
-	if options.APIKey == "" {
+	if options.APIKeyConfigured != nil {
+		options.APIKey = *options.APIKeyConfigured
+	} else if options.APIKey == "" {
 		options.APIKey = os.Getenv("EXA_API_KEY")
 	}
-	if options.BaseURL == "" {
+	if options.BaseURLConfigured != nil {
+		options.BaseURL = *options.BaseURLConfigured
+	} else if options.BaseURL == "" {
 		options.BaseURL = "https://api.exa.ai"
 	}
 	if options.SearchType == "" {
@@ -123,11 +129,14 @@ func (p *ExaSearchProvider) post(ctx context.Context, endpoint string, body map[
 }
 
 type PerplexitySearchProviderOptions struct {
-	APIKey        string
-	BaseURL       string
-	Model         string
-	MaxTokens     int
-	SearchRecency string
+	APIKey            string
+	APIKeyConfigured  *string
+	BaseURL           string
+	BaseURLConfigured *string
+	Model             string
+	ModelConfigured   *string
+	MaxTokens         int
+	SearchRecency     string
 }
 
 type PerplexitySearchProvider struct {
@@ -136,13 +145,19 @@ type PerplexitySearchProvider struct {
 }
 
 func NewPerplexitySearchProvider(options PerplexitySearchProviderOptions) *PerplexitySearchProvider {
-	if options.APIKey == "" {
+	if options.APIKeyConfigured != nil {
+		options.APIKey = *options.APIKeyConfigured
+	} else if options.APIKey == "" {
 		options.APIKey = os.Getenv("PERPLEXITY_API_KEY")
 	}
-	if options.BaseURL == "" {
+	if options.BaseURLConfigured != nil {
+		options.BaseURL = *options.BaseURLConfigured
+	} else if options.BaseURL == "" {
 		options.BaseURL = "https://api.perplexity.ai"
 	}
-	if options.Model == "" {
+	if options.ModelConfigured != nil {
+		options.Model = *options.ModelConfigured
+	} else if options.Model == "" {
 		options.Model = "sonar"
 	}
 	if options.MaxTokens == 0 {

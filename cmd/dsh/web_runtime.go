@@ -391,28 +391,35 @@ func runWeb(args []string, composed *composition, cfg harness.Config, stdout, st
 				if err != nil {
 					return err
 				}
-				next, err := harness.New(harness.WithConfig(nextConfig))
+				runtime.mu.RLock()
+				current := runtime.generation
+				runtime.mu.RUnlock()
+				if current == nil || current.engine != engine {
+					return errors.New("dsh: profile reload lost the active engine")
+				}
+				plugins, err := buildProfileRuntimePlugins(nextComposition)
 				if err != nil {
 					return err
 				}
-				profileRuntime, err := mountProfileRuntimePlugins(next, nextComposition, args)
-				if err != nil {
-					_ = next.Close()
+				previousConfig := engine.Config()
+				if err := engine.ApplyRuntimeConfig(nextConfig); err != nil {
 					return err
 				}
-				if profileRuntime != nil {
-					if code, err := profileRuntime.flush(stdout, stderr); err != nil {
-						_ = next.Close()
-						return err
-					} else if code != nil {
-						_ = next.Close()
-						return profileExit(*code)
+				if current.profileRuntime == nil {
+					if len(plugins) > 0 {
+						mounted, mountErr := mountProfileRuntimePluginSet(engine, args, plugins)
+						if mountErr != nil {
+							_ = engine.ApplyRuntimeConfig(previousConfig)
+							return mountErr
+						}
+						current.profileRuntime = mounted
+						runtime.startProfile(current)
 					}
-				}
-				if err := runtime.replace(next, profileRuntime, nextConfig); err != nil {
+				} else if err := current.profileRuntime.reconcile(plugins); err != nil {
+					_ = engine.ApplyRuntimeConfig(previousConfig)
 					return err
 				}
-				watch.paths.setRuntime(profileRuntime)
+				watch.paths.setRuntime(current.profileRuntime)
 				return nil
 			}, stderr)
 		}()

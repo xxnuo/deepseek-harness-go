@@ -624,7 +624,7 @@ return {
   inject: ['jobs'],
   apply(ctx) {
     harness.handle('exercise', () => ctx.jobs.start({
-      kind: 'dynamic', label: 'cross-plugin',
+      kind: 'dynamic', label: 'cross-plugin', owner: { id: '`+sessionID+`' },
       run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } }
     }))
   }
@@ -640,7 +640,7 @@ return {
 	_, _ = e.DynamicCordisStop(sessionID, controllerID)
 }
 
-func TestDynamicCordisJobsControllerServesOtherPluginOwner(t *testing.T) {
+func TestDynamicCordisJobsControllerDoesNotServeOtherPluginOwner(t *testing.T) {
 	e := newIntegrationEngine(t)
 	controllerOwner, err := e.CreateSession(t.Context(), e.Config().Workspace, "jobs-controller-owner", "")
 	if err != nil {
@@ -677,7 +677,7 @@ return {
   }
 }`)
 	started := e.DynamicCordisInvoke(t.Context(), producerID, producerRun, "start", nil)
-	if !started.OK || started.Value != "cross-1" {
+	if started.OK || !strings.Contains(started.Message, "no job controller") {
 		t.Fatalf("cross-owner start = %#v", started)
 	}
 	foreign := e.DynamicCordisInvoke(t.Context(), producerID, producerRun, "foreign", map[string]any{"owner": controllerOwner})
@@ -689,5 +689,58 @@ return {
 	}
 	if stopped, err := e.DynamicCordisStop(producerOwner, producerID); err != nil || !stopped.OK {
 		t.Fatalf("producer stop = %#v, %v", stopped, err)
+	}
+}
+
+func TestDynamicCordisJobListenersAreOwnerRelative(t *testing.T) {
+	e := newIntegrationEngine(t)
+	ownerA, err := e.CreateSession(t.Context(), e.Config().Workspace, "jobs-listener-a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, err := e.CreateSession(t.Context(), e.Config().Workspace, "jobs-listener-b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginA, runA := runDynamicBuiltinPlugin(t, e, ownerA, "jla", `
+return {
+  inject: ['jobs'],
+  apply(ctx) {
+    const events = []
+    ctx.jobs.onJobsChanged(owner => events.push('changed:' + owner.id))
+    ctx.jobs.onJobDone((job, owner) => events.push('done:' + job.id + ':' + owner.id))
+    harness.handle('events', () => events)
+  }
+}`)
+	pluginB, runB := runDynamicBuiltinPlugin(t, e, ownerB, "jlb", `
+return {
+  inject: ['jobs'],
+  apply(ctx) {
+    const events = []
+    ctx.jobs.attachController('owner-b')
+    ctx.jobs.onJobsChanged(owner => events.push('changed:' + owner.id))
+    ctx.jobs.onJobDone((job, owner) => events.push('done:' + job.id + ':' + owner.id))
+    harness.handle('exercise', async owner => {
+      const id = ctx.jobs.start({
+        kind: 'scope', label: 'owner-relative', owner: { id: owner },
+        run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } },
+      })
+      await ctx.jobs.wait(id, 1000, { id: owner })
+      for (let index = 0; index < 8 && events.length < 3; index++) await Promise.resolve()
+      return events
+    })
+  }
+}`)
+	eventsB := e.DynamicCordisInvoke(t.Context(), pluginB, runB, "exercise", ownerB)
+	if !eventsB.OK {
+		t.Fatalf("owner B exercise = %#v", eventsB)
+	}
+	wantB := []any{"changed:" + ownerB, "changed:" + ownerB, "done:scope-1:" + ownerB}
+	if !reflect.DeepEqual(eventsB.Value, wantB) {
+		t.Fatalf("owner B events = %#v, want %#v", eventsB.Value, wantB)
+	}
+	eventsA := e.DynamicCordisInvoke(t.Context(), pluginA, runA, "events", nil)
+	if !eventsA.OK || len(eventsA.Value.([]any)) != 0 {
+		t.Fatalf("foreign owner listener received events = %#v", eventsA)
 	}
 }

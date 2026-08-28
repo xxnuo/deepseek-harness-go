@@ -106,8 +106,13 @@ func TestPersistentBashRestartsAcrossSandboxModeChanges(t *testing.T) {
 	if output := runPersistentTool(t, e.tools["bash"], sessionID, e.Config().Workspace, "export DSH_MODE_STATE=workspace"); output != "" {
 		t.Fatalf("workspace setup = %q", output)
 	}
-	if _, err := e.runCommand(session, "/permission danger-full-access"); err != nil {
-		t.Fatal(err)
+	blockedSwitch, err := e.runCommand(session, "/permission danger-full-access")
+	if err != nil || blockedSwitch.Command == nil || blockedSwitch.Command.Kind != "error" || !strings.Contains(blockedSwitch.Command.Text, "open or being created") {
+		t.Fatalf("open persistent shell permission switch = %#v, %v", blockedSwitch, err)
+	}
+	e.shells.closeOwner(sessionID)
+	if switched, err := e.runCommand(session, "/permission danger-full-access"); err != nil || switched.Command == nil || switched.Command.Kind != "success" {
+		t.Fatalf("permission switch after shell close = %#v, %v", switched, err)
 	}
 	outside := filepath.Join("/var/tmp", newID("dsh-persistent-full"))
 	t.Cleanup(func() { _ = os.Remove(outside) })
@@ -118,8 +123,13 @@ func TestPersistentBashRestartsAcrossSandboxModeChanges(t *testing.T) {
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatalf("danger-full-access persistent write: %v", err)
 	}
-	if _, err := e.runCommand(session, "/permission read-only"); err != nil {
-		t.Fatal(err)
+	blockedSwitch, err = e.runCommand(session, "/permission read-only")
+	if err != nil || blockedSwitch.Command == nil || blockedSwitch.Command.Kind != "error" || !strings.Contains(blockedSwitch.Command.Text, "open or being created") {
+		t.Fatalf("open persistent shell read-only switch = %#v, %v", blockedSwitch, err)
+	}
+	e.shells.closeOwner(sessionID)
+	if switched, err := e.runCommand(session, "/permission read-only"); err != nil || switched.Command == nil || switched.Command.Kind != "success" {
+		t.Fatalf("read-only switch after shell close = %#v, %v", switched, err)
 	}
 	result, err := callBuiltin(t, e, sessionID, "bash", map[string]any{"command": "printf blocked > blocked.txt", "description": "verify read-only persistent denial"})
 	if err != nil || !strings.Contains(resultText(result), sandboxDenialMarker(sandboxReadOnly)) {

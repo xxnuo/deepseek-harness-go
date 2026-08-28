@@ -60,7 +60,7 @@ func (e *Engine) resolvedSettingsValueLocked(ns string) (map[string]any, map[str
 		base = piAISettingsBase()
 		value = mergeSettings(base, user)
 	case "web-search-deepseek":
-		base = deepSeekWebSearchBaseSettings()
+		base = deepSeekWebSearchBaseSettings(e.cfg.DeepSeekWebSearch)
 		value = mergeSettings(base, user)
 	}
 	return value, base
@@ -241,10 +241,17 @@ func (e *Engine) permissionDefaultPresetLocked() string {
 }
 
 func (e *Engine) settingsDescribe() map[string]any {
+	active := make(map[string]bool, len(builtinSettingsNamespaces))
+	for _, ns := range builtinSettingsNamespaces {
+		active[ns] = e.settingsNamespaceActive(ns)
+	}
 	e.mu.RLock()
 	keys := make([]string, 0, len(builtinSettingsNamespaces))
 	seen := make(map[string]bool, len(builtinSettingsNamespaces))
 	for _, ns := range builtinSettingsNamespaces {
+		if !active[ns] {
+			continue
+		}
 		keys = append(keys, ns)
 		seen[ns] = true
 	}
@@ -265,6 +272,16 @@ func validSettingsNS(ns string) bool {
 	return ok
 }
 
+func (e *Engine) settingsNamespaceActive(ns string) bool {
+	if !validSettingsNS(ns) {
+		return false
+	}
+	if ns == "web-search-deepseek" {
+		return e.hostPluginActive("@deepseek-ai/dsh-web-search-deepseek")
+	}
+	return true
+}
+
 func (e *Engine) checkSettingsRevisionLocked(ns string, expected *int) *RPCError {
 	if expected != nil && *expected != e.settingsRev[ns] {
 		return rpcError("settings-conflict", "settings revision does not match", map[string]any{"ns": ns, "expected": *expected, "actual": e.settingsRev[ns]})
@@ -277,7 +294,7 @@ func (e *Engine) settingsUpdate(ns string, patch map[string]any, expected *int, 
 }
 
 func (e *Engine) settingsUpdateFrom(origin *dynamicCordisRun, ns string, patch map[string]any, expected *int, replace bool) (any, *RPCError) {
-	if !validSettingsNS(ns) {
+	if !e.settingsNamespaceActive(ns) {
 		return nil, rpcError("settings-rejected", fmt.Sprintf("settings namespace %q is not registered", ns), map[string]any{"ns": ns})
 	}
 	if patch == nil {
@@ -333,7 +350,7 @@ func (e *Engine) settingsUpdateFrom(origin *dynamicCordisRun, ns string, patch m
 }
 
 func (e *Engine) settingsMutate(ns string, rawOps []any, expected *int) (any, *RPCError) {
-	if !validSettingsNS(ns) {
+	if !e.settingsNamespaceActive(ns) {
 		return nil, rpcError("settings-rejected", fmt.Sprintf("settings namespace %q is not registered", ns), map[string]any{"ns": ns})
 	}
 	e.mu.Lock()

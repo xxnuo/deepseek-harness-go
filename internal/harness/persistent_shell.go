@@ -30,16 +30,17 @@ type persistentShellRegistry struct {
 }
 
 type persistentShell struct {
-	mu        sync.Mutex
-	workspace string
-	mode      string
-	timeout   time.Duration
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	output    io.ReadCloser
-	stdout    *bufio.Reader
-	state     shellChildState
-	closed    bool
+	mu             sync.Mutex
+	workspace      string
+	mode           string
+	timeout        time.Duration
+	maxOutputChars int
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	output         io.ReadCloser
+	stdout         *bufio.Reader
+	state          shellChildState
+	closed         bool
 }
 
 type persistentShellResult struct {
@@ -58,6 +59,10 @@ func (r *persistentShellRegistry) run(ctx context.Context, owner, workspace, com
 }
 
 func (r *persistentShellRegistry) runWithMode(ctx context.Context, owner, workspace, mode, command string) (string, error) {
+	return r.runWithModeOptions(ctx, owner, workspace, mode, command, persistentShellTimeout, editorOutputLimit)
+}
+
+func (r *persistentShellRegistry) runWithModeOptions(ctx context.Context, owner, workspace, mode, command string, timeout time.Duration, maxOutputChars int) (string, error) {
 	if strings.TrimSpace(owner) == "" {
 		return "", errors.New("persistent shell requires an owning session")
 	}
@@ -69,6 +74,12 @@ func (r *persistentShellRegistry) runWithMode(ctx context.Context, owner, worksp
 	if err != nil || !info.IsDir() {
 		return "", fmt.Errorf("persistent shell: invalid workspace %q", workspace)
 	}
+	if timeout <= 0 {
+		timeout = persistentShellTimeout
+	}
+	if maxOutputChars <= 0 {
+		maxOutputChars = editorOutputLimit
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -76,7 +87,7 @@ func (r *persistentShellRegistry) runWithMode(ctx context.Context, owner, worksp
 	}
 	shell := r.shells[owner]
 	if shell == nil {
-		shell = &persistentShell{workspace: workspace, mode: mode, timeout: persistentShellTimeout}
+		shell = &persistentShell{workspace: workspace, mode: mode, timeout: timeout, maxOutputChars: maxOutputChars}
 		r.shells[owner] = shell
 	} else if shell.workspace != workspace {
 		r.mu.Unlock()
@@ -94,6 +105,10 @@ func (r *persistentShellRegistry) runWithMode(ctx context.Context, owner, worksp
 		shell.resetLocked()
 		shell.mu.Unlock()
 	}
+	shell.mu.Lock()
+	shell.timeout = timeout
+	shell.maxOutputChars = maxOutputChars
+	shell.mu.Unlock()
 	r.mu.Unlock()
 	return shell.run(ctx, command)
 }
@@ -112,6 +127,22 @@ func (r *persistentShellRegistry) close() {
 	r.shells = map[string]*persistentShell{}
 	r.mu.Unlock()
 	for _, shell := range shells {
+		shell.close()
+	}
+}
+
+func (r *persistentShellRegistry) hasOwnerActivity(owner string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.shells[owner] != nil
+}
+
+func (r *persistentShellRegistry) closeOwner(owner string) {
+	r.mu.Lock()
+	shell := r.shells[owner]
+	delete(r.shells, owner)
+	r.mu.Unlock()
+	if shell != nil {
 		shell.close()
 	}
 }
@@ -162,10 +193,10 @@ func (s *persistentShell) run(ctx context.Context, command string) (string, erro
 				}
 				return "", fmt.Errorf("persistent shell failed to start: %s: %w", value.text, value.err)
 			}
-			text := appendShellStatus(clipEditorOutput(value.text), persistentShellExitMarker(state))
+			text := appendShellStatus(clipEditorOutputLimit(value.text, s.maxOutputChars), persistentShellExitMarker(state))
 			return appendShellStatus(text, persistentShellResetMessage), nil
 		}
-		text := clipEditorOutput(value.text)
+		text := clipEditorOutputLimit(value.text, s.maxOutputChars)
 		if value.exitCode != 0 {
 			text = appendShellStatus(text, fmt.Sprintf("[exit code: %d]", value.exitCode))
 		}
@@ -182,7 +213,7 @@ func (s *persistentShell) run(ctx context.Context, command string) (string, erro
 		if upstreamErr != nil {
 			return "", upstreamErr
 		}
-		partial := clipEditorOutput(value.text)
+		partial := clipEditorOutputLimit(value.text, s.maxOutputChars)
 		seconds := int((timeout + 500*time.Millisecond) / time.Second)
 		return fmt.Sprintf("Your command timed out after %d seconds or experienced an OOM error. Below is partial output:\n%s\n%s", seconds, partial, persistentShellResetMessage), nil
 	}

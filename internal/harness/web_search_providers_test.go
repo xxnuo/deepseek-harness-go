@@ -107,6 +107,20 @@ func TestOptionalSearchProvidersErrorsAndSelection(t *testing.T) {
 	}
 }
 
+func TestOptionalSearchProviderExplicitEmptyKeyOverridesEnvironment(t *testing.T) {
+	t.Setenv("EXA_API_KEY", "exa-env-key")
+	t.Setenv("PERPLEXITY_API_KEY", "perplexity-env-key")
+	empty := ""
+	exa := NewExaSearchProvider(ExaSearchProviderOptions{APIKeyConfigured: &empty})
+	if exa.Available() {
+		t.Fatal("Exa explicit empty apiKey fell back to EXA_API_KEY")
+	}
+	perplexity := NewPerplexitySearchProvider(PerplexitySearchProviderOptions{APIKeyConfigured: &empty})
+	if perplexity.Available() {
+		t.Fatal("Perplexity explicit empty apiKey fell back to PERPLEXITY_API_KEY")
+	}
+}
+
 func ioNopCloser(value string) *testReadCloser {
 	return &testReadCloser{Reader: strings.NewReader(value)}
 }

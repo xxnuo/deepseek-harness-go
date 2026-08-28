@@ -31,6 +31,8 @@ type queuedPrompt struct {
 	content            []ContentBlock
 	source             map[string]any
 	additionalContexts []SessionReferenceContext
+	goalReservation    bool
+	goalStale          bool
 	done               chan promptOutcome
 }
 
@@ -201,11 +203,21 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		}
 		return nil, execution.Result, nil
 	}
-	content, err := e.durablePromptContent(req.Content)
+	var content []ContentBlock
+	if req.preparedContent != nil {
+		content = cloneContentBlocks(req.preparedContent)
+	} else {
+		content, err = e.durablePromptContentContext(ctx, req.Content)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	content, parsedReferences, err := parseSessionReferenceContent(content)
 	if err != nil {
 		return nil, nil, err
 	}
-	prepared, err := e.PrepareSessionReferences(ctx, id, content, req.References, e.cfg.SessionReference)
+	references := append(parsedReferences, req.References...)
+	prepared, err := e.PrepareSessionReferences(ctx, id, content, references, e.cfg.SessionReference)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -249,8 +261,10 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		target = "next-step"
 		start = len(s.steering)
 	} else if source["kind"] != "goal" {
+		s.parked = false
 		for i, pending := range s.pending {
 			if isGoalPrompt(pending) {
+				pending.goalStale = true
 				start = i
 				break
 			}
@@ -277,11 +291,20 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		s.maintenanceWake = true
 	}
 	startWorker := !s.Running && !s.maintenance
+	var claimEvent *Event
 	if startWorker {
 		s.Running = true
+		installSessionActivityLocked(s)
+		if claimed, claimedEvent, claimErr := claimNextPromptLocked(s); claimErr == nil && claimed != nil {
+			s.claimed = claimed
+			claimEvent = &claimedEvent
+		}
 	}
 	s.mu.Unlock()
 	e.publishEventFrom(origin, id, event)
+	if claimEvent != nil {
+		e.publishEventFrom(origin, id, *claimEvent)
+	}
 	e.emitQueue(s)
 	if startWorker {
 		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
@@ -301,12 +324,22 @@ func (e *Engine) startSessionWorker(s *Session) {
 		s.maintenanceWake = true
 	}
 	start := !s.Running && !s.maintenance
+	var claimEvent *Event
 	if start {
 		s.Running = true
+		installSessionActivityLocked(s)
+		if claimed, event, claimErr := claimNextPromptLocked(s); claimErr == nil && claimed != nil {
+			s.claimed = claimed
+			claimEvent = &event
+		}
 	}
 	id := s.Header.ID
 	s.mu.Unlock()
 	if start {
+		if claimEvent != nil {
+			e.publishEvent(id, *claimEvent)
+			e.emitQueue(s)
+		}
 		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
 		e.notifyAgentTeamStatus(id)
 		e.launchSessionWorker(s)
@@ -344,6 +377,9 @@ func (e *Engine) enqueueTeamPrompt(s *Session, content []ContentBlock, source ma
 		return "", err
 	}
 	*queue = append(*queue, job)
+	if wakeup {
+		s.parked = false
+	}
 	if s.maintenance && wakeup {
 		s.maintenanceWake = true
 	}
@@ -381,11 +417,19 @@ func (e *Engine) launchSessionWorker(s *Session) {
 
 func (e *Engine) finishClosedSessionWorker(s *Session) {
 	s.mu.Lock()
-	pending := append(append([]*queuedPrompt(nil), s.pending...), s.steering...)
+	pending := make([]*queuedPrompt, 0, 1+len(s.pending)+len(s.steering))
+	if s.claimed != nil {
+		pending = append(pending, s.claimed)
+	}
+	pending = append(pending, s.pending...)
+	pending = append(pending, s.steering...)
+	s.claimed = nil
+	s.activePrompt = nil
 	s.pending = nil
 	s.steering = nil
 	s.Running = false
 	s.Cancel = nil
+	s.activity = nil
 	s.mu.Unlock()
 	for _, item := range pending {
 		if item.done != nil {
@@ -448,10 +492,41 @@ func nextTurnLocked(s *Session) int {
 	return s.turnCounter
 }
 
-// runSessionWorker owns a session's active-turn state. It claims prompts in
-// FIFO order, creates a fresh cancellation context for each turn, and keeps
-// pending prompts after cancellation so they can resume after the aborted
-// turn settles.
+func installSessionActivityLocked(s *Session) *sessionActivity {
+	if s.activity != nil {
+		return s.activity
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	activity := &sessionActivity{ctx: ctx, cancel: cancel}
+	s.activity = activity
+	s.Cancel = func() { cancel(context.Canceled) }
+	return activity
+}
+
+func clearSessionActivityLocked(s *Session, activity *sessionActivity) {
+	if s.activity != activity {
+		return
+	}
+	s.activity = nil
+	s.Cancel = nil
+}
+
+func turnAbortReason(ctx context.Context) map[string]any {
+	reason := map[string]any{"kind": "legacy"}
+	var cancelled *agentCancelError
+	if errors.As(context.Cause(ctx), &cancelled) {
+		reason = map[string]any{"kind": cancelled.cause.Kind}
+		if cancelled.cause.Reason != "" {
+			reason["reason"] = cancelled.cause.Reason
+		}
+	}
+	return map[string]any{"kind": "aborted", "reason": reason}
+}
+
+// runSessionWorker owns a session's active-turn state. Waking input reserves
+// and claims its first item before the goroutine starts, so cancellation cannot
+// accidentally leak onto later work. Each following turn receives a fresh
+// activity context after the previous turn settles.
 func (e *Engine) runSessionWorker(s *Session) {
 	if isSubagentSession(s) {
 		e.startSubagentHooks(s)
@@ -466,14 +541,18 @@ func (e *Engine) runSessionWorker(s *Session) {
 			return
 		}
 
-		item, claimErr := e.claimNextPrompt(s)
+		item, activity, claimErr := e.claimNextPrompt(s)
 		if claimErr != nil {
 			e.disarmGoal(s.Header.ID)
 			s.mu.Lock()
+			failedActivity := s.activity
 			s.Running = false
-			s.Cancel = nil
+			clearSessionActivityLocked(s, failedActivity)
 			id := s.Header.ID
 			s.mu.Unlock()
+			if failedActivity != nil {
+				failedActivity.cancel(context.Canceled)
+			}
 			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
 			e.notifyAgentTeamStatus(id)
 			e.scheduleWake(id)
@@ -492,25 +571,34 @@ func (e *Engine) runSessionWorker(s *Session) {
 				s.mu.Unlock()
 				continue
 			}
+			idleActivity := s.activity
 			s.Running = false
-			s.Cancel = nil
+			clearSessionActivityLocked(s, idleActivity)
 			id := s.Header.ID
 			s.mu.Unlock()
+			if idleActivity != nil {
+				idleActivity.cancel(context.Canceled)
+			}
 			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
 			e.notifyAgentTeamStatus(id)
 			e.scheduleWake(id)
 			return
 		}
+		if item.source["kind"] == "user" {
+			e.jobWakeMu.Lock()
+			delete(e.jobWakes, s.Header.ID)
+			e.jobWakeMu.Unlock()
+		}
 
 		turn := e.nextTurn(s)
-		turnCtx, cancel := context.WithCancel(context.Background())
+		turnCtx := activity.ctx
 		s.mu.Lock()
 		if s.draining {
 			s.Running = false
-			s.Cancel = nil
+			clearSessionActivityLocked(s, activity)
 			id := s.Header.ID
 			s.mu.Unlock()
-			cancel()
+			activity.cancel(context.Canceled)
 			if item.done != nil {
 				item.done <- promptOutcome{err: errors.New("subagent session is being released")}
 			}
@@ -519,7 +607,6 @@ func (e *Engine) runSessionWorker(s *Session) {
 			e.scheduleWake(id)
 			return
 		}
-		s.Cancel = cancel
 		s.mu.Unlock()
 		_, _ = e.appendEvent(s, "turn/start", map[string]any{"turn": turn})
 		hookOutcome, userErr := e.runHookPoint(turnCtx, s, hookPointInput{
@@ -534,8 +621,24 @@ func (e *Engine) runSessionWorker(s *Session) {
 		if userErr == nil {
 			_, userErr = e.admitPrompt(turnCtx, s, item)
 		}
+		s.mu.Lock()
+		if s.activePrompt == item {
+			s.activePrompt = nil
+		}
+		s.mu.Unlock()
 		if userErr == nil {
 			userErr = e.appendHookContexts(s, hookOutcome.contexts)
+		}
+		if userErr == nil {
+			s.mu.Lock()
+			descriptor := s.initialSubagentDescriptor
+			s.initialSubagentDescriptor = nil
+			s.mu.Unlock()
+			if descriptor != nil {
+				if _, appendErr := e.appendEvent(s, "subagent/descriptor", descriptor.eventData()); appendErr != nil {
+					userErr = appendErr
+				}
+			}
 		}
 		var output string
 		var runErr error
@@ -543,9 +646,12 @@ func (e *Engine) runSessionWorker(s *Session) {
 			runErr = userErr
 			reason := map[string]any{"kind": "error", "error": map[string]any{"message": userErr.Error(), "code": "SESSION"}}
 			if errors.Is(userErr, context.Canceled) {
-				reason = map[string]any{"kind": "aborted"}
+				reason = turnAbortReason(turnCtx)
 			} else if userErr.Error() == "goal-round-stale" || errors.Is(userErr, errHookPromptRejected) {
 				reason = map[string]any{"kind": "rejected"}
+			}
+			if errors.Is(userErr, errHookPromptRejected) {
+				e.blockRejectedGoalRound(s, item)
 			}
 			_, _ = e.appendEvent(s, "turn/end", map[string]any{"turn": turn, "reason": reason})
 		} else {
@@ -579,12 +685,23 @@ func (e *Engine) runSessionWorker(s *Session) {
 		if item.done != nil {
 			item.done <- promptOutcome{text: output, err: runErr}
 		}
-		cancel()
+		activity.cancel(context.Canceled)
+		s.mu.Lock()
+		clearSessionActivityLocked(s, activity)
+		if s.parked {
+			s.Running = false
+			id := s.Header.ID
+			s.mu.Unlock()
+			e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": false})
+			e.notifyAgentTeamStatus(id)
+			e.scheduleWake(id)
+			return
+		}
+		s.mu.Unlock()
 	}
 }
 
-func (e *Engine) claimNextPrompt(s *Session) (*queuedPrompt, error) {
-	s.mu.Lock()
+func claimNextPromptLocked(s *Session) (*queuedPrompt, Event, error) {
 	target := "next-turn"
 	queue := &s.pending
 	if len(*queue) == 0 {
@@ -592,24 +709,46 @@ func (e *Engine) claimNextPrompt(s *Session) (*queuedPrompt, error) {
 		queue = &s.steering
 	}
 	if len(*queue) == 0 {
-		s.mu.Unlock()
-		return nil, nil
+		return nil, Event{}, nil
 	}
 	item := (*queue)[0]
 	event, err := appendEventLocked(s, "agent/inbox/spliced", map[string]any{
 		"target": target, "start": 0, "removedCount": 1, "inserted": []any{},
 	}, nil, nil, false)
+	if err != nil {
+		return nil, Event{}, err
+	}
+	*queue = (*queue)[1:]
+	return item, event, nil
+}
+
+func (e *Engine) claimNextPrompt(s *Session) (*queuedPrompt, *sessionActivity, error) {
+	s.mu.Lock()
+	if s.claimed != nil {
+		item := s.claimed
+		s.claimed = nil
+		s.activePrompt = item
+		activity := installSessionActivityLocked(s)
+		s.mu.Unlock()
+		return item, activity, nil
+	}
+	if len(s.pending) == 0 && len(s.steering) == 0 {
+		s.mu.Unlock()
+		return nil, nil, nil
+	}
+	activity := installSessionActivityLocked(s)
+	item, event, err := claimNextPromptLocked(s)
 	if err == nil {
-		*queue = (*queue)[1:]
+		s.activePrompt = item
 	}
 	id := s.Header.ID
 	s.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	e.publishEvent(id, event)
 	e.emitQueue(s)
-	return item, nil
+	return item, activity, nil
 }
 
 func openStepForTurn(events []Event, turn int) (bool, int) {
@@ -702,7 +841,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		}
 		reason := map[string]any{"kind": "error", "error": map[string]any{"message": resultErr.Error(), "code": "AGENT"}}
 		if errors.Is(resultErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(resultErr, ErrEngineClosed) {
-			reason = map[string]any{"kind": "aborted"}
+			reason = turnAbortReason(ctx)
 		}
 		e.closeOpenTurn(s, turn, reason)
 	}()
@@ -716,6 +855,10 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 	}
 	if err := e.ensureInstructionBaseline(ctx, s, agentRuntime); err != nil {
 		e.closeOpenTurn(s, turn, map[string]any{"kind": "error", "error": map[string]any{"message": err.Error(), "code": "CONTEXT"}})
+		return "", err
+	}
+	if err := e.ensureSkillCatalog(ctx, s, agentRuntime); err != nil {
+		e.closeOpenTurn(s, turn, map[string]any{"kind": "error", "error": map[string]any{"message": err.Error(), "code": "SKILL_CATALOG"}})
 		return "", err
 	}
 	messages := e.durableMessages(s, turn)
@@ -763,6 +906,10 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 			}
 			messages = e.durableMessages(s, turn)
 		}
+		if err := e.applyPendingPlanMode(s); err != nil {
+			e.closeOpenTurn(s, turn, map[string]any{"kind": "error", "error": map[string]any{"message": err.Error(), "code": "PLAN_MODE"}})
+			return "", err
+		}
 		assembly, err := e.promptAssemblyForSession(ctx, s, selection, agentRuntime)
 		if err != nil {
 			e.closeOpenTurn(s, turn, map[string]any{"kind": "error", "error": map[string]any{"message": err.Error(), "code": "PROMPT"}})
@@ -788,6 +935,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 			return "", err
 		}
 		messages = e.durableMessages(s, turn)
+		messages = e.dynamicCordisReferenceMessages(s.Header.ID, messages, agentRuntime)
 		header := map[string]any{"config": config}
 		if system != "" {
 			header["system"] = system
@@ -807,9 +955,12 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		var completion Completion
 		var streamed []Delta
 		overflowRetries := 0
+		compactionPolicy := compactionPolicyFor(agentRuntime.compactionConfig, ModelSelection{Provider: routeProvider, Model: selection.Model})
 		for {
+			requestMessages := append([]ChatMessage(nil), messages...)
+			requestMessages = append(requestMessages, e.skillInvocationMessages(s, turn)...)
 			request := ChatRequest{
-				SessionID: s.Header.ID, Model: selection.Model, System: system, Messages: messages, Tools: tools,
+				SessionID: s.Header.ID, Model: selection.Model, System: system, Messages: requestMessages, Tools: tools,
 				Thinking: thinking, ReasoningEffort: effort, Temperature: selection.Temperature, MaxTokens: maxTokens,
 			}
 			completion, streamed, err = e.completeWithRetrySink(ctx, provider, request, s, turn, step, func(delta Delta) error {
@@ -844,7 +995,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 				break
 			}
 			failure := retryFailure(err)
-			if failure.Code == "CONTEXT_WINDOW_EXCEEDED" && overflowRetries < e.cfg.Compaction.MaxOverflowRetries && ctx.Err() == nil {
+			if failure.Code == "CONTEXT_WINDOW_EXCEEDED" && agentRuntime.compactionEnabled && agentRuntime.compactionAuto && overflowRetries < compactionPolicy.MaxOverflowRetries && ctx.Err() == nil {
 				changed, _ := e.compactForOverflow(ctx, s, turn, selection, system, tools)
 				if changed && ctx.Err() == nil {
 					overflowRetries++
@@ -857,7 +1008,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, stepStart.Seq, selection, streamed); appendErr != nil {
 					return "", appendErr
 				}
-				reason = map[string]any{"kind": "aborted"}
+				reason = turnAbortReason(ctx)
 			}
 			e.closeOpenTurn(s, turn, reason)
 			return "", err
@@ -930,10 +1081,9 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 				return "", err
 			}
 		}
-		for _, call := range toolCalls {
-			if err := e.executeToolCall(ctx, s, turn, step, call); err != nil {
-				return "", err
-			}
+		concluded, err := e.executeToolCalls(ctx, s, turn, step, toolCalls)
+		if err != nil {
+			return "", err
 		}
 		for _, item := range steering {
 			if _, err := e.admitPrompt(ctx, s, item); err != nil {
@@ -942,6 +1092,12 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		}
 		if _, err := e.appendEvent(s, "step/end", map[string]any{"turn": turn, "step": step}); err != nil {
 			return "", err
+		}
+		if concluded {
+			if _, err := e.appendEvent(s, "turn/end", map[string]any{"turn": turn, "reason": map[string]any{"kind": "completed"}}); err != nil {
+				return "", err
+			}
+			return lastText, nil
 		}
 		// Rebuild from durable events so the next provider request includes the
 		// assistant tool calls and role=tool results in exact order.

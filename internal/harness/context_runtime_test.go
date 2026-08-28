@@ -240,7 +240,7 @@ func TestStepContextsSkipCanceledPreparation(t *testing.T) {
 	}
 }
 
-func TestPromptSessionReferencesAreSnapshottedAndPersistedBeforeMessage(t *testing.T) {
+func TestPromptSessionReferencesAreSnapshottedAndPersistedAfterMessage(t *testing.T) {
 	provider := &promptCaptureProvider{}
 	engine := newContextTestEngine(t, provider, nil)
 	sourceID, _ := engine.CreateSession(context.Background(), engine.Config().Workspace, "reference-source-prompt", "")
@@ -253,8 +253,9 @@ func TestPromptSessionReferencesAreSnapshottedAndPersistedBeforeMessage(t *testi
 		t.Fatal(err)
 	}
 	if _, err := engine.Run(context.Background(), targetID, PromptRequest{
-		Content:    []PromptContentPart{{Type: "text", Text: "use source"}},
-		References: []SessionReferenceInput{{SessionID: sourceID, Label: "source"}},
+		Content: []PromptContentPart{{Type: "text", Text: "use " + FormatSessionReferenceMention(SessionReferenceInput{
+			SessionID: sourceID, Label: "source",
+		})}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -278,12 +279,38 @@ func TestPromptSessionReferencesAreSnapshottedAndPersistedBeforeMessage(t *testi
 			userSeq = event.Seq
 		}
 	}
-	if referenceSeq < 0 || userSeq <= referenceSeq {
+	if userSeq < 0 || referenceSeq <= userSeq {
 		t.Fatalf("reference/user order = %d/%d", referenceSeq, userSeq)
 	}
 	requests := provider.snapshot()
-	if len(requests) != 1 || len(requests[0].Messages) < 2 || !strings.Contains(requests[0].Messages[0].Content, "source fact") || requests[0].Messages[1].Content != "use source" {
+	if len(requests) != 1 || len(requests[0].Messages) < 2 || requests[0].Messages[0].Content != "use @source" || !strings.Contains(requests[0].Messages[1].Content, "source fact") {
 		t.Fatalf("provider messages = %#v", requests)
+	}
+}
+
+func TestPromptRejectsMalformedCanonicalSessionMentionBeforeAdmission(t *testing.T) {
+	provider := &promptCaptureProvider{}
+	engine := newContextTestEngine(t, provider, nil)
+	targetID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "reference-malformed-target", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.Run(context.Background(), targetID, PromptRequest{
+		Content: []PromptContentPart{{Type: "text", Text: "@[bad](dsh-session:not-canonical)"}},
+	})
+	if !IsSessionReferenceError(err, SessionReferenceInvalidReference) {
+		t.Fatalf("malformed mention error = %#v", err)
+	}
+	if requests := provider.snapshot(); len(requests) != 0 {
+		t.Fatalf("malformed mention reached provider: %#v", requests)
+	}
+	target, _ := engine.getSession(targetID)
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	for _, event := range target.Events {
+		if event.Type == "user/message" {
+			t.Fatalf("malformed mention was admitted: %#v", event)
+		}
 	}
 }
 

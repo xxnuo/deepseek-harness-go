@@ -262,3 +262,42 @@ func TestTypertRemoteKnownUnsupportedDynamicMethodIsNot404(t *testing.T) {
 		t.Fatalf("plugin inventory = %#v", inventory)
 	}
 }
+
+func TestPluginInventoryUsesLiveHostEntries(t *testing.T) {
+	e := newIntegrationEngine(t)
+	t.Cleanup(func() { _ = e.Close() })
+	active := "active"
+	e.SetPluginInventory([]PluginInventoryEntry{
+		{EntryID: "first", ModuleName: "pkg:first", Enabled: true, FiberPhase: &active},
+		{EntryID: "disabled", ModuleName: "pkg:disabled", Enabled: false},
+		{EntryID: "group", ModuleName: "cordis:group", Enabled: true, FiberPhase: &active, Group: true},
+		{EntryID: "pending", ModuleName: "pkg:pending", Enabled: true, FiberPhase: func() *string { v := "pending"; return &v }()},
+	})
+	value, rpcErr := e.remotePluginInventory()
+	if rpcErr != nil {
+		t.Fatalf("inventory error: %v", rpcErr)
+	}
+	rows := value["entries"].([]map[string]any)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %#v", rows)
+	}
+	phase, ok := rows[0]["fiberPhase"].(*string)
+	if rows[0]["entryId"] != "first" || rows[0]["moduleName"] != "pkg:first" || !ok || *phase != active {
+		t.Fatalf("active row = %#v", rows[0])
+	}
+	if rows[1]["entryId"] != "disabled" || rows[1]["enabled"] != false || rows[1]["fiberPhase"] != (*string)(nil) {
+		t.Fatalf("disabled row = %#v", rows[1])
+	}
+	pendingPhase, ok := rows[2]["fiberPhase"].(*string)
+	if rows[2]["entryId"] != "pending" || !ok || *pendingPhase != "pending" {
+		t.Fatalf("pending row = %#v", rows[2])
+	}
+
+	next := "loading"
+	e.SetPluginInventory([]PluginInventoryEntry{{EntryID: "first", ModuleName: "pkg:first", Enabled: true, FiberPhase: &next}})
+	updated, _ := e.remotePluginInventory()
+	updatedRows := updated["entries"].([]map[string]any)
+	if len(updatedRows) != 1 || *updatedRows[0]["fiberPhase"].(*string) != next {
+		t.Fatalf("updated rows = %#v", updatedRows)
+	}
+}

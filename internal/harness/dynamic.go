@@ -102,6 +102,7 @@ type dynamicCordisState struct {
 	clientManifest []CordisInspectProviderManifest
 	pending        map[string]*dynamicCordisInspectPending
 	plugins        map[string]*dynamicCordisPlugin
+	pluginOrder    []string
 	services       map[string]dynamicCordisService
 	nextInspect    uint64
 	nextPlugin     uint64
@@ -194,6 +195,31 @@ func (loop *dynamicCordisLoop) call(job func()) bool {
 	return true
 }
 
+// pumpUntil keeps the single JavaScript runtime responsive while lifecycle
+// cleanup awaits a Promise whose resolver posts back onto this loop.
+func (loop *dynamicCordisLoop) pumpUntil(done func() bool) bool {
+	for !done() {
+		loop.mu.Lock()
+		for len(loop.jobs) == 0 && !loop.closed && !done() {
+			loop.cond.Wait()
+		}
+		if done() {
+			loop.mu.Unlock()
+			return true
+		}
+		if len(loop.jobs) == 0 {
+			loop.mu.Unlock()
+			return false
+		}
+		job := loop.jobs[0]
+		loop.jobs[0] = nil
+		loop.jobs = loop.jobs[1:]
+		loop.mu.Unlock()
+		job()
+	}
+	return true
+}
+
 func (loop *dynamicCordisLoop) close() {
 	loop.mu.Lock()
 	loop.closed = true
@@ -207,6 +233,10 @@ func newDynamicCordisState() *dynamicCordisState {
 		loop:              newDynamicCordisLoop(),
 		pending:           map[string]*dynamicCordisInspectPending{},
 		plugins:           map[string]*dynamicCordisPlugin{},
+		nextPlugin:        1,
+		nextPackage:       1,
+		nextRun:           1,
+		nextApproval:      1,
 		services:          map[string]dynamicCordisService{},
 		webRoutes:         map[string]*dynamicWebRouteRegistration{},
 		webUpgrades:       map[string]*dynamicWebUpgradeRegistration{},

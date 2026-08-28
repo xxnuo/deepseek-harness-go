@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,117 @@ func TestCordisPresetSelectsDynamicTools(t *testing.T) {
 		}
 		if standardTools[name] {
 			t.Errorf("standard preset unexpectedly exposes %s", name)
+		}
+	}
+}
+
+func TestAgentOwnedTerminalToolsDoNotDependOnHostInventory(t *testing.T) {
+	presets := t.TempDir()
+	for name, composition := range map[string]string{
+		"pty":   "- id: tool-terminal\n  name: '@deepseek-ai/dsh-tool-terminal'\n",
+		"plain": "- id: bash\n  name: '@deepseek-ai/dsh-tool-bash'\n",
+	} {
+		dir := filepath.Join(presets, name)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "agent.cordis.yml"), []byte(composition), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace, cfg.PresetDir, cfg.Persist = t.TempDir(), t.TempDir(), presets, false
+	cfg.SessionTitleLLM.Enabled = false
+	// The terminal tool is intentionally absent from the Host inventory. Its
+	// presence must still be observable for a preset that mounts the Agent row.
+	cfg.PluginInventory = []PluginInventoryEntry{{EntryID: "bash", ModuleName: "@deepseek-ai/dsh-tool-bash", Enabled: true}}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+
+	visible := func(preset string) map[string]bool {
+		t.Helper()
+		id, createErr := e.CreateSession(context.Background(), cfg.Workspace, "terminal-"+preset, preset)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		session, getErr := e.getSession(id)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		rows, listErr := e.toolsForSession(session)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		result := map[string]bool{}
+		for _, row := range rows {
+			result[row.Name] = true
+		}
+		return result
+	}
+
+	pty := visible("pty")
+	for _, name := range []string{"terminal_open", "terminal_send", "terminal_read", "terminal_signal", "terminal_close", "terminal_list"} {
+		if !pty[name] {
+			t.Fatalf("Agent-owned terminal tool %q missing: %#v", name, pty)
+		}
+	}
+	if plain := visible("plain"); plain["terminal_open"] {
+		t.Fatalf("terminal tool leaked into preset without tool-terminal: %#v", plain)
+	}
+}
+
+func TestHostPluginInventoryGatesModelPluginRegistration(t *testing.T) {
+	newEngine := func(inventory []PluginInventoryEntry) *Engine {
+		t.Helper()
+		cfg := DefaultConfig()
+		cfg.DataDir = t.TempDir()
+		cfg.Workspace = t.TempDir()
+		cfg.Persist = false
+		cfg.SessionTitleLLM.Enabled = false
+		cfg.PluginInventory = inventory
+		e, err := New(WithConfig(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = e.Close() })
+		return e
+	}
+
+	disabled := newEngine([]PluginInventoryEntry{
+		{EntryID: "questions", ModuleName: "@deepseek-ai/dsh-user-questions", Enabled: false},
+		{EntryID: "bash", ModuleName: "@deepseek-ai/dsh-tool-bash", Enabled: false},
+		{EntryID: "bash-persistent", ModuleName: "@deepseek-ai/dsh-tool-bash-persistent", Enabled: false},
+	})
+	for _, name := range []string{"ask_user_question", "bash"} {
+		for _, schema := range disabled.ListTools() {
+			if schema.Name == name {
+				t.Fatalf("disabled host plugin registered %q", name)
+			}
+		}
+	}
+	if runtime.GOOS != "windows" {
+		pwshOnly := newEngine([]PluginInventoryEntry{{EntryID: "pwsh", ModuleName: "@deepseek-ai/dsh-tool-pwsh", Enabled: true}})
+		for _, schema := range pwshOnly.ListTools() {
+			if schema.Name == "bash" {
+				t.Fatal("non-native shell plugin must not expose bash")
+			}
+		}
+	}
+
+	active := newEngine([]PluginInventoryEntry{
+		{EntryID: "questions", ModuleName: "@deepseek-ai/dsh-user-questions", Enabled: true},
+		{EntryID: "bash", ModuleName: "@deepseek-ai/dsh-tool-bash", Enabled: true},
+	})
+	registered := map[string]bool{}
+	for _, schema := range active.ListTools() {
+		registered[schema.Name] = true
+	}
+	for _, name := range []string{"ask_user_question", "bash"} {
+		if !registered[name] {
+			t.Fatalf("active host plugin did not register %q: %#v", name, registered)
 		}
 	}
 }
@@ -244,6 +356,52 @@ return {
 	e.mu.RUnlock()
 	if exists {
 		t.Fatal("dynamic tool survived undefine")
+	}
+}
+
+func TestDynamicCordisIdentityMintsStartAtOne(t *testing.T) {
+	e := newIntegrationEngine(t)
+	owner, err := e.CreateSession(t.Context(), e.Config().Workspace, "cordis-identity-mints", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.DynamicCordisDefine(DynamicCordisDefineRequest{
+		SessionID: owner,
+		Plugin:    DynamicCordisPluginSelector{Kind: "new", IDPrefix: "one"},
+		Name:      "first", Purpose: "identity mint",
+		Code: DynamicCordisCode{Host: `return { apply() {} }`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PluginID != "one-1" || first.PackageID != "pkg-1" {
+		t.Fatalf("first identities = %#v, want one-1/pkg-1", first)
+	}
+	run, err := e.DynamicCordisRun(t.Context(), owner, first.PluginID, first.PackageID, "run")
+	if err != nil || !run.OK || run.PluginRunID != "run-1" {
+		t.Fatalf("first run = %#v, %v", run, err)
+	}
+	second, err := e.DynamicCordisDefine(DynamicCordisDefineRequest{
+		SessionID: owner,
+		Plugin:    DynamicCordisPluginSelector{Kind: "existing", PluginID: first.PluginID},
+		Name:      "second", Purpose: "identity mint",
+		Code: DynamicCordisCode{Client: `return {}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PackageID != "pkg-2" {
+		t.Fatalf("second package = %q, want pkg-2", second.PackageID)
+	}
+	update, err := e.DynamicCordisRun(t.Context(), owner, first.PluginID, second.PackageID, "update")
+	if err != nil || !update.OK || update.PluginRunID != "run-2" {
+		t.Fatalf("second run = %#v, %v", update, err)
+	}
+	e.dynamicCordis.RLock()
+	requestID := dynamicCordisAttemptString(e.dynamicCordis.plugins[first.PluginID].latest, "approvalRequestId")
+	e.dynamicCordis.RUnlock()
+	if requestID != "approval-1" {
+		t.Fatalf("approval request = %q, want approval-1", requestID)
 	}
 }
 
@@ -679,10 +837,10 @@ func (dynamicCordisWebProvider) Fetch(context.Context, WebFetchRequest) (WebFetc
 func TestDynamicCordisWebServiceCallsGoProviders(t *testing.T) {
 	e := newIntegrationEngine(t)
 	provider := dynamicCordisWebProvider{}
-	if err := e.RegisterWebSearchProvider(provider); err != nil {
+	if _, err := e.RegisterWebSearchProvider(provider); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.RegisterWebFetchProvider(provider); err != nil {
+	if _, err := e.RegisterWebFetchProvider(provider); err != nil {
 		t.Fatal(err)
 	}
 	e.cfg.WebSearchProvider = provider.ID()
@@ -723,6 +881,142 @@ return {
 	result := executeRegisteredTool(t, e, "dynamic_web_probe", owner, map[string]any{})
 	if got := toolResultText(result); got != `{"answer":"answer","sources":1,"truncated":true,"body":"fetched"}` {
 		t.Fatalf("web result = %q", got)
+	}
+}
+
+func TestDynamicCordisWebServiceRegistersAsyncProvidersAndDisposesThem(t *testing.T) {
+	e := newIntegrationEngine(t)
+	owner, err := e.CreateSession(t.Context(), e.Config().Workspace, "cordis-web-provider", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := e.DynamicCordisDefine(DynamicCordisDefineRequest{
+		SessionID: owner,
+		Plugin:    DynamicCordisPluginSelector{Kind: "new", IDPrefix: "wprov"},
+		Name:      "dynamic web provider",
+		Purpose:   "register an async web provider",
+		Code: DynamicCordisCode{Host: `
+return {
+  inject: ['web', 'timer', 'tools'],
+  apply(ctx) {
+    ctx.web.registerSearchProvider({
+      id: 'dynamic-js',
+      available() { return true },
+      async search(request, signal) {
+        signal.throwIfAborted()
+        await ctx.timeout(1)
+        return { content: request.query, sources: [{ url: 'https://dynamic.example' }], truncated: false }
+      },
+    })
+    harness.registerTool(ctx, harness.defineTool({
+      name: 'dynamic_web_provider_probe',
+      description: 'Call the registered JS web provider.',
+      parameters: {},
+      output: { schema: { type: 'string' }, render(_args, value) { return [{ type: 'text', text: value }] } },
+      async execute() {
+        const result = await ctx.web.search({ query: 'from-tool', maxResults: 1 })
+        return result.content
+      },
+    }))
+  },
+}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, err := e.DynamicCordisRun(t.Context(), owner, receipt.PluginID, receipt.PackageID, "run"); err != nil || !run.OK {
+		t.Fatalf("run = %#v, %v", run, err)
+	}
+	e.cfg.WebSearchProvider = "dynamic-js"
+	result, err := e.webSearch(t.Context(), WebSearchRequest{Query: "from-js", MaxResults: 1})
+	if err != nil || result.Content != "from-js" || len(result.Sources) != 1 {
+		t.Fatalf("dynamic provider result = %#v, %v", result, err)
+	}
+	toolResult := executeRegisteredTool(t, e, "dynamic_web_provider_probe", owner, map[string]any{})
+	if got := toolResultText(toolResult); got != "from-tool" {
+		t.Fatalf("dynamic provider tool result = %q", got)
+	}
+	if stopped, err := e.DynamicCordisStop(owner, receipt.PluginID); err != nil || !stopped.OK {
+		t.Fatalf("stop = %#v, %v", stopped, err)
+	}
+	if _, err := e.webSearch(context.Background(), WebSearchRequest{Query: "after-stop"}); err == nil || !strings.Contains(err.Error(), `configured web provider "dynamic-js" is not registered`) {
+		t.Fatalf("provider remained after stop: %v", err)
+	}
+}
+
+func TestDynamicCordisWebServiceRegistersAsyncFetchProvider(t *testing.T) {
+	e := newIntegrationEngine(t)
+	owner, err := e.CreateSession(t.Context(), e.Config().Workspace, "cordis-web-fetch-provider", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := e.DynamicCordisDefine(DynamicCordisDefineRequest{
+		SessionID: owner,
+		Plugin:    DynamicCordisPluginSelector{Kind: "new", IDPrefix: "wfetch"},
+		Name:      "dynamic fetch provider",
+		Purpose:   "register an async fetch provider",
+		Code: DynamicCordisCode{Host: `
+return {
+  inject: ['web', 'timer'],
+  apply(ctx) {
+    ctx.web.registerFetchProvider({
+      id: 'dynamic-fetch',
+      available() { return true },
+      async fetch(request, signal) {
+        signal.throwIfAborted()
+        await ctx.timeout(1)
+        return { url: request.url + '/final', statusCode: 200, body: { kind: 'text', content: 'fetched' }, truncated: false }
+      },
+    })
+  },
+}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, err := e.DynamicCordisRun(t.Context(), owner, receipt.PluginID, receipt.PackageID, "run"); err != nil || !run.OK {
+		t.Fatalf("run = %#v, %v", run, err)
+	}
+	e.cfg.WebFetchProvider = "dynamic-fetch"
+	result, err := e.webFetch(t.Context(), WebFetchRequest{URL: "https://dynamic.example"})
+	if err != nil || result.URL != "https://dynamic.example/final" || result.Body.Content != "fetched" {
+		t.Fatalf("dynamic fetch result = %#v, %v", result, err)
+	}
+	if stopped, err := e.DynamicCordisStop(owner, receipt.PluginID); err != nil || !stopped.OK {
+		t.Fatalf("stop = %#v, %v", stopped, err)
+	}
+	if _, err := e.webFetch(context.Background(), WebFetchRequest{URL: "https://dynamic.example"}); err == nil || !strings.Contains(err.Error(), `configured web provider "dynamic-fetch" is not registered`) {
+		t.Fatalf("fetch provider remained after stop: %v", err)
+	}
+}
+
+func TestDynamicCordisWebProviderPreservesErrorCode(t *testing.T) {
+	e := newIntegrationEngine(t)
+	owner, err := e.CreateSession(t.Context(), e.Config().Workspace, "cordis-web-error", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := e.DynamicCordisDefine(DynamicCordisDefineRequest{
+		SessionID: owner, Plugin: DynamicCordisPluginSelector{Kind: "new", IDPrefix: "werr"},
+		Name: "dynamic web error", Purpose: "preserve provider error codes", Code: DynamicCordisCode{Host: `
+return { inject: ['web'], apply(ctx) {
+  ctx.web.registerSearchProvider({
+    id: 'dynamic-error', available() { return true },
+    search() { const error = new Error('blocked'); error.code = 'WEB_BLOCKED_URL'; throw error },
+  })
+} }`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, err := e.DynamicCordisRun(t.Context(), owner, receipt.PluginID, receipt.PackageID, "run"); err != nil || !run.OK {
+		t.Fatalf("run = %#v, %v", run, err)
+	}
+	e.cfg.WebSearchProvider = "dynamic-error"
+	_, err = e.webSearch(t.Context(), WebSearchRequest{Query: "q"})
+	webErr, ok := err.(*WebError)
+	if !ok || webErr.Code != "WEB_BLOCKED_URL" || webErr.Message != "blocked" {
+		t.Fatalf("dynamic provider error = %#v", err)
 	}
 }
 

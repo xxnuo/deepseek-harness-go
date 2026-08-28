@@ -240,14 +240,36 @@ return {
         content: args.content
       })
       const candidates = await ctx.sessionReferenceResolver.listCandidates(
-        { id: args.targetId }, args.sourceId, 5
+        { id: args.targetId }, args.sourceId
       )
       const prepared = await ctx.sessionReferenceResolver.prepare(
         { id: args.targetId },
         [{ type: 'text', text: 'compare source' }],
         [{ sessionId: args.sourceId, label: 'source' }]
       )
-      return { spill, candidates, prepared }
+      const failures = []
+      try {
+        await ctx.sessionReferenceResolver.listCandidates({ id: args.targetId }, '', 0)
+      } catch (error) {
+        failures.push({ name: error.name, code: error.code, message: error.message })
+      }
+	  const aborted = {
+		aborted: true,
+		reason: 'superseded',
+		addEventListener() {},
+		removeEventListener() {}
+	  }
+      try {
+        await ctx.sessionReferenceResolver.prepare(
+          { id: args.targetId },
+          [{ type: 'text', text: 'cancelled' }],
+          [{ sessionId: args.sourceId }],
+		  aborted
+        )
+      } catch (error) {
+        failures.push({ name: error.name, code: error.code, message: error.message })
+      }
+      return { spill, candidates, prepared, failures }
     })
   }
 }`)
@@ -286,6 +308,16 @@ return {
 	prompt := additional["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(prompt, "durable source context") || !strings.Contains(prompt, "untrusted, read-only snapshot") {
 		t.Fatalf("reference prompt = %q", prompt)
+	}
+	failures := value["failures"].([]any)
+	if len(failures) != 2 {
+		t.Fatalf("reference failures = %#v", failures)
+	}
+	invalid := failures[0].(map[string]any)
+	cancelled := failures[1].(map[string]any)
+	if invalid["name"] != "SessionReferenceError" || invalid["code"] != string(SessionReferenceInvalidReference) ||
+		cancelled["name"] != "SessionReferenceError" || cancelled["code"] != string(SessionReferenceCancelled) {
+		t.Fatalf("reference failures = %#v", failures)
 	}
 }
 
@@ -394,12 +426,12 @@ return {
       const blocked = ctx.goals.block({ id: args.sessionId }, { id: resumed.id, revision: resumed.revision }, { code: 'needs-input', message: 'waiting' })
       const cleared = ctx.goals.clear({ id: args.sessionId }, { id: blocked.id, revision: blocked.revision })
       const jobId = ctx.jobs.start({
-        kind: 'dynamic', label: 'instant',
+        kind: 'dynamic', label: 'instant', owner: { id: args.sessionId },
         run() { return { done: Promise.resolve({ status: 'completed', detail: 'ok', output: 'done' }), readOutput() { return 'delta' }, cancel() {} } }
       })
-      const before = ctx.jobs.get(jobId)
-      const waited = await ctx.jobs.wait(jobId, 1000)
-      const read = ctx.jobs.read(jobId)
+      const before = ctx.jobs.get(jobId, { id: args.sessionId })
+      const waited = await ctx.jobs.wait(jobId, 1000, { id: args.sessionId })
+      const read = ctx.jobs.read(jobId, { id: args.sessionId })
       return {
         childId: child.id, header, seq: child.seq, title, fetched: fetched.id, forkedId: forked.id,
 				hidden, entered: !!entered, detached, recycled: recycled.id, lifecycle,

@@ -771,6 +771,19 @@ func (p *managedDeepSeekProvider) Models(ctx context.Context) ([]ModelInfo, erro
 	return catalog, nil
 }
 
+func (p *managedDeepSeekProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	models, err := p.Models(ctx)
+	if err != nil {
+		return ModelInfo{}, err
+	}
+	for _, info := range models {
+		if info.ID == model {
+			return info, nil
+		}
+	}
+	return ModelInfo{}, fmt.Errorf("model %q is unavailable", model)
+}
+
 func deepSeekImageMessages(messages []ChatMessage) ([]ChatMessage, error) {
 	out := make([]ChatMessage, 0, len(messages)+1)
 	pendingToolImages := make([]ChatImage, 0)

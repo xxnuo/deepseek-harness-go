@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -93,12 +95,15 @@ func (p *CodexSubagentProvider) Start(ctx context.Context, request SubagentStart
 		return nil, err
 	}
 	command, args := codexAppServerCommand(p.executable)
-	process, err := startSubagentProcess(command, args, cwd, p.env)
+	process, err := startSubagentProcessWithStderr(command, args, cwd, p.env, true)
 	if err != nil {
 		return nil, fmt.Errorf("subagent-codex: start app-server: %w", err)
 	}
 	rpc := newSubagentRPCClient(process.stdout, process.stdin)
 	wire := newCodexSubagentWire(rpc, p.permissionMode)
+	if process.stderr != nil {
+		go observeCodexStderr(process.stderr, wire)
+	}
 	rpc.setHandlers(func(method string, raw json.RawMessage) (any, error) {
 		result, handleErr := wire.handleRequest(method, raw)
 		if handleErr != nil {
@@ -146,14 +151,24 @@ func (p *CodexSubagentProvider) Start(ctx context.Context, request SubagentStart
 	}
 	run := newSubagentRun(newRunID(), cancel, dispose)
 	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-run.Done():
+		}
+	}()
+	go func() {
 		result, runErr := wire.runTurn(runCtx, texts)
 		if runCtx.Err() != nil {
 			run.settle(SubagentResult{Output: wire.collectOutput(), StopReason: SubagentAborted})
 			return
 		}
 		if runErr != nil {
-			run.settle(SubagentResult{Output: wire.collectOutput(), StopReason: SubagentError})
+			run.settle(SubagentResult{Output: wire.collectOutput(), Diagnostic: wire.combinedDiagnostic(), StopReason: SubagentError})
 			return
+		}
+		if result.StopReason != SubagentCompleted {
+			result.Diagnostic = wire.combinedDiagnostic()
 		}
 		run.settle(result)
 	}()
@@ -192,6 +207,33 @@ func codexTextTask(prompt []ContentBlock) ([]string, error) {
 type codexNotification struct {
 	method string
 	params map[string]any
+	order  int
+}
+
+type codexFailureFacts struct {
+	stage         string
+	category      string
+	httpStatus    int
+	hasHTTPStatus bool
+}
+
+type codexPendingDiagnostic struct {
+	order    int
+	request  string
+	decision string
+	reason   string
+}
+
+type codexStderrSignature struct {
+	text     string
+	request  string
+	decision string
+	reason   string
+}
+
+var codexStderrSignatures = []codexStderrSignature{
+	{text: "approval policy is Never; reject command", request: "command execution", decision: "denied", reason: "Codex rejected an escalation because the selected policy never asks for approval"},
+	{text: "recorded sandbox violation:", request: "sandbox execution", decision: "failed", reason: "Codex reported a sandbox violation"},
 }
 
 type codexSubagentWire struct {
@@ -208,6 +250,12 @@ type codexSubagentWire struct {
 	lastUnphasedAnswer string
 	hasFinalAnswer     bool
 	hasUnphasedAnswer  bool
+	diagnostic         string
+	diagnosticOrder    int
+	observationOrder   int
+	pendingDiagnostic  *codexPendingDiagnostic
+	failure            *codexFailureFacts
+	stderrTail         string
 	fatal              chan struct{}
 	fatalErr           error
 	fatalOnce          sync.Once
@@ -288,17 +336,21 @@ func (w *codexSubagentWire) runTurn(ctx context.Context, texts []string) (Subage
 	}
 	var response map[string]any
 	if err := w.rpc.request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, &response); err != nil {
+		w.recordFailure(codexFailureFacts{stage: "turn-start", category: "unknown"})
 		return SubagentResult{}, fmt.Errorf("subagent-codex: turn/start: %w", err)
 	}
 	turn, err := subagentObject(response["turn"], "turn/start turn")
 	if err != nil {
+		w.recordFailure(codexFailureFacts{stage: "turn-start", category: "unknown"})
 		return SubagentResult{}, err
 	}
 	id, err := subagentString(turn["id"], "turn/start turn id")
 	if err != nil {
+		w.recordFailure(codexFailureFacts{stage: "turn-start", category: "unknown"})
 		return SubagentResult{}, err
 	}
 	if err := w.commitTurnID(id); err != nil {
+		w.recordFailure(codexFailureFacts{stage: "turn-start", category: "unknown"})
 		return SubagentResult{}, err
 	}
 	w.mu.Lock()
@@ -311,22 +363,33 @@ func (w *codexSubagentWire) runTurn(ctx context.Context, texts []string) (Subage
 		w.mu.Lock()
 		err := w.fatalErr
 		w.mu.Unlock()
+		w.recordFailure(codexFailureFacts{stage: "turn", category: "unknown"})
 		return SubagentResult{}, err
 	case <-w.rpc.done:
+		w.recordFailure(codexFailureFacts{stage: "process", category: "process-exit"})
 		return SubagentResult{}, w.rpc.waitError()
 	case params := <-completed:
 		terminal, err := subagentObject(params["turn"], "turn/completed turn")
 		if err != nil {
+			w.recordFailure(codexFailureFacts{stage: "turn", category: "unknown"})
 			return SubagentResult{}, err
 		}
-		if codexContextWindowExceeded(terminal) {
+		facts := codexTerminalFailureFacts(terminal)
+		if terminal["status"] != "completed" {
+			w.recordFailure(facts)
+		}
+		if facts.category == "sandboxError" {
+			w.recordDiagnostic("sandbox execution", "failed", "Codex reported a sandbox failure", 0)
+		}
+		if facts.category == "contextWindowExceeded" {
 			return SubagentResult{Output: w.collectOutput(), StopReason: SubagentMaxTokens}, nil
 		}
 		if terminal["status"] != "completed" {
-			return SubagentResult{}, fmt.Errorf("subagent-codex: Codex turn ended with status %v", terminal["status"])
+			return SubagentResult{}, fmt.Errorf("subagent-codex: Codex turn ended with status %v: %s", terminal["status"], facts.category)
 		}
 		output := w.collectOutput()
 		if len(output) == 0 {
+			w.recordFailure(codexFailureFacts{stage: "turn", category: "unknown"})
 			return SubagentResult{}, errors.New("subagent-codex: Codex completed without a final answer")
 		}
 		return SubagentResult{Output: output, StopReason: SubagentCompleted}, nil
@@ -359,6 +422,21 @@ func (w *codexSubagentWire) collectOutput() []ContentBlock {
 	return []ContentBlock{{Type: "text", Text: text}}
 }
 
+func observeCodexStderr(input io.Reader, wire *codexSubagentWire) {
+	buffer := make([]byte, 4096)
+	for {
+		count, err := input.Read(buffer)
+		if count > 0 {
+			chunk := append([]byte(nil), buffer[:count]...)
+			wire.observeStderr(string(chunk))
+			_, _ = os.Stderr.Write(chunk)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 func (w *codexSubagentWire) handleRequest(method string, raw json.RawMessage) (any, error) {
 	var params map[string]any
 	if err := decodeSubagentRPCParams(raw, &params); err != nil {
@@ -366,28 +444,44 @@ func (w *codexSubagentWire) handleRequest(method string, raw json.RawMessage) (a
 	}
 	switch method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
-		if err := w.validateRunIDs(params, false); err != nil {
+		provisional, err := w.validateRunIDs(params, false)
+		if err != nil {
 			return nil, err
 		}
 		decision, err := codexUnattendedDecision(params)
 		if err != nil {
 			return nil, err
 		}
+		request := "command approval"
+		if method == "item/fileChange/requestApproval" {
+			request = "file approval"
+		}
+		verdict := "declined"
+		if decision == "cancel" {
+			verdict = "cancelled"
+		}
+		w.recordRequestDiagnostic(provisional, request, verdict, "the provider does not grant interactive approval")
 		return map[string]any{"decision": decision}, nil
 	case "item/permissions/requestApproval":
-		if err := w.validateRunIDs(params, false); err != nil {
+		provisional, err := w.validateRunIDs(params, false)
+		if err != nil {
 			return nil, err
 		}
+		w.recordRequestDiagnostic(provisional, "permission grant", "denied", "the provider grants no additional turn permissions")
 		return map[string]any{"permissions": map[string]any{}, "scope": "turn"}, nil
 	case "item/tool/requestUserInput":
-		if err := w.validateRunIDs(params, false); err != nil {
+		provisional, err := w.validateRunIDs(params, false)
+		if err != nil {
 			return nil, err
 		}
+		w.recordRequestDiagnostic(provisional, "user input", "empty response", "the provider does not collect interactive answers")
 		return map[string]any{"answers": map[string]any{}}, nil
 	case "mcpServer/elicitation/request":
-		if err := w.validateRunIDs(params, true); err != nil {
+		provisional, err := w.validateRunIDs(params, true)
+		if err != nil {
 			return nil, err
 		}
+		w.recordRequestDiagnostic(provisional, "MCP elicitation", "declined", "the provider does not collect interactive MCP input")
 		return map[string]any{"action": "decline", "content": nil, "_meta": nil}, nil
 	default:
 		return nil, fmt.Errorf("subagent-codex: unsupported app-server request %q", method)
@@ -403,6 +497,10 @@ func (w *codexSubagentWire) handleNotification(method string, raw json.RawMessag
 }
 
 func (w *codexSubagentWire) applyNotification(method string, params map[string]any, queueEarly bool) error {
+	return w.applyNotificationWithOrder(method, params, queueEarly, 0)
+}
+
+func (w *codexSubagentWire) applyNotificationWithOrder(method string, params map[string]any, queueEarly bool, order int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	switch method {
@@ -433,7 +531,8 @@ func (w *codexSubagentWire) applyNotification(method string, params map[string]a
 				if err := w.observePendingTurnIDLocked(id); err != nil {
 					return err
 				}
-				w.early = append(w.early, codexNotification{method: method, params: params})
+				w.observationOrder++
+				w.early = append(w.early, codexNotification{method: method, params: params, order: w.observationOrder})
 			}
 			return nil
 		}
@@ -441,8 +540,19 @@ func (w *codexSubagentWire) applyNotification(method string, params map[string]a
 			return nil
 		}
 		item, err := subagentObject(params["item"], "item/completed item")
-		if err != nil || item["type"] != "agentMessage" {
+		if err != nil {
 			return err
+		}
+		if item["type"] == "commandExecution" && item["status"] == "declined" {
+			w.recordDiagnosticLocked("command execution", "declined", "Codex declined the command under the selected permission mode", order)
+			return nil
+		}
+		if item["type"] == "fileChange" && item["status"] == "declined" {
+			w.recordDiagnosticLocked("file change", "declined", "Codex declined the file change under the selected permission mode", order)
+			return nil
+		}
+		if item["type"] != "agentMessage" {
+			return nil
 		}
 		text, ok := item["text"].(string)
 		if !ok {
@@ -476,7 +586,8 @@ func (w *codexSubagentWire) applyNotification(method string, params map[string]a
 				if err := w.observePendingTurnIDLocked(id); err != nil {
 					return err
 				}
-				w.early = append(w.early, codexNotification{method: method, params: params})
+				w.observationOrder++
+				w.early = append(w.early, codexNotification{method: method, params: params, order: w.observationOrder})
 			}
 			return nil
 		}
@@ -513,37 +624,135 @@ func (w *codexSubagentWire) commitTurnID(id string) error {
 		return errors.New("subagent-codex: turn/start response did not match the active turn")
 	}
 	w.turnID = id
+	if pending := w.pendingDiagnostic; pending != nil {
+		w.recordDiagnosticLocked(pending.request, pending.decision, pending.reason, pending.order)
+		w.pendingDiagnostic = nil
+	}
 	early := append([]codexNotification(nil), w.early...)
 	w.early = nil
 	w.mu.Unlock()
 	for _, notification := range early {
-		if err := w.applyNotification(notification.method, notification.params, false); err != nil {
+		if err := w.applyNotificationWithOrder(notification.method, notification.params, false, notification.order); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *codexSubagentWire) validateRunIDs(params map[string]any, nullableTurn bool) error {
+func (w *codexSubagentWire) recordRequestDiagnostic(provisional bool, request, decision, reason string) {
+	w.mu.Lock()
+	w.observationOrder++
+	order := w.observationOrder
+	if provisional {
+		w.pendingDiagnostic = &codexPendingDiagnostic{order: order, request: request, decision: decision, reason: reason}
+		w.mu.Unlock()
+		return
+	}
+	w.recordDiagnosticLocked(request, decision, reason, order)
+	w.mu.Unlock()
+}
+
+func (w *codexSubagentWire) recordDiagnostic(request, decision, reason string, order int) {
+	w.mu.Lock()
+	w.recordDiagnosticLocked(request, decision, reason, order)
+	w.mu.Unlock()
+}
+
+func (w *codexSubagentWire) recordDiagnosticLocked(request, decision, reason string, order int) {
+	if order == 0 {
+		w.observationOrder++
+		order = w.observationOrder
+	}
+	if order < w.diagnosticOrder {
+		return
+	}
+	w.diagnosticOrder = order
+	w.diagnostic = fmt.Sprintf("Codex unattended decision (mode: %s; request: %s; decision: %s): %s", w.permissionMode, request, decision, reason)
+}
+
+func (w *codexSubagentWire) recordFailure(facts codexFailureFacts) {
+	w.mu.Lock()
+	copy := facts
+	w.failure = &copy
+	w.mu.Unlock()
+}
+
+func (w *codexSubagentWire) combinedDiagnostic() string {
+	w.mu.Lock()
+	facts := w.failure
+	permission := w.diagnostic
+	w.mu.Unlock()
+	if facts == nil {
+		facts = &codexFailureFacts{stage: "turn", category: "unknown"}
+	}
+	diagnostic := codexFailureDiagnostic(*facts)
+	if permission != "" {
+		diagnostic += "\n" + permission
+	}
+	return diagnostic
+}
+
+func (w *codexSubagentWire) observeStderr(chunk string) {
+	w.mu.Lock()
+	observed := w.stderrTail + chunk
+	latestIndex := -1
+	var latest *codexStderrSignature
+	for index := range codexStderrSignatures {
+		position := strings.LastIndex(observed, codexStderrSignatures[index].text)
+		if position > latestIndex {
+			latestIndex = position
+			latest = &codexStderrSignatures[index]
+		}
+	}
+	if latest != nil {
+		w.recordDiagnosticLocked(latest.request, latest.decision, latest.reason, 0)
+	}
+	w.stderrTail = codexStderrSignatureTail(observed)
+	w.mu.Unlock()
+}
+
+func codexStderrSignatureTail(value string) string {
+	max := 0
+	for _, item := range codexStderrSignatures {
+		if len(item.text) > max {
+			max = len(item.text)
+		}
+	}
+	length := max - 1
+	if length > len(value) {
+		length = len(value)
+	}
+	for ; length > 0; length-- {
+		tail := value[len(value)-length:]
+		for _, item := range codexStderrSignatures {
+			if len(tail) < len(item.text) && strings.HasPrefix(item.text, tail) {
+				return tail
+			}
+		}
+	}
+	return ""
+}
+
+func (w *codexSubagentWire) validateRunIDs(params map[string]any, nullableTurn bool) (bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if params["threadId"] != w.threadID {
-		return errors.New("subagent-codex: app-server request referenced another thread")
+		return false, errors.New("subagent-codex: app-server request referenced another thread")
 	}
 	if nullableTurn && params["turnId"] == nil {
-		return nil
+		return false, nil
 	}
 	id, err := subagentString(params["turnId"], "server request turn id")
 	if err != nil {
-		return err
+		return false, err
 	}
 	if w.turnID == "" {
-		return w.observePendingTurnIDLocked(id)
+		return true, w.observePendingTurnIDLocked(id)
 	}
 	if id != w.turnID {
-		return errors.New("subagent-codex: app-server request referenced another turn")
+		return false, errors.New("subagent-codex: app-server request referenced another turn")
 	}
-	return nil
+	return false, nil
 }
 
 func codexUnattendedDecision(params map[string]any) (string, error) {
@@ -568,12 +777,79 @@ func codexUnattendedDecision(params map[string]any) (string, error) {
 	return "", errors.New("subagent-codex: app-server offered no unattended approval decision")
 }
 
-func codexContextWindowExceeded(turn map[string]any) bool {
+func codexFailureDiagnostic(facts codexFailureFacts) string {
+	fields := []string{"product: Codex", "stage: " + facts.stage, "category: " + facts.category}
+	if facts.hasHTTPStatus {
+		fields = append(fields, fmt.Sprintf("HTTP status: %d", facts.httpStatus))
+	}
+	return "Product subagent failure (" + strings.Join(fields, "; ") + ")"
+}
+
+func codexTerminalFailureFacts(turn map[string]any) codexFailureFacts {
+	facts := codexFailureFacts{stage: "turn", category: "unknown"}
 	if turn["status"] != "failed" {
-		return false
+		return facts
 	}
 	errorValue, ok := turn["error"].(map[string]any)
-	return ok && errorValue["codexErrorInfo"] == "contextWindowExceeded"
+	if !ok {
+		return facts
+	}
+	info := errorValue["codexErrorInfo"]
+	if category, ok := info.(string); ok {
+		for _, known := range []string{
+			"contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "serverOverloaded",
+			"cyberPolicy", "internalServerError", "unauthorized", "badRequest", "threadRollbackFailed", "sandboxError", "other",
+		} {
+			if category == known {
+				facts.category = category
+				return facts
+			}
+		}
+		return facts
+	}
+	object, ok := info.(map[string]any)
+	if !ok || len(object) != 1 {
+		return facts
+	}
+	for category, raw := range object {
+		detail, ok := raw.(map[string]any)
+		if !ok {
+			return facts
+		}
+		switch category {
+		case "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts":
+			facts.category = category
+			if status, ok := codexNumericHTTPStatus(detail["httpStatusCode"]); ok {
+				facts.httpStatus, facts.hasHTTPStatus = status, true
+			}
+		case "activeTurnNotSteerable":
+			facts.category = category
+		}
+		return facts
+	}
+	return facts
+}
+
+func codexNumericHTTPStatus(value any) (int, bool) {
+	var number float64
+	switch value := value.(type) {
+	case float64:
+		number = value
+	case json.Number:
+		parsed, err := value.Float64()
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	case int:
+		number = float64(value)
+	default:
+		return 0, false
+	}
+	if number < 0 || number > 65535 || number != float64(int(number)) {
+		return 0, false
+	}
+	return int(number), true
 }
 
 func subagentObject(value any, label string) (map[string]any, error) {

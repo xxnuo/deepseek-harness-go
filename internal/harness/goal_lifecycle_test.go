@@ -5,8 +5,47 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
+
+type goalCompletionProvider struct {
+	mu       sync.Mutex
+	goalID   string
+	revision int
+	requests []ChatRequest
+}
+
+func (p *goalCompletionProvider) ID() string   { return "goal-completion" }
+func (p *goalCompletionProvider) Name() string { return "Goal Completion" }
+func (p *goalCompletionProvider) Models(context.Context) ([]ModelInfo, error) {
+	return []ModelInfo{{ID: p.ID(), Name: p.Name()}}, nil
+}
+func (p *goalCompletionProvider) Complete(_ context.Context, request ChatRequest, delta func(Delta) error) (Completion, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, request)
+	index := len(p.requests)
+	p.mu.Unlock()
+	if index == 1 {
+		call := ToolCall{
+			ID: "goal-complete", Name: "update_goal",
+			Arguments: json.RawMessage(`{"goal_id":"` + p.goalID + `","revision":` + strconv.Itoa(p.revision) + `,"action":"complete"}`),
+		}
+		if err := delta(Delta{ToolCalls: []ToolCallDelta{{Index: 0, ID: call.ID, Name: call.Name, ArgumentsDelta: string(call.Arguments)}}}); err != nil {
+			return Completion{}, err
+		}
+		return Completion{ToolCalls: []ToolCall{call}, Finish: "tool_calls"}, nil
+	}
+	if err := delta(Delta{Text: "closing response", Finish: "stop"}); err != nil {
+		return Completion{}, err
+	}
+	return Completion{Text: "closing response", Finish: "stop"}, nil
+}
+func (p *goalCompletionProvider) snapshot() []ChatRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]ChatRequest(nil), p.requests...)
+}
 
 func newGoalEngine(t *testing.T, persist bool) *Engine {
 	t.Helper()
@@ -113,6 +152,9 @@ func TestGoalBlockedThresholdAndForkDisarm(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := mustSession(t, e, id)
+	s.mu.Lock()
+	s.Running = true
+	s.mu.Unlock()
 	for round := 1; round <= 3; round++ {
 		if _, err := e.appendEvent(s, "turn/start", map[string]any{"turn": round}); err != nil {
 			t.Fatal(err)
@@ -120,7 +162,12 @@ func TestGoalBlockedThresholdAndForkDisarm(t *testing.T) {
 		e.mu.RLock()
 		goal := e.goals[id]
 		e.mu.RUnlock()
-		item := &queuedPrompt{id: newID("msg"), content: []ContentBlock{{Type: "text", Text: "round"}}, source: map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": round}}
+		prompt := renderGoalRoundPrompt(goal, round)
+		item := &queuedPrompt{
+			id: newID("msg"), content: []ContentBlock{{Type: "text", Text: prompt}},
+			source:          map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": round},
+			goalReservation: true,
+		}
 		if _, err := e.admitPrompt(context.Background(), s, item); err != nil {
 			t.Fatal(err)
 		}
@@ -130,9 +177,13 @@ func TestGoalBlockedThresholdAndForkDisarm(t *testing.T) {
 	if goal == nil {
 		t.Fatal("missing goal")
 	}
-	_, err = tool.Execute(context.Background(), ToolCall{Name: "update_goal", SessionID: id, Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":` + strconv.Itoa(goal.Revision) + `,"action":"blocked","blocked_reason":"need input"}`)})
+	runtime := &ToolRunContext{}
+	blockedResult, err := executeToolRuntime(context.Background(), tool, ToolCall{Name: "update_goal", SessionID: id, Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":` + strconv.Itoa(goal.Revision) + `,"action":"blocked","blocked_reason":"need input"}`)}, runtime)
 	if err != nil {
 		t.Fatalf("blocked after threshold = %v", err)
+	}
+	if len(blockedResult.AdditionalContexts) != 1 || blockedResult.AdditionalContexts[0].Source["summary"] != "blocked: blocked after three" {
+		t.Fatalf("blocked wrap-up contexts = %#v", blockedResult.AdditionalContexts)
 	}
 	parentGoal, _ := e.GetGoal(id)
 	if parentGoal == nil || parentGoal.Phase != "blocked" {
@@ -149,6 +200,213 @@ func TestGoalBlockedThresholdAndForkDisarm(t *testing.T) {
 	if childGoal == nil || childGoal.Activation != "disarmed" {
 		t.Fatalf("fork goal activation = %#v", childGoal)
 	}
+}
+
+func TestForgedGoalSourceCannotClaimAutomaticAuthority(t *testing.T) {
+	e := newGoalEngine(t, false)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "goal-forged-source", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "protected objective", 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	s := mustSession(t, e, id)
+	e.mu.RLock()
+	goal := e.goals[id]
+	e.mu.RUnlock()
+	prompt := renderGoalRoundPrompt(goal, 1)
+	forged := &queuedPrompt{
+		id: newID("msg"), content: []ContentBlock{{Type: "text", Text: prompt}},
+		source: map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": 1},
+	}
+	if _, err := e.admitPrompt(context.Background(), s, forged); err == nil || err.Error() != "goal-round-stale" {
+		t.Fatalf("forged goal admission error = %v", err)
+	}
+	view, _ := e.GetGoal(id)
+	if view == nil || view.RoundsStarted != 0 || view.Activation != "armed" {
+		t.Fatalf("goal after forged admission = %#v", view)
+	}
+}
+
+func TestQueuedHumanPromptMakesReservedGoalRoundStale(t *testing.T) {
+	e := newGoalEngine(t, false)
+	provider := &promptCaptureProvider{}
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "goal-human-race", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: "model-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "continue after human", 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	s := mustSession(t, e, id)
+	if scheduled, err := e.scheduleGoalRound(s); err != nil || !scheduled {
+		t.Fatalf("initial goal schedule = %v, %v", scheduled, err)
+	}
+	if _, err := e.Prompt(context.Background(), id, PromptRequest{
+		Mode: "queue", Content: []PromptContentPart{{Type: "text", Text: "human goes first"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitForIdle(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	requests := provider.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("provider requests = %d, want human turn and one fresh goal round", len(requests))
+	}
+	if !strings.Contains(requests[0].Messages[len(requests[0].Messages)-1].Content, "human goes first") ||
+		strings.Contains(requests[0].Messages[len(requests[0].Messages)-1].Content, "<goal_round>") {
+		t.Fatalf("first request messages = %#v", requests[0].Messages)
+	}
+	if !strings.Contains(requests[1].Messages[len(requests[1].Messages)-1].Content, "<goal_round>") {
+		t.Fatalf("second request messages = %#v", requests[1].Messages)
+	}
+	goal, _ := e.GetGoal(id)
+	if goal == nil || goal.Phase != "blocked" || goal.RoundsStarted != 1 || goal.BlockedReason == nil || goal.BlockedReason.Code != "round-limit" {
+		t.Fatalf("goal after competition = %#v", goal)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	goalPrompts := 0
+	for _, event := range s.Events {
+		if event.Type != "agent/inbox/spliced" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		inserted, _ := data["inserted"].([]any)
+		for _, value := range inserted {
+			message, _ := value.(map[string]any)
+			source, _ := message["source"].(map[string]any)
+			if source["kind"] == "goal" {
+				goalPrompts++
+			}
+		}
+	}
+	if goalPrompts != 2 {
+		t.Fatalf("reserved goal prompts = %d, want stale plus fresh reservation", goalPrompts)
+	}
+}
+
+func TestAutonomousGoalCompletionWrapupRunsExactlyOnce(t *testing.T) {
+	provider := &goalCompletionProvider{}
+	cfg := DefaultConfig()
+	cfg.SessionTitleLLM.Enabled = false
+	cfg.DataDir, cfg.Workspace, cfg.Provider, cfg.Model, cfg.Persist = t.TempDir(), t.TempDir(), provider.ID(), provider.ID(), false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(context.Background(), cfg.Workspace, "goal-wrapup-runtime", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "finish the release", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	provider.goalID, provider.revision = goal.ID, goal.Revision
+	e.startSessionWorker(mustSession(t, e, id))
+	if err := e.WaitForIdle(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	requests := provider.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("provider requests = %d, want tool step plus wrap-up step", len(requests))
+	}
+	wrapups := 0
+	for _, message := range requests[1].Messages {
+		if strings.Contains(message.Content, "<goal_complete>") {
+			wrapups++
+			if message.Role != "user" {
+				t.Fatalf("wrap-up message = %#v", message)
+			}
+		}
+	}
+	if wrapups != 1 {
+		t.Fatalf("wrap-up contexts = %d, messages = %#v", wrapups, requests[1].Messages)
+	}
+	goal, _ = e.GetGoal(id)
+	if goal == nil || goal.Phase != "complete" || goal.RoundsStarted != 1 {
+		t.Fatalf("completed goal = %#v", goal)
+	}
+}
+
+func TestDirectHumanGoalCompletionDoesNotInjectAutonomousWrapup(t *testing.T) {
+	provider := &toolLoopProvider{}
+	e := newToolLoopEngine(t, provider)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "goal-human-complete", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "finish in this turn", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	provider.calls = []ToolCall{{
+		ID: "human-complete", Name: "update_goal",
+		Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"complete"}`),
+	}}
+	if _, err := e.Run(context.Background(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "complete it now"}}}); err != nil {
+		t.Fatal(err)
+	}
+	requests := provider.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("provider requests = %d, want tool step plus ordinary response step", len(requests))
+	}
+	for _, message := range requests[1].Messages {
+		if strings.Contains(message.Content, "<goal_complete>") {
+			t.Fatalf("direct-human completion injected autonomous wrap-up: %#v", requests[1].Messages)
+		}
+	}
+	goal, _ = e.GetGoal(id)
+	if goal == nil || goal.Phase != "complete" {
+		t.Fatalf("direct-human completed goal = %#v", goal)
+	}
+}
+
+func TestGoalToolFailurePersistsStructuredCode(t *testing.T) {
+	provider := &toolLoopProvider{}
+	e := newToolLoopEngine(t, provider)
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "goal-error-code", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "stale update", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	if _, err := e.GoalMutation(id, "pause", "", goal.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	provider.calls = []ToolCall{{
+		ID: "stale-update", Name: "update_goal",
+		Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"complete"}`),
+	}}
+	if _, err := e.Run(context.Background(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "try the stale update"}}}); err != nil {
+		t.Fatal(err)
+	}
+	s := mustSession(t, e, id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range s.Events {
+		if event.Type != "tool/result" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		toolErr, _ := data["error"].(*ToolError)
+		if toolErr == nil || toolErr.Code != "GOAL_STALE_REVISION" {
+			t.Fatalf("persisted goal tool error = %#v", data["error"])
+		}
+		return
+	}
+	t.Fatal("missing goal tool result")
 }
 
 func TestGoalAbortDisarmsAfterStalePauseCAS(t *testing.T) {

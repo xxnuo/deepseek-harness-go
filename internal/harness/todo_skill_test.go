@@ -198,6 +198,25 @@ func TestTodoWriteRejectsInvalidArguments(t *testing.T) {
 	}
 }
 
+func TestTodoWriteHonorsSingleActivePolicy(t *testing.T) {
+	e := newIntegrationEngine(t)
+	id := createToolSession(t, e)
+	allowed := false
+	cfg := e.Config()
+	cfg.TodoAllowParallelInProgress = &allowed
+	if err := e.ApplyRuntimeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	tool := registeredTool(t, e, "todo_write")
+	_, err := tool.Execute(context.Background(), ToolCall{
+		Name: "todo_write", SessionID: id,
+		Arguments: json.RawMessage(`{"todos":[{"content":"one","status":"in_progress"},{"content":"two","status":"in_progress"}]}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "at most one task may be in_progress (got 2)") {
+		t.Fatalf("single-active policy error = %v", err)
+	}
+}
+
 func writeTestSkill(t *testing.T, root, dir, document string) string {
 	t.Helper()
 	path := filepath.Join(root, dir, "SKILL.md")

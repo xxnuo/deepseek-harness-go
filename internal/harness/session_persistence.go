@@ -56,6 +56,12 @@ type SessionStore interface {
 	Close() error
 }
 
+// SessionPersistenceFlusher proves that accepted writes for one live session
+// reached the store's durable backend.
+type SessionPersistenceFlusher interface {
+	Flush(context.Context, string) error
+}
+
 type sessionStoreCreateRollback interface {
 	Delete(context.Context, string) error
 }
@@ -104,6 +110,24 @@ func (s *JSONLSessionStore) Locate(meta SessionHeader) (SessionLocation, bool) {
 }
 
 func (s *JSONLSessionStore) SupportsRawArtifacts() bool { return true }
+
+func (s *JSONLSessionStore) Flush(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	_, live := s.states[id]
+	closed := s.closing || s.closed
+	s.mu.Unlock()
+	if closed {
+		return storageError(StorageClosed, "JSONL session store is closed")
+	}
+	if !live {
+		return fmt.Errorf("session-not-found: %s", id)
+	}
+	// JSONL Append is synchronous, so there is no deferred write queue.
+	return nil
+}
 
 func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader) error {
 	if err := validateSessionHeader(meta); err != nil {

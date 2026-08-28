@@ -266,10 +266,34 @@ func (s *acpServer) handlePrompt(message acpMessage) {
 		s.replyError(message.ID, -32602, contentErr.Error(), nil)
 		return
 	}
+	if promptPartsHaveImage(parts) {
+		if routeErr := s.assertImageRoute(runCtx, params.SessionID); routeErr != nil {
+			s.replyACPImageRouteFailure(message.ID, runCtx, routeErr)
+			return
+		}
+	}
+	var preparedContent []ContentBlock
+	if promptPartsHaveImage(parts) {
+		preparedContent, contentErr = s.engine.durablePromptContentContext(runCtx, parts)
+		if contentErr != nil {
+			if runCtx.Err() != nil {
+				s.reply(message.ID, map[string]any{"stopReason": "cancelled"})
+			} else if isImageAdmissionFailure(contentErr) {
+				s.replyError(message.ID, -32602, contentErr.Error(), nil)
+			} else {
+				s.replyError(message.ID, -32603, "unable to persist the prompt image batch", nil)
+			}
+			return
+		}
+		if routeErr := s.assertImageRoute(runCtx, params.SessionID); routeErr != nil {
+			s.replyACPImageRouteFailure(message.ID, runCtx, routeErr)
+			return
+		}
+	}
 	before := s.sessionEventCount(params.SessionID)
 	job, command, runErr := s.engine.enqueuePrompt(runCtx, params.SessionID, PromptRequest{
 		SessionID: params.SessionID, Mode: "queue", Content: parts, Literal: true,
-		Source: map[string]any{"kind": "user", "transport": "acp"},
+		Source: map[string]any{"kind": "user", "transport": "acp"}, preparedContent: preparedContent,
 	}, true)
 	record.mu.Lock()
 	inflight.job = job
@@ -395,27 +419,54 @@ func (s *acpServer) removeQueuedPrompt(sessionID string, job *queuedPrompt) bool
 
 func (s *acpServer) supportsImagePrompts() bool {
 	config := s.engine.Config()
-	s.engine.mu.RLock()
-	provider := s.engine.providers[config.Provider]
-	s.engine.mu.RUnlock()
-	if provider == nil || config.Model == "" {
+	if strings.TrimSpace(config.Provider) == "" || strings.TrimSpace(config.Model) == "" {
 		return false
 	}
-	models, err := provider.Models(s.ctx)
+	model, err := resolveExactModelInfo(s.ctx, s.engine, ModelSelection{Provider: config.Provider, Model: config.Model})
 	if err != nil {
 		return false
 	}
-	for _, model := range models {
-		if model.ID != config.Model {
-			continue
-		}
-		for _, modality := range model.InputModalities {
-			if modality == "image" {
-				return true
-			}
-		}
+	return containsString(model.InputModalities, "image")
+}
+
+type acpImageRouteError struct {
+	message  string
+	internal bool
+	cause    error
+}
+
+func (e *acpImageRouteError) Error() string { return e.message }
+func (e *acpImageRouteError) Unwrap() error { return e.cause }
+
+func (s *acpServer) assertImageRoute(ctx context.Context, sessionID string) error {
+	selection, err := imageModelSelection(s.engine, ToolCall{SessionID: sessionID})
+	if err != nil {
+		return &acpImageRouteError{message: "the current model route could not be resolved for image input", cause: err}
 	}
-	return false
+	model, err := resolveExactModelInfo(ctx, s.engine, selection)
+	if err != nil {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		return &acpImageRouteError{message: "the current model route could not be verified for image input", internal: true, cause: err}
+	}
+	if !containsString(model.InputModalities, "image") {
+		return &acpImageRouteError{message: fmt.Sprintf("model %q does not declare image input", selection.Model)}
+	}
+	return nil
+}
+
+func (s *acpServer) replyACPImageRouteFailure(id json.RawMessage, ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		s.reply(id, map[string]any{"stopReason": "cancelled"})
+		return
+	}
+	code := -32602
+	var routeFailure *acpImageRouteError
+	if errors.As(err, &routeFailure) && routeFailure.internal {
+		code = -32603
+	}
+	s.replyError(id, code, err.Error(), nil)
 }
 
 func decodeACPPrompt(raw []json.RawMessage, imageEnabled bool) ([]PromptContentPart, error) {
@@ -463,14 +514,17 @@ func decodeACPPrompt(raw []json.RawMessage, imageEnabled bool) ([]PromptContentP
 			if !dataOK || !mediaOK {
 				return nil, errors.New("image content requires data and mimeType")
 			}
-			image, err := prepareImage(mediaType, data, "")
-			if err != nil {
-				return nil, err
+			if imageExtension(mediaType) == "" {
+				return nil, errors.New("image mimeType must be image/png, image/jpeg, image/webp, or image/gif")
+			}
+			decoded, err := base64.StdEncoding.DecodeString(data)
+			if err != nil || base64.StdEncoding.EncodeToString(decoded) != data {
+				return nil, errors.New("image data must be canonical base64")
 			}
 			imageCount++
-			imageBytes += len(image.data)
+			imageBytes += len(decoded)
 			flushText()
-			parts = append(parts, PromptContentPart{Type: "image", Data: data, MediaType: mediaType})
+			parts = append(parts, PromptContentPart{Type: "image", Data: data, MediaType: mediaType, decoded: decoded})
 		case "audio":
 			return nil, errors.New("audio prompt content is not supported")
 		case "resource":
@@ -497,6 +551,15 @@ func decodeACPPrompt(raw []json.RawMessage, imageEnabled bool) ([]PromptContentP
 		return nil, errors.New("empty prompt")
 	}
 	return parts, nil
+}
+
+func promptPartsHaveImage(parts []PromptContentPart) bool {
+	for _, part := range parts {
+		if part.Type == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 func acpRequiredString(object map[string]json.RawMessage, key string) (string, bool) {
@@ -869,6 +932,13 @@ func (s *acpServer) close() error {
 	s.cancel()
 	s.wg.Wait()
 	failures := make([]error, 0, len(records)+1)
+	rootIDs := make([]string, 0, len(records))
+	for _, record := range records {
+		rootIDs = append(rootIDs, record.id)
+	}
+	if err := s.engine.drainModelSubagentDescendants(context.Background(), rootIDs); err != nil {
+		failures = append(failures, err)
+	}
 	for _, record := range records {
 		if err := detachSDKSession(s.engine, record.id); err != nil {
 			failures = append(failures, err)

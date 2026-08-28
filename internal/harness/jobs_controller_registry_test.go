@@ -21,11 +21,11 @@ return {
     harness.handle('exercise', () => {
       first()
       let afterFirst = ''
-      try { ctx.jobs.start({ kind: 'refs', label: 'still-served', run() { return { done: Promise.resolve({ status: 'completed' }) } } }) }
+      try { ctx.jobs.start({ kind: 'refs', label: 'still-served', owner: { id: '`+sessionID+`' }, run() { return { done: Promise.resolve({ status: 'completed' }) } } }) }
       catch (error) { afterFirst = String(error) }
       second()
       let afterSecond = ''
-      try { ctx.jobs.start({ kind: 'refs', label: 'detached', run() { return { done: Promise.resolve({ status: 'completed' }) } } }) }
+      try { ctx.jobs.start({ kind: 'refs', label: 'detached', owner: { id: '`+sessionID+`' }, run() { return { done: Promise.resolve({ status: 'completed' }) } } }) }
       catch (error) { afterSecond = String(error) }
       return { afterFirst, afterSecond }
     })
@@ -92,19 +92,19 @@ return {
       let settle
       let id
       id = ctx.jobs.start({
-        kind: 'reentrant', label: 'cancel reads registry',
+        kind: 'reentrant', label: 'cancel reads registry', owner: { id: '`+sessionID+`' },
         run() {
           return {
             done: new Promise(resolve => { settle = resolve }),
             cancel() {
-              const before = ctx.jobs.get(id)
+              const before = ctx.jobs.get(id, { id: '`+sessionID+`' })
               settle({ status: 'killed', detail: before.status })
             },
           }
         },
       })
-      const requested = ctx.jobs.kill(id)
-      const terminal = await ctx.jobs.wait(id, 1000)
+      const requested = ctx.jobs.kill(id, { id: '`+sessionID+`' })
+      const terminal = await ctx.jobs.wait(id, 1000, { id: '`+sessionID+`' })
       return { requested: requested.status, terminal }
     })
   }
@@ -145,14 +145,16 @@ return {
       }
       return signal
     }
-    harness.handle('unowned', async () => {
-      const id = ctx.jobs.start({
-        kind: 'open', label: 'shared',
-	    run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } },
-      })
-	  await ctx.jobs.wait(id, 1000)
-	  for (let index = 0; index < 8 && done.length === 0; index++) await Promise.resolve()
-	  return { id, ownerSession: ctx.jobs.get(id).ownerSession, listed: ctx.jobs.list().map(job => job.id), changed, done }
+    harness.handle('unowned', () => {
+      try {
+        ctx.jobs.start({
+          kind: 'open', label: 'shared',
+	      run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } },
+        })
+        return ''
+      } catch (error) {
+        return String(error)
+      }
     })
     harness.handle('abort', async () => {
       let settle
@@ -199,7 +201,7 @@ return {
     })
     harness.handle('invalidLimits', () => [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(outputLimitBytes => {
       try {
-        ctx.jobs.start({ kind: 'limit', label: 'invalid', outputLimitBytes, run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } } })
+        ctx.jobs.start({ kind: 'limit', label: 'invalid', owner: { id: '`+sessionID+`' }, outputLimitBytes, run() { return { done: Promise.resolve({ status: 'completed' }), cancel() {} } } })
         return ''
       } catch (error) { return String(error) }
     }))
@@ -253,22 +255,7 @@ return {
 	}
 
 	unowned := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "unowned", nil)
-	if !unowned.OK {
+	if !unowned.OK || !strings.Contains(unowned.Value.(string), "no job controller") {
 		t.Fatalf("unowned = %#v", unowned)
-	}
-	unownedValue := unowned.Value.(map[string]any)
-	if unownedValue["ownerSession"] != nil || len(unownedValue["listed"].([]any)) == 0 || len(unownedValue["changed"].([]any)) == 0 {
-		t.Fatalf("unowned snapshot = %#v", unownedValue)
-	}
-	done := unownedValue["done"].([]any)
-	foundUnowned := false
-	for _, raw := range done {
-		row := raw.([]any)
-		if row[0] == unownedValue["id"] && row[3] == true {
-			foundUnowned = true
-		}
-	}
-	if !foundUnowned {
-		t.Fatalf("unowned completion = %#v", done)
 	}
 }

@@ -283,19 +283,31 @@ func optionalString(value *string) string {
 	return *value
 }
 
-// remotePluginInventory projects the packages that are actually available to
-// the Go web host. The upstream Loader exposes richer Fiber state; boot graph
-// entries are the same deployment boundary in the Go port, so report them as
-// active host entries and keep the wire shape stable for the original UI.
+// remotePluginInventory projects the live Host Loader entries. Client boot
+// graph entries are only a compatibility fallback for callers that did not
+// provide composition metadata; they are not the Host inventory source when a
+// profile has been composed.
 func (e *Engine) remotePluginInventory() (map[string]any, *RPCError) {
-	graph, _, err := e.buildBootGraph()
-	if err != nil {
-		return nil, rpcError("inventory-unavailable", err.Error(), nil)
+	live := e.pluginInventorySnapshot()
+	if live == nil {
+		graph, _, err := e.buildBootGraph()
+		if err != nil {
+			return nil, rpcError("inventory-unavailable", err.Error(), nil)
+		}
+		live = make([]PluginInventoryEntry, 0, len(graph.Entries))
+		for _, entry := range graph.Entries {
+			phase := "active"
+			live = append(live, PluginInventoryEntry{EntryID: entry.ID, ModuleName: entry.ID, Enabled: true, FiberPhase: &phase})
+		}
 	}
-	entries := make([]map[string]any, 0, len(graph.Entries))
-	for _, entry := range graph.Entries {
+	entries := make([]map[string]any, 0, len(live))
+	for _, entry := range live {
+		if entry.Group {
+			continue
+		}
 		entries = append(entries, map[string]any{
-			"entryId": entry.ID, "moduleName": entry.ID, "enabled": true, "fiberPhase": "active",
+			"entryId": entry.EntryID, "moduleName": entry.ModuleName,
+			"enabled": entry.Enabled, "fiberPhase": entry.FiberPhase,
 		})
 	}
 	return map[string]any{"entries": entries}, nil
@@ -397,10 +409,15 @@ func (e *Engine) remoteCommandsList(args map[string]json.RawMessage) (any, *RPCE
 	if err != nil {
 		return nil, err
 	}
-	if _, sessionErr := e.getSession(id); sessionErr != nil {
+	session, sessionErr := e.getSession(id)
+	if sessionErr != nil {
 		return nil, errorToRPC(sessionErr)
 	}
-	return commandCatalog(), nil
+	catalog, catalogErr := e.commandCatalogForSession(session)
+	if catalogErr != nil {
+		return nil, errorToRPC(catalogErr)
+	}
+	return catalog, nil
 }
 
 func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json.RawMessage) (any, bool, *RPCError) {

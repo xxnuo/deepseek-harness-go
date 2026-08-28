@@ -90,9 +90,76 @@ func (e *Engine) dynamicCordisBuiltinServiceValue(run *dynamicCordisRun, name st
 		return e.dynamicCordisFSFacade(run)
 	case "shell":
 		return e.dynamicCordisShellFacade(run)
+	case "shellEnv":
+		return e.dynamicCordisShellEnvironmentFacade(run)
 	default:
 		return run.runtime.NewObject()
 	}
+}
+
+func (e *Engine) dynamicCordisShellEnvironmentFacade(run *dynamicCordisRun) *goja.Object {
+	vm := run.runtime
+	service := vm.NewObject()
+	_ = service.Set("register", func(call goja.FunctionCall) goja.Value {
+		object, ok := call.Argument(0).(*goja.Object)
+		if !ok {
+			panic(vm.ToValue("ctx.shellEnv.register requires an object"))
+		}
+		name := strings.TrimSpace(object.Get("name").String())
+		variablesObject, ok := object.Get("variables").(*goja.Object)
+		if !ok {
+			panic(vm.ToValue("ctx.shellEnv.register requires variables"))
+		}
+		variables := map[string]string{}
+		for _, key := range variablesObject.Keys() {
+			entry, ok := variablesObject.Get(key).(*goja.Object)
+			if !ok {
+				panic(vm.ToValue(fmt.Sprintf("ctx.shellEnv.register variable %q requires an object", key)))
+			}
+			variables[key] = entry.Get("description").String()
+		}
+		resolve, ok := goja.AssertFunction(object.Get("resolve"))
+		if !ok {
+			panic(vm.ToValue("ctx.shellEnv.register requires resolve"))
+		}
+		dispose, err := e.shellEnv.register(run, shellEnvironmentContributor{name: name, variables: variables, resolve: resolve})
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		run.disposers = append(run.disposers, dispose)
+		return vm.ToValue(func() { dispose() })
+	})
+	_ = service.Set("collect", func(call goja.FunctionCall) goja.Value {
+		args := map[string]any{}
+		if value := call.Argument(0); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+			data, err := json.Marshal(value.Export())
+			if err == nil {
+				_ = json.Unmarshal(data, &args)
+			}
+		}
+		sessionID := run.sessionID
+		if agent, ok := args["agent"].(map[string]any); ok {
+			if session, ok := agent["session"].(map[string]any); ok {
+				if header, ok := session["header"].(map[string]any); ok {
+					if id, ok := header["id"].(string); ok {
+						sessionID = id
+					}
+				}
+			}
+		}
+		name, _ := args["name"].(string)
+		callID, _ := args["callId"].(string)
+		argumentBytes, _ := json.Marshal(args["arguments"])
+		values, err := e.collectShellEnvironmentOnLoop(ToolCall{ID: callID, Name: name, SessionID: sessionID, Arguments: argumentBytes})
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(values)
+	})
+	_ = service.Set("list", func(goja.FunctionCall) goja.Value {
+		return vm.ToValue(e.shellEnv.list())
+	})
+	return service
 }
 
 func dynamicPromptRegistryKey(session, name string) string { return session + "\x00" + name }
@@ -395,6 +462,9 @@ func (e *Engine) dynamicPromptWaterfallForSession(ctx context.Context, session s
 }
 
 func (e *Engine) resolvedPromptAssemblyForSession(session *Session, selection ModelSelection, agent agentRuntime, caller *dynamicCordisRun, assemblyContext map[string]any) (resolvedPromptAssembly, *resolvedPromptSection, bool, error) {
+	session.mu.Lock()
+	isDelegated := session.Header.Origin == "subagent"
+	session.mu.Unlock()
 	sections, variables, err := e.resolvedSystemPromptAssembly(session, selection, agent, caller, assemblyContext)
 	if err != nil {
 		return resolvedPromptAssembly{}, nil, false, err
@@ -406,6 +476,10 @@ func (e *Engine) resolvedPromptAssemblyForSession(session *Session, selection Mo
 	contexts, suppressed, err := e.dynamicPromptContexts(session.Header.ID, caller, assemblyContext)
 	if err != nil {
 		return resolvedPromptAssembly{}, nil, false, err
+	}
+	if isDelegated {
+		contexts = append(contexts, resolvedPromptSection{Name: "subagent:delegation", Order: 120, Text: subagentDelegationContext})
+		sort.SliceStable(contexts, func(i, j int) bool { return contexts[i].Order < contexts[j].Order })
 	}
 	providedTools, err := e.dynamicPromptTools(session.Header.ID, caller, assemblyContext)
 	if err != nil {

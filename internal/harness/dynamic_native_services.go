@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 
 	"github.com/dop251/goja"
@@ -149,7 +150,7 @@ func dynamicAuthorizationSignal(run *dynamicCordisRun, ctx context.Context) (*go
 	return signal, func() { stop() }
 }
 
-func dynamicAuthorizationContextFromSignal(run *dynamicCordisRun, value goja.Value) (context.Context, context.CancelCauseFunc, func(), error) {
+func dynamicContextFromSignal(run *dynamicCordisRun, value goja.Value, subject string) (context.Context, context.CancelCauseFunc, func(), error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return ctx, cancel, func() {}, nil
@@ -157,10 +158,10 @@ func dynamicAuthorizationContextFromSignal(run *dynamicCordisRun, value goja.Val
 	signal, ok := value.(*goja.Object)
 	if !ok {
 		cancel(context.Canceled)
-		return nil, nil, nil, errors.New("authorization signal must be an AbortSignal")
+		return nil, nil, nil, errors.New(subject + " signal must be an AbortSignal")
 	}
 	if signal.Get("aborted").ToBoolean() {
-		cancel(errors.New("authorization request aborted"))
+		cancel(errors.New(subject + " request aborted"))
 		return ctx, cancel, func() {}, nil
 	}
 	add, addOK := goja.AssertFunction(signal.Get("addEventListener"))
@@ -169,7 +170,7 @@ func dynamicAuthorizationContextFromSignal(run *dynamicCordisRun, value goja.Val
 		return ctx, cancel, func() {}, nil
 	}
 	onAbort := run.runtime.ToValue(func(goja.FunctionCall) goja.Value {
-		cancel(errors.New("authorization request aborted"))
+		cancel(errors.New(subject + " request aborted"))
 		return goja.Undefined()
 	})
 	if _, err := add(signal, run.runtime.ToValue("abort"), onAbort, run.runtime.ToValue(map[string]any{"once": true})); err != nil {
@@ -182,6 +183,20 @@ func dynamicAuthorizationContextFromSignal(run *dynamicCordisRun, value goja.Val
 		}
 	}
 	return ctx, cancel, removeAbort, nil
+}
+
+func dynamicAuthorizationContextFromSignal(run *dynamicCordisRun, value goja.Value) (context.Context, context.CancelCauseFunc, func(), error) {
+	return dynamicContextFromSignal(run, value, "authorization")
+}
+
+func dynamicSessionReferenceErrorValue(vm *goja.Runtime, err error) goja.Value {
+	value := vm.NewGoError(err)
+	var reference *SessionReferenceError
+	if errors.As(err, &reference) {
+		_ = value.Set("name", "SessionReferenceError")
+		_ = value.Set("code", reference.Code)
+	}
+	return value
 }
 
 func dynamicAuthorizationFlow(run *dynamicCordisRun, value goja.Value) (AuthorizationFlow, goja.Callable, error) {
@@ -911,40 +926,72 @@ func (e *Engine) dynamicCordisSessionReferenceFacade(run *dynamicCordisRun) *goj
 	vm := run.runtime
 	service := vm.NewObject()
 	_ = service.Set("listCandidates", func(call goja.FunctionCall) goja.Value {
-		return e.dynamicCordisAsyncValue(run, func() goja.Value {
-			targetID := dynamicCordisSessionID(vm, call.Argument(0))
-			query := ""
-			if value := call.Argument(1); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
-				query = value.String()
+		targetID := dynamicCordisSessionID(vm, call.Argument(0))
+		query := ""
+		if value := call.Argument(1); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+			query = value.String()
+		}
+		config, err := e.cfg.SessionReference.normalized()
+		if err != nil {
+			panic(dynamicSessionReferenceErrorValue(vm, err))
+		}
+		limit := config.CandidateLimit
+		if value := call.Argument(2); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+			number := value.ToFloat()
+			if math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number || math.Abs(number) > 9_007_199_254_740_991 {
+				err := sessionReferenceError(SessionReferenceInvalidReference, "candidate limit must be a positive safe integer", nil)
+				panic(dynamicSessionReferenceErrorValue(vm, err))
 			}
-			limit := 0
-			if value := call.Argument(2); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
-				limit = int(value.ToInteger())
-			}
-			rows, err := e.ListSessionReferenceCandidates(context.Background(), targetID, query, limit, e.cfg.SessionReference)
-			if err != nil {
-				panic(vm.ToValue(err.Error()))
-			}
-			return vm.ToValue(cloneJSON(rows))
-		})
+			limit = int(number)
+		}
+		ctx, cancel, removeAbort, err := dynamicContextFromSignal(run, call.Argument(3), "session reference")
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		promise, resolve, reject := vm.NewPromise()
+		go func() {
+			rows, listErr := e.ListSessionReferenceCandidates(ctx, targetID, query, limit, config)
+			_ = e.dynamicCordis.loop.post(func() {
+				removeAbort()
+				cancel(context.Canceled)
+				if listErr != nil {
+					_ = reject(dynamicSessionReferenceErrorValue(vm, listErr))
+					return
+				}
+				_ = resolve(vm.ToValue(cloneJSON(rows)))
+			})
+		}()
+		return vm.ToValue(promise)
 	})
 	_ = service.Set("prepare", func(call goja.FunctionCall) goja.Value {
-		return e.dynamicCordisAsyncValue(run, func() goja.Value {
-			targetID := dynamicCordisSessionID(vm, call.Argument(0))
-			var content []ContentBlock
-			if err := dynamicCordisDecode(call.Argument(1), &content); err != nil {
-				panic(vm.ToValue("ctx.sessionReferenceResolver.prepare content: " + err.Error()))
-			}
-			var references []SessionReferenceInput
-			if err := dynamicCordisDecode(call.Argument(2), &references); err != nil {
-				panic(vm.ToValue("ctx.sessionReferenceResolver.prepare references: " + err.Error()))
-			}
-			prepared, err := e.PrepareSessionReferences(context.Background(), targetID, content, references, e.cfg.SessionReference)
-			if err != nil {
-				panic(vm.ToValue(err.Error()))
-			}
-			return vm.ToValue(cloneJSON(prepared))
-		})
+		targetID := dynamicCordisSessionID(vm, call.Argument(0))
+		var content []ContentBlock
+		if err := dynamicCordisDecode(call.Argument(1), &content); err != nil {
+			panic(vm.ToValue("ctx.sessionReferenceResolver.prepare content: " + err.Error()))
+		}
+		var references []SessionReferenceInput
+		if err := dynamicCordisDecode(call.Argument(2), &references); err != nil {
+			referenceErr := sessionReferenceError(SessionReferenceInvalidReference, err.Error(), err)
+			panic(dynamicSessionReferenceErrorValue(vm, referenceErr))
+		}
+		ctx, cancel, removeAbort, err := dynamicContextFromSignal(run, call.Argument(3), "session reference")
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		promise, resolve, reject := vm.NewPromise()
+		go func() {
+			prepared, prepareErr := e.PrepareSessionReferences(ctx, targetID, content, references, e.cfg.SessionReference)
+			_ = e.dynamicCordis.loop.post(func() {
+				removeAbort()
+				cancel(context.Canceled)
+				if prepareErr != nil {
+					_ = reject(dynamicSessionReferenceErrorValue(vm, prepareErr))
+					return
+				}
+				_ = resolve(vm.ToValue(cloneJSON(prepared)))
+			})
+		}()
+		return vm.ToValue(promise)
 	})
 	return service
 }

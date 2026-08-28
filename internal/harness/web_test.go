@@ -18,9 +18,9 @@ func TestWebFetchIsDisabledByDefaultAndExplicitlyEnabled(t *testing.T) {
 		wantTool bool
 		wantHTTP bool
 	}{
-		{name: "default"},
+		{name: "default", wantHTTP: true},
 		{name: "http", provider: "http", wantTool: true, wantHTTP: true},
-		{name: "custom", provider: "custom", wantTool: true},
+		{name: "custom", provider: "custom", wantTool: true, wantHTTP: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine, err := New(WithPersistence(false), WithProvider("echo"), WithWebFetchProvider(test.provider))
@@ -163,12 +163,31 @@ func TestHTTPWebFetchProviderUsesConfiguredLimitsAndUserAgent(t *testing.T) {
 	}
 }
 
+func TestHTTPWebFetchProviderCountsUTF16Characters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("a😀b"))
+	}))
+	defer server.Close()
+	provider := NewHTTPWebFetchProvider(HTTPWebFetchConfig{
+		MaxURLLength: 256, MaxResponseBytes: 100, MaxBodyChars: 3,
+		Timeout: time.Second, MaxRedirects: 0, UserAgent: "test",
+	})
+	result, err := provider.Fetch(context.Background(), WebFetchRequest{URL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Body.Content != "a😀" || !result.Truncated || utf16Length(result.Body.Content) != 3 {
+		t.Fatalf("UTF-16 capped fetch = %#v", result)
+	}
+}
+
 func TestRenderWebFetchCapsCompleteOutput(t *testing.T) {
 	text, truncated := renderWebFetch(WebFetchResult{
 		URL: "https://example.test", StatusCode: http.StatusOK,
 		Body: WebFetchBody{Kind: "text", Content: strings.Repeat("x", 100)},
 	}, 80)
-	if !truncated || len([]rune(text)) != 80 || !strings.HasSuffix(text, "(Content truncated. Fetch a more specific URL or section for the full text.)") {
+	if !truncated || utf16Length(text) != 80 || !strings.HasSuffix(text, "(Content truncated. Fetch a more specific URL or section for the full text.)") {
 		t.Fatalf("rendered fetch = %q, truncated=%v", text, truncated)
 	}
 }
@@ -444,6 +463,20 @@ type stubWebSearchProvider struct {
 	available bool
 }
 
+type scriptedWebSeamProvider struct {
+	search func(context.Context, WebSearchRequest) (WebSearchResult, error)
+	fetch  func(context.Context, WebFetchRequest) (WebFetchResult, error)
+}
+
+func (scriptedWebSeamProvider) ID() string      { return "scripted-seam" }
+func (scriptedWebSeamProvider) Available() bool { return true }
+func (p scriptedWebSeamProvider) Search(ctx context.Context, request WebSearchRequest) (WebSearchResult, error) {
+	return p.search(ctx, request)
+}
+func (p scriptedWebSeamProvider) Fetch(ctx context.Context, request WebFetchRequest) (WebFetchResult, error) {
+	return p.fetch(ctx, request)
+}
+
 func (p stubWebSearchProvider) ID() string      { return p.id }
 func (p stubWebSearchProvider) Available() bool { return p.available }
 func (p stubWebSearchProvider) Search(context.Context, WebSearchRequest) (WebSearchResult, error) {
@@ -456,10 +489,11 @@ func TestWebProviderSelectionAndDuplicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
-	if err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "custom", available: true}); err != nil {
+	dispose, err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "custom", available: true})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "custom", available: true}); err == nil {
+	if _, err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "custom", available: true}); err == nil {
 		t.Fatal("duplicate search provider was accepted")
 	} else if webErr, ok := err.(*WebError); !ok || webErr.Code != "WEB_DUPLICATE_PROVIDER" {
 		t.Fatalf("duplicate provider error = %#v", err)
@@ -477,7 +511,7 @@ func TestWebProviderSelectionAndDuplicates(t *testing.T) {
 	if _, err := e.webSearch(context.Background(), WebSearchRequest{Query: "q"}); err != nil {
 		t.Fatalf("single usable provider was not auto-selected: %v", err)
 	}
-	if err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "other", available: true}); err != nil {
+	if _, err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "other", available: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.webSearch(context.Background(), WebSearchRequest{Query: "q"}); err == nil {
@@ -485,4 +519,256 @@ func TestWebProviderSelectionAndDuplicates(t *testing.T) {
 	} else if webErr, ok := err.(*WebError); !ok || webErr.Code != "WEB_PROVIDER_AMBIGUOUS" {
 		t.Fatalf("ambiguous provider error = %#v", err)
 	}
+	dispose()
+	if _, err := e.webSearch(context.Background(), WebSearchRequest{Query: "q"}); err != nil {
+		t.Fatalf("search after provider disposal: %v", err)
+	}
+}
+
+func TestEmptyConfiguredProviderEnablesRuntimeAutoSelection(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.Provider = "echo"
+	cfg.PluginInventory = []PluginInventoryEntry{}
+	cfg.WebSearchProvider = ""
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := e.Config().WebSearchProvider; got != "" {
+		t.Fatalf("empty provider was normalized to %q", got)
+	}
+	provider := stubWebSearchProvider{id: "only", available: true}
+	if _, err := e.RegisterWebSearchProvider(provider); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := e.selectWebSearchProvider()
+	if err != nil || selected != provider {
+		t.Fatalf("auto-selected provider = %#v, %v", selected, err)
+	}
+}
+
+func TestWebSeamForwardsRequestsWithoutConsumerValidation(t *testing.T) {
+	e, err := New(WithPersistence(false), WithProvider("echo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	var searchRequest WebSearchRequest
+	var fetchRequest WebFetchRequest
+	provider := scriptedWebSeamProvider{
+		search: func(_ context.Context, request WebSearchRequest) (WebSearchResult, error) {
+			searchRequest = request
+			return WebSearchResult{Sources: []WebSearchSource{}, Truncated: false}, nil
+		},
+		fetch: func(_ context.Context, request WebFetchRequest) (WebFetchResult, error) {
+			fetchRequest = request
+			return WebFetchResult{URL: request.URL, StatusCode: 200, Body: WebFetchBody{Kind: "text"}}, nil
+		},
+	}
+	if _, err := e.RegisterWebSearchProvider(provider); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RegisterWebFetchProvider(provider); err != nil {
+		t.Fatal(err)
+	}
+	e.cfg.WebSearchProvider = provider.ID()
+	e.cfg.WebFetchProvider = provider.ID()
+	if _, err := e.webSearch(context.Background(), WebSearchRequest{Query: ""}); err != nil {
+		t.Fatalf("search forwarding: %v", err)
+	}
+	if _, err := e.webFetch(context.Background(), WebFetchRequest{URL: ""}); err != nil {
+		t.Fatalf("fetch forwarding: %v", err)
+	}
+	if searchRequest.Query != "" || fetchRequest.URL != "" {
+		t.Fatalf("forwarded requests = %#v, %#v", searchRequest, fetchRequest)
+	}
+}
+
+func TestWebProviderDisposerSupportsReloadAndPreservesRegistrationOrder(t *testing.T) {
+	e, err := New(WithPersistence(false), WithProvider("echo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	first := stubWebSearchProvider{id: "reloadable", available: true}
+	disposeFirst, err := e.RegisterWebSearchProvider(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disposeFirst()
+	second := stubWebSearchProvider{id: "reloadable", available: true}
+	if _, err := e.RegisterWebSearchProvider(second); err != nil {
+		t.Fatal(err)
+	}
+	disposeFirst()
+	e.cfg.WebSearchProvider = "reloadable"
+	selected, err := e.selectWebSearchProvider()
+	if err != nil || selected != second {
+		t.Fatalf("provider after reload = %#v, %v", selected, err)
+	}
+
+	e.cfg.WebSearchProvider = ""
+	e.settings["web-search-deepseek"] = map[string]any{"baseURL": "not a url"}
+	if _, err := e.RegisterWebSearchProvider(stubWebSearchProvider{id: "last", available: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.selectWebSearchProvider(); err == nil || !strings.Contains(err.Error(), "reloadable, last") {
+		t.Fatalf("ambiguous provider order error = %v", err)
+	}
+}
+
+func TestHostWebProviderRegistryFollowsPluginInventoryAndReload(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.Provider = "echo"
+	cfg.PluginInventory = []PluginInventoryEntry{}
+	cfg.WebSearchProvider = "exa"
+	cfg.ExaSearch = ExaSearchProviderOptions{APIKey: "key"}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.selectWebSearchProvider(); err == nil {
+		t.Fatal("provider registered without its Host plugin")
+	} else if webErr, ok := err.(*WebError); !ok || webErr.Code != "WEB_PROVIDER_CONFIGURED_MISSING" {
+		t.Fatalf("missing provider error = %#v", err)
+	}
+
+	next := e.Config()
+	next.PluginInventory = []PluginInventoryEntry{{EntryID: "exa", ModuleName: "@deepseek-ai/dsh-web-search-exa", Enabled: true}}
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if provider, err := e.selectWebSearchProvider(); err != nil || provider.ID() != "exa" {
+		t.Fatalf("provider after activation = %#v, %v", provider, err)
+	}
+
+	next = e.Config()
+	next.PluginInventory = []PluginInventoryEntry{}
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.selectWebSearchProvider(); err == nil {
+		t.Fatal("provider survived Host plugin disposal")
+	} else if webErr, ok := err.(*WebError); !ok || webErr.Code != "WEB_PROVIDER_CONFIGURED_MISSING" {
+		t.Fatalf("disposed provider error = %#v", err)
+	}
+}
+
+func TestHostHTTPWebProviderRegistersIndependentlyOfSelection(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.Provider = "echo"
+	cfg.WebFetchProvider = "custom-fetch"
+	cfg.PluginInventory = []PluginInventoryEntry{{
+		EntryID: "http", ModuleName: "@deepseek-ai/dsh-web-fetch-http", Enabled: true,
+	}}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, ok := e.webFetchProviders["http"]; !ok {
+		t.Fatal("mounted HTTP provider was not registered when another provider was selected")
+	}
+	if _, err := e.selectWebFetchProvider(); err == nil {
+		t.Fatal("configured missing provider unexpectedly resolved")
+	} else if webErr, ok := err.(*WebError); !ok || webErr.Code != "WEB_PROVIDER_CONFIGURED_MISSING" {
+		t.Fatalf("selection error = %#v", err)
+	}
+}
+
+func TestHostWebProviderWaitsForActivePluginFiber(t *testing.T) {
+	pending := "pending"
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.Provider = "echo"
+	cfg.WebSearchProvider = "exa"
+	cfg.ExaSearch = ExaSearchProviderOptions{APIKey: "key"}
+	cfg.PluginInventory = []PluginInventoryEntry{{
+		EntryID: "exa", ModuleName: "@deepseek-ai/dsh-web-search-exa", Enabled: true, FiberPhase: &pending,
+	}}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.selectWebSearchProvider(); err == nil {
+		t.Fatal("pending provider was registered before its fiber became active")
+	}
+	if settingsDescribeContains(e, "web-search-deepseek") {
+		t.Fatal("pending provider exposed its settings namespace")
+	}
+	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "pending"}, nil, false); rpcErr == nil || rpcErr.Code != "settings-rejected" {
+		t.Fatalf("pending provider settings update = %#v", rpcErr)
+	}
+	active := "active"
+	next := e.Config()
+	next.PluginInventory = []PluginInventoryEntry{{
+		EntryID: "exa", ModuleName: "@deepseek-ai/dsh-web-search-exa", Enabled: true, FiberPhase: &active,
+	}}
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if provider, err := e.selectWebSearchProvider(); err != nil || provider.ID() != "exa" {
+		t.Fatalf("provider after fiber activation = %#v, %v", provider, err)
+	}
+}
+
+func TestDeepSeekWebSettingsNamespaceFollowsPluginLifecycle(t *testing.T) {
+	active := "active"
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.Provider = "echo"
+	cfg.PluginInventory = []PluginInventoryEntry{{
+		EntryID: "deepseek", ModuleName: "@deepseek-ai/dsh-web-search-deepseek", Enabled: true, FiberPhase: &active,
+	}}
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if !settingsDescribeContains(e, "web-search-deepseek") {
+		t.Fatal("active DeepSeek provider did not expose its settings namespace")
+	}
+	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "saved-model"}, nil, false); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	next := e.Config()
+	next.PluginInventory = []PluginInventoryEntry{}
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if settingsDescribeContains(e, "web-search-deepseek") {
+		t.Fatal("disposed DeepSeek provider kept its settings namespace visible")
+	}
+	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "hidden"}, nil, false); rpcErr == nil || rpcErr.Code != "settings-rejected" {
+		t.Fatalf("disposed provider settings update = %#v", rpcErr)
+	}
+	next = e.Config()
+	next.PluginInventory = cfg.PluginInventory
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if !settingsDescribeContains(e, "web-search-deepseek") {
+		t.Fatal("reloaded DeepSeek provider did not restore its settings namespace")
+	}
+	e.mu.RLock()
+	view := e.settingsViewLocked("web-search-deepseek")
+	e.mu.RUnlock()
+	if value := view["value"].(map[string]any); value["model"] != "saved-model" {
+		t.Fatalf("reloaded provider settings = %#v", value)
+	}
+}
+
+func settingsDescribeContains(e *Engine, namespace string) bool {
+	for _, raw := range e.settingsDescribe()["namespaces"].([]any) {
+		if raw.(map[string]any)["ns"] == namespace {
+			return true
+		}
+	}
+	return false
 }

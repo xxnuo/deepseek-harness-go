@@ -98,6 +98,42 @@ func TestBackgroundBashIncrementalOutputAndWait(t *testing.T) {
 	}
 }
 
+func TestBackgroundJobCompletionQueuesOwnerNotice(t *testing.T) {
+	e, err := New(WithWorkspace(t.TempDir()), WithPersistence(false), WithProvider("echo"), WithModel("echo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	owner := createJobTestSession(t, e, "session-notice")
+	_ = startBackgroundBash(t, e, owner, "printf notice-ok")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s, getErr := e.getSession(owner)
+		if getErr == nil {
+			s.mu.Lock()
+			for _, event := range s.Events {
+				if event.Type != "agent/inbox/spliced" {
+					continue
+				}
+				data, _ := event.Data.(map[string]any)
+				inserted, _ := data["inserted"].([]any)
+				if len(inserted) == 0 {
+					continue
+				}
+				message, _ := inserted[0].(map[string]any)
+				source, _ := message["source"].(map[string]any)
+				if source["plugin"] == "tool-jobs" {
+					s.mu.Unlock()
+					return
+				}
+			}
+			s.mu.Unlock()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("background completion notice was not queued")
+}
+
 func TestBackgroundJobsAreOwnerIsolatedAndKillable(t *testing.T) {
 	e, err := New(WithWorkspace(t.TempDir()), WithPersistence(false))
 	if err != nil {

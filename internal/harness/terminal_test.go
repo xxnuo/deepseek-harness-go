@@ -307,6 +307,75 @@ func TestTerminalPendingOwnerCleanupAndPermissionFence(t *testing.T) {
 	}
 }
 
+func TestTerminalPublishedSpawnContextIsNotCancelledOnReturn(t *testing.T) {
+	e := newTerminalTestEngine(t, TerminalToolConfig{})
+	seen := make(chan context.Context, 1)
+	state := &testTerminalBackendState{typeID: "context"}
+	state.spawn = func(ctx context.Context, _ TerminalBackendSpawnSpec) (TerminalBackendSession, error) {
+		seen <- ctx
+		return newTestTerminalSession(), nil
+	}
+	if _, err := e.RegisterTerminalBackend(testTerminalBackend{state}); err != nil {
+		t.Fatal(err)
+	}
+	owner := terminalTestOwner(t, e, "terminal-context-owner")
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := e.OpenTerminal(ctx, owner, TerminalSpawnRequest{Type: "context"}); err != nil {
+		t.Fatal(err)
+	}
+	backendCtx := <-seen
+	select {
+	case <-backendCtx.Done():
+		t.Fatalf("published backend context was cancelled on return: %v", context.Cause(backendCtx))
+	default:
+	}
+	cancel()
+	select {
+	case <-backendCtx.Done():
+		if !errors.Is(context.Cause(backendCtx), context.Canceled) {
+			t.Fatalf("backend cancellation cause = %v", context.Cause(backendCtx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("published backend context did not retain caller cancellation")
+	}
+}
+
+func TestTerminalCallerCancellationRetainsCleanupFailureUntilOwnerDisposal(t *testing.T) {
+	e := newTerminalTestEngine(t, TerminalToolConfig{})
+	started := make(chan struct{})
+	cleanupErr := errors.New("backend cleanup failed")
+	state := &testTerminalBackendState{typeID: "cleanup-failing"}
+	state.spawn = func(ctx context.Context, _ TerminalBackendSpawnSpec) (TerminalBackendSession, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, &TerminalBackendCleanupError{SpawnError: errors.New("backend observed cancellation"), CleanupError: cleanupErr}
+	}
+	if _, err := e.RegisterTerminalBackend(testTerminalBackend{state}); err != nil {
+		t.Fatal(err)
+	}
+	owner := terminalTestOwner(t, e, "terminal-cleanup-owner")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.OpenTerminal(ctx, owner, TerminalSpawnRequest{Type: "cleanup-failing"})
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("spawn error = %v, want caller cancellation", err)
+	}
+	if !e.HasTerminalActivity(owner) {
+		t.Fatal("retained cleanup failure was not reported as owner activity")
+	}
+	if err := e.terminals.closeOwner(owner); !errors.Is(err, cleanupErr) {
+		t.Fatalf("owner cleanup error = %v, want %v", err, cleanupErr)
+	}
+	if e.HasTerminalActivity(owner) {
+		t.Fatal("owner cleanup did not drain retained failure")
+	}
+}
+
 func TestTerminalToolSchemasAndConfig(t *testing.T) {
 	e := newTerminalTestEngine(t, TerminalToolConfig{})
 	schemas := map[string]ToolSchema{}

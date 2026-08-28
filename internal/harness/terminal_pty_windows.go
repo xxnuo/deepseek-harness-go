@@ -396,6 +396,12 @@ func (operation *windowsTerminalSendOperation) finish(result TerminalSendResult,
 	close(operation.done)
 }
 
+func (operation *windowsTerminalSendOperation) isSettled() bool {
+	operation.mu.Lock()
+	defer operation.mu.Unlock()
+	return operation.settled
+}
+
 type windowsPTYSession struct {
 	mu           sync.Mutex
 	pty          *windowsConPTY
@@ -405,6 +411,7 @@ type windowsPTYSession struct {
 	status       TerminalSessionStatus
 	scrollback   *terminalTextBuffer
 	active       *windowsTerminalSendOperation
+	interrupting *windowsTerminalSendOperation
 	closing      bool
 	closeDone    chan struct{}
 	closeErr     error
@@ -480,7 +487,7 @@ func (session *windowsPTYSession) StartSend(ctx context.Context, request Termina
 		return nil, &TerminalError{Code: "SEND_ACTIVE", Message: "PTY session already has an active send"}
 	}
 	var operation *windowsTerminalSendOperation
-	operation = newWindowsTerminalSendOperation(session.config.MaxReadBytes, func() { go session.interrupt(operation) })
+	operation = newWindowsTerminalSendOperation(session.config.MaxReadBytes, func() { session.requestInterrupt(operation) })
 	session.active = operation
 	session.resetReadinessLocked()
 	session.mu.Unlock()
@@ -555,12 +562,22 @@ func (session *windowsPTYSession) settleActive(operation *windowsTerminalSendOpe
 		session.mu.Unlock()
 		return
 	}
-	session.active = nil
+	retainOwnership := session.interrupting == operation
+	if !retainOwnership {
+		session.active = nil
+	}
 	status := cloneTerminalStatus(session.status)
 	_, scrollbackTruncated := session.scrollback.snapshot()
 	session.mu.Unlock()
 	viewport, operationTruncated := operation.output.snapshot()
 	operation.finish(TerminalSendResult{Viewport: viewport, WaitReason: reason, SessionStatus: status, Truncated: operationTruncated || scrollbackTruncated}, nil)
+	if retainOwnership {
+		session.mu.Lock()
+		if session.active == operation && session.interrupting != operation {
+			session.active = nil
+		}
+		session.mu.Unlock()
+	}
 }
 
 func (session *windowsPTYSession) failActive(operation *windowsTerminalSendOperation, err error) {
@@ -583,6 +600,25 @@ func (session *windowsPTYSession) interrupt(operation *windowsTerminalSendOperat
 			session.failActive(operation, err)
 		}
 	}
+	session.mu.Lock()
+	if session.interrupting == operation {
+		session.interrupting = nil
+		if session.active == operation && operation.isSettled() {
+			session.active = nil
+		}
+	}
+	session.mu.Unlock()
+}
+
+func (session *windowsPTYSession) requestInterrupt(operation *windowsTerminalSendOperation) {
+	session.mu.Lock()
+	if session.active != operation || session.closing {
+		session.mu.Unlock()
+		return
+	}
+	session.interrupting = operation
+	session.mu.Unlock()
+	go session.interrupt(operation)
 }
 
 func (session *windowsPTYSession) readLoop() {

@@ -32,12 +32,18 @@ type profileRuntimePlugin struct {
 	paths    []string
 }
 
+type mountedProfilePlugin struct {
+	entryID, pluginID, packageID, body string
+}
+
 type profileRuntimeMount struct {
 	engine       *harness.Engine
 	bootstrapID  string
 	bootstrapRun string
 	cwd          string
 	watchPaths   []string
+	plugins      map[string]mountedProfilePlugin
+	pluginOrder  []string
 }
 
 type profileRuntimeResult struct {
@@ -102,13 +108,19 @@ func runCustomProfile(args []string, composed *composition, cfg harness.Config, 
 				fmt.Fprintf(stderr, "dsh: config reload failed: %v\n", err)
 				continue
 			}
-			next, err := startCustomProfileGeneration(args, nextComposition, nextConfig)
+			plugins, err := buildProfileRuntimePlugins(nextComposition)
+			previousConfig := generation.engine.Config()
+			if err == nil {
+				err = generation.engine.ApplyRuntimeConfig(nextConfig)
+			}
+			if err == nil {
+				err = generation.runtime.reconcile(plugins)
+			}
 			if err != nil {
+				_ = generation.engine.ApplyRuntimeConfig(previousConfig)
 				fmt.Fprintf(stderr, "dsh: config reload failed: %v\n", err)
 				continue
 			}
-			_ = generation.close()
-			generation = next
 			watch.paths.setRuntime(generation.runtime)
 			if code, err := generation.flush(stdout, stderr); err != nil {
 				return err
@@ -172,10 +184,13 @@ func defineAndRunProfilePlugin(engine *harness.Engine, prefix, name, body string
 	}
 	started, err := engine.DynamicCordisRun(context.Background(), "", receipt.PluginID, receipt.PackageID, "run")
 	if err != nil {
-		return harness.DynamicCordisRunResponse{}, err
+		_, cleanupErr := engine.DynamicCordisUndefine("", receipt.PluginID)
+		return harness.DynamicCordisRunResponse{}, errors.Join(err, cleanupErr)
 	}
 	if !started.OK {
-		return harness.DynamicCordisRunResponse{}, fmt.Errorf("dsh: profile plugin %q failed to start: %s", name, started.Message)
+		startErr := fmt.Errorf("dsh: profile plugin %q failed to start: %s", name, started.Message)
+		_, cleanupErr := engine.DynamicCordisUndefine("", receipt.PluginID)
+		return harness.DynamicCordisRunResponse{}, errors.Join(startErr, cleanupErr)
 	}
 	return started, nil
 }
@@ -200,16 +215,219 @@ func mountProfileRuntimePluginSet(engine *harness.Engine, args []string, plugins
 		return nil, err
 	}
 	cwd, _ := os.Getwd()
-	mounted := &profileRuntimeMount{engine: engine, bootstrapID: bootstrap.PluginID, bootstrapRun: bootstrap.PluginRunID, cwd: cwd}
+	mounted := &profileRuntimeMount{engine: engine, bootstrapID: bootstrap.PluginID, bootstrapRun: bootstrap.PluginRunID, cwd: cwd, plugins: map[string]mountedProfilePlugin{}, pluginOrder: make([]string, 0, len(plugins))}
+	running := make([]mountedProfilePlugin, 0, len(plugins))
 	for _, plugin := range plugins {
-		if _, err := defineAndRunProfilePlugin(engine, "prof", plugin.id, plugin.body); err != nil {
-			return nil, err
+		started, err := defineAndRunProfilePlugin(engine, "prof", plugin.id, plugin.body)
+		if err != nil {
+			cleanupErrs := []error{err}
+			for index := len(running) - 1; index >= 0; index-- {
+				if _, cleanupErr := engine.DynamicCordisUndefine("", running[index].pluginID); cleanupErr != nil {
+					cleanupErrs = append(cleanupErrs, cleanupErr)
+				}
+			}
+			if _, cleanupErr := engine.DynamicCordisUndefine("", bootstrap.PluginID); cleanupErr != nil {
+				cleanupErrs = append(cleanupErrs, cleanupErr)
+			}
+			return nil, errors.Join(cleanupErrs...)
 		}
+		mountedPlugin := mountedProfilePlugin{entryID: plugin.id, pluginID: started.PluginID, packageID: started.PackageID, body: plugin.body}
+		running = append(running, mountedPlugin)
+		mounted.plugins[plugin.id] = mountedPlugin
+		mounted.pluginOrder = append(mounted.pluginOrder, plugin.id)
 		mounted.watchPaths = append(mounted.watchPaths, plugin.paths...)
+	}
+	for _, plugin := range running {
+		phase := profilePluginFiberPhase(engine, plugin)
+		engine.SetPluginInventoryEntryState(plugin.entryID, true, &phase)
 	}
 	sort.Strings(mounted.watchPaths)
 	mounted.watchPaths = compactStrings(mounted.watchPaths)
 	return mounted, nil
+}
+
+// reconcile replaces only the external profile plugin layer. The bootstrap
+// plugin and Engine remain alive, so sessions, subscriptions, and Host-owned
+// services retain their identity across a profile patch reload.
+func (mounted *profileRuntimeMount) reconcile(plugins []profileRuntimePlugin) error {
+	if mounted == nil {
+		return nil
+	}
+	if mounted.plugins == nil {
+		mounted.plugins = map[string]mountedProfilePlugin{}
+	}
+	desired := make(map[string]profileRuntimePlugin, len(plugins))
+	for _, plugin := range plugins {
+		desired[plugin.id] = plugin
+	}
+	previousOrder := append([]string(nil), mounted.pluginOrder...)
+	previousWatchPaths := append([]string(nil), mounted.watchPaths...)
+	created := make([]mountedProfilePlugin, 0)
+	changed := make([]mountedProfilePlugin, 0)
+	removed := make([]mountedProfilePlugin, 0)
+	rollbackCreated := func() error {
+		var errs []error
+		for index := len(created) - 1; index >= 0; index-- {
+			added := created[index]
+			receipt, err := mounted.engine.DynamicCordisUndefine("", added.pluginID)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("rollback created profile plugin %q: %w", added.entryID, err))
+			} else if !receipt.OK && receipt.Message != "" {
+				errs = append(errs, fmt.Errorf("rollback created profile plugin %q failed: %s", added.entryID, receipt.Message))
+			}
+			delete(mounted.plugins, added.entryID)
+		}
+		return errors.Join(errs...)
+	}
+	rollbackChanged := func() error {
+		var errs []error
+		for index := len(changed) - 1; index >= 0; index-- {
+			previous := changed[index]
+			// DynamicCordisRun disposes the previous fiber before loading the
+			// candidate package. Re-activate the known-good package when the
+			// candidate fails, matching Loader's rollback contract.
+			started, err := mounted.engine.DynamicCordisRun(context.Background(), "", previous.pluginID, previous.packageID, "update")
+			if err != nil {
+				errs = append(errs, fmt.Errorf("rollback changed profile plugin %q: %w", previous.entryID, err))
+			}
+			if !started.OK {
+				// A failed candidate may never have committed, in which case the
+				// previous package is still current and needs a normal restart.
+				started, err = mounted.engine.DynamicCordisRun(context.Background(), "", previous.pluginID, previous.packageID, "run")
+				if err != nil {
+					errs = append(errs, fmt.Errorf("rollback changed profile plugin %q: %w", previous.entryID, err))
+				}
+			}
+			if started.OK {
+				mounted.plugins[previous.entryID] = previous
+			} else if started.Message != "" {
+				errs = append(errs, fmt.Errorf("rollback changed profile plugin %q failed: %s", previous.entryID, started.Message))
+			}
+		}
+		return errors.Join(errs...)
+	}
+	rollbackRemoved := func() error {
+		var errs []error
+		for index := len(removed) - 1; index >= 0; index-- {
+			previous := removed[index]
+			started, err := defineAndRunProfilePlugin(mounted.engine, "prof", previous.entryID, previous.body)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("rollback removed profile plugin %q: %w", previous.entryID, err))
+				continue
+			}
+			restored := previous
+			restored.pluginID, restored.packageID = started.PluginID, started.PackageID
+			mounted.plugins[previous.entryID] = restored
+			phase := profilePluginFiberPhase(mounted.engine, restored)
+			mounted.engine.SetPluginInventoryEntryState(previous.entryID, true, &phase)
+		}
+		return errors.Join(errs...)
+	}
+	rollback := func(cause error) error {
+		errs := []error{cause}
+		if err := rollbackCreated(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := rollbackChanged(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := rollbackRemoved(); err != nil {
+			errs = append(errs, err)
+		}
+		mounted.pluginOrder = previousOrder
+		mounted.watchPaths = previousWatchPaths
+		return errors.Join(errs...)
+	}
+	for _, plugin := range plugins {
+		current, exists := mounted.plugins[plugin.id]
+		if exists && current.body == plugin.body {
+			continue
+		}
+		if !exists {
+			started, err := defineAndRunProfilePlugin(mounted.engine, "prof", plugin.id, plugin.body)
+			if err != nil {
+				return rollback(err)
+			}
+			current = mountedProfilePlugin{entryID: plugin.id, pluginID: started.PluginID, packageID: started.PackageID}
+			created = append(created, current)
+		} else {
+			changed = append(changed, current)
+			defined, err := mounted.engine.DynamicCordisDefine(harness.DynamicCordisDefineRequest{
+				Plugin:  harness.DynamicCordisPluginSelector{Kind: "existing", PluginID: current.pluginID, IDPrefix: "prof"},
+				Name:    plugin.id,
+				Purpose: "update an installed profile plugin",
+				Code:    harness.DynamicCordisCode{Host: plugin.body},
+				Global:  true,
+			})
+			if err != nil {
+				return rollback(err)
+			}
+			started, err := mounted.engine.DynamicCordisRun(context.Background(), "", current.pluginID, defined.PackageID, "update")
+			if err != nil {
+				return rollback(err)
+			}
+			if !started.OK {
+				return rollback(fmt.Errorf("dsh: profile plugin %q failed to update: %s", plugin.id, started.Message))
+			}
+			current.packageID = started.PackageID
+		}
+		current.entryID, current.body = plugin.id, plugin.body
+		mounted.plugins[plugin.id] = current
+		phase := profilePluginFiberPhase(mounted.engine, current)
+		mounted.engine.SetPluginInventoryEntryState(plugin.id, true, &phase)
+	}
+	// Loader removes stale entries in their previous tree order, not map order.
+	for _, id := range append([]string(nil), mounted.pluginOrder...) {
+		current, exists := mounted.plugins[id]
+		if !exists {
+			continue
+		}
+		if _, ok := desired[id]; ok {
+			continue
+		}
+		removed = append(removed, current)
+		receipt, err := mounted.engine.DynamicCordisUndefine("", current.pluginID)
+		if err != nil {
+			return rollback(err)
+		}
+		if !receipt.OK {
+			message := receipt.Message
+			if message == "" {
+				message = receipt.Reason
+			}
+			return rollback(fmt.Errorf("dsh: profile plugin %q could not be removed: %s", id, message))
+		}
+		delete(mounted.plugins, id)
+	}
+	mounted.pluginOrder = mounted.pluginOrder[:0]
+	for _, plugin := range plugins {
+		mounted.pluginOrder = append(mounted.pluginOrder, plugin.id)
+	}
+	mounted.watchPaths = mounted.watchPaths[:0]
+	for _, plugin := range plugins {
+		mounted.watchPaths = append(mounted.watchPaths, plugin.paths...)
+	}
+	sort.Strings(mounted.watchPaths)
+	mounted.watchPaths = compactStrings(mounted.watchPaths)
+	return nil
+}
+
+func profilePluginFiberPhase(engine *harness.Engine, plugin mountedProfilePlugin) string {
+	view, err := engine.DynamicCordisInspectSelf("", plugin.pluginID, plugin.packageID)
+	if err != nil {
+		return "failed"
+	}
+	runtimeView, _ := view["runtime"].(map[string]any)
+	host, _ := runtimeView["host"].(map[string]any)
+	status, _ := host["status"].(string)
+	switch status {
+	case "waiting":
+		return "pending"
+	case "failed":
+		return "failed"
+	default:
+		return "active"
+	}
 }
 
 func (generation *customProfileGeneration) flush(stdout, stderr io.Writer) (*int, error) {
@@ -341,6 +559,9 @@ func (generation *customProfileGeneration) close() error {
 }
 
 func profileBootstrapBody(args []string) string {
+	if args == nil {
+		args = []string{}
+	}
 	encoded, _ := json.Marshal(args)
 	return fmt.Sprintf(`
 const args = %s
@@ -387,6 +608,13 @@ return {
 func buildProfileRuntimePlugins(composed *composition) ([]profileRuntimePlugin, error) {
 	entries := composed.externalPluginEntries()
 	plugins := make([]profileRuntimePlugin, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, exists := seen[entry.id]; exists {
+			return nil, fmt.Errorf("dsh: duplicate loader entry id: %s", entry.id)
+		}
+		seen[entry.id] = struct{}{}
+	}
 	for _, entry := range entries {
 		path, err := resolveProfilePluginPath(composed.profileDir, entry.name)
 		if err != nil {
@@ -463,16 +691,61 @@ func buildProfilePluginBody(path string, entry *yaml.Node) (string, []string, er
 %s
 %s
 const profileModule = __dshProfileModule
-const plugin = profileModule.default ?? profileModule
+let plugin = profileModule
+if (plugin !== null && plugin !== undefined) {
+  plugin = plugin.default ?? plugin
+  if (plugin.__esModule) plugin = plugin.default ?? plugin
+}
 const rowInject = %s
-const pluginInject = Array.isArray(profileModule.inject) ? profileModule.inject : plugin.inject
-const apply = typeof plugin === 'function' ? plugin : plugin.apply ?? profileModule.apply
+const pluginInject = plugin?.inject
+const apply = typeof plugin === 'function' ? plugin : plugin?.apply
+function resolveInjectNames(value) {
+  if (Array.isArray(value)) return value
+  if (value && typeof value === 'object') {
+    const names = []
+    for (const name in value) names.push(name)
+    return names
+  }
+  return []
+}
+function resolvePluginConfig(config) {
+  if (!plugin?.Config) return config
+  const result = plugin.Config['~standard'].validate(config)
+  if (result && typeof result.then === 'function') {
+    throw new TypeError('Async config validation is not supported')
+  }
+  if (result?.issues) {
+    const lines = result.issues.map(issue => issue.path
+      ? '  - ' + issue.message + ' (at ' + issue.path.join('.') + ')'
+      : '  - ' + issue.message)
+    throw new TypeError('invalid config:\n' + lines.join('\n'))
+  }
+  return result?.value
+}
+const GeneratorFunction = function* () {}.constructor
+const AsyncGeneratorFunction = async function* () {}.constructor
+function isPluginConstructor(callback) {
+  if (!callback.prototype) return false
+  if (callback instanceof GeneratorFunction) return false
+  if (AsyncGeneratorFunction !== Function && callback instanceof AsyncGeneratorFunction) return false
+  return true
+}
+function executePlugin(ctx, config) {
+  if (!isPluginConstructor(apply)) return apply(ctx, config)
+  const reflectedContext = Object.create(ctx)
+  Object.defineProperty(reflectedContext, 'reflect', {
+    value: Object.freeze({ provide(name, value) { return ctx.provide(name, value) } }),
+  })
+  const instance = new apply(reflectedContext, config)
+  for (const hook of instance?.[Symbol.for('cordis.initHooks')] ?? []) hook()
+  return instance?.[Symbol.for('cordis.init')]?.()
+}
 return {
-  inject: [...new Set([...(Array.isArray(pluginInject) ? pluginInject : []), ...rowInject])],
+  inject: [...new Set([...resolveInjectNames(pluginInject), ...rowInject])],
   apply(ctx) {
     __dshProfileContext = ctx
     if (typeof apply !== 'function') throw new Error('profile plugin must export apply(ctx, config) or a default function')
-    return apply(ctx, %s)
+    return ctx.effect(() => executePlugin(ctx, resolvePluginConfig(%s)))
   },
 }`, profileProcessPrelude(), result.OutputFiles[0].Contents, rowInject, config), paths, nil
 }
@@ -539,8 +812,18 @@ func profileEntryInject(entry *yaml.Node) ([]string, error) {
 			result = append(result, name)
 		}
 		return result, nil
+	case map[string]any:
+		result := make([]string, 0, len(value))
+		for index := 0; index < len(node.Content); index += 2 {
+			name := strings.TrimSpace(node.Content[index].Value)
+			if name == "" {
+				return nil, errors.New("profile plugin inject must contain service names")
+			}
+			result = append(result, name)
+		}
+		return result, nil
 	default:
-		return nil, errors.New("profile plugin inject must be a service name or array")
+		return nil, errors.New("profile plugin inject must be a service name, array, or object")
 	}
 }
 
@@ -613,26 +896,38 @@ func resolveProfilePluginPath(profileDir, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve plugin module %q: %w", name, err)
 	}
-	var document map[string]any
-	if err := json.Unmarshal(manifest, &document); err != nil {
+	document, err := decodeProfileJSON(manifest)
+	if err != nil {
 		return "", fmt.Errorf("invalid package.json for %q: %w", name, err)
+	}
+	object, ok := document.(profileJSONObject)
+	if !ok {
+		return "", fmt.Errorf("invalid package.json for %q: root must be an object", name)
 	}
 	exportKey := "."
 	if subpath != "" {
 		exportKey = "./" + filepath.ToSlash(subpath)
 	}
-	target := profileManifestExportTarget(document["exports"], exportKey)
-	if target != "" {
-		return resolveProfileJSFile(filepath.Join(root, filepath.FromSlash(target)))
+	if exports, exists := object.get("exports"); exists {
+		target, matched, err := profileManifestExportTarget(exports, exportKey)
+		if err != nil {
+			return "", fmt.Errorf("invalid package exports for %q: %w", name, err)
+		}
+		if !matched || target == "" {
+			return "", fmt.Errorf("package subpath %q is not exported by %q", exportKey, packageName)
+		}
+		path, err := profileExportPath(root, target)
+		if err != nil {
+			return "", fmt.Errorf("invalid package exports for %q: %w", name, err)
+		}
+		return resolveProfileJSFile(path)
 	}
 	if subpath != "" {
 		return resolveProfileJSFile(filepath.Join(root, filepath.FromSlash(subpath)))
 	}
+	target, _ := object.string("module")
 	if target == "" {
-		target, _ = document["module"].(string)
-	}
-	if target == "" {
-		target, _ = document["main"].(string)
+		target, _ = object.string("main")
 	}
 	if target == "" {
 		target = "index.js"
@@ -654,35 +949,191 @@ func splitProfilePackageName(name string) (string, string) {
 	return parts[0], strings.Join(parts[1:], "/")
 }
 
-func profileManifestExportTarget(value any, key string) string {
-	switch value := value.(type) {
-	case string:
-		if key == "." {
-			return value
-		}
-	case map[string]any:
-		if target, ok := value[key]; ok {
-			return profileManifestConditionTarget(target)
-		}
-		if key == "." {
-			return profileManifestConditionTarget(value)
-		}
-	}
-	return ""
+type profileJSONPair struct {
+	key   string
+	value any
 }
 
-func profileManifestConditionTarget(value any) string {
-	switch value := value.(type) {
-	case string:
-		return value
-	case map[string]any:
-		for _, key := range []string{"import", "node", "default", "require"} {
-			if target := profileManifestConditionTarget(value[key]); target != "" {
-				return target
-			}
+type profileJSONObject []profileJSONPair
+type profileJSONArray []any
+
+func (object profileJSONObject) get(key string) (any, bool) {
+	for _, pair := range object {
+		if pair.key == key {
+			return pair.value, true
 		}
 	}
-	return ""
+	return nil, false
+}
+
+func (object profileJSONObject) string(key string) (string, bool) {
+	value, ok := object.get(key)
+	if !ok {
+		return "", false
+	}
+	result, ok := value.(string)
+	return result, ok
+}
+
+func decodeProfileJSON(data []byte) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	value, err := decodeProfileJSONValue(decoder)
+	if err != nil {
+		return nil, err
+	}
+	if decoder.More() {
+		return nil, errors.New("multiple JSON values")
+	}
+	return value, nil
+}
+
+func decodeProfileJSONValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return token, nil
+	}
+	switch delimiter {
+	case '{':
+		object := profileJSONObject{}
+		for decoder.More() {
+			key, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			value, err := decodeProfileJSONValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			object = append(object, profileJSONPair{key: key.(string), value: value})
+		}
+		_, err = decoder.Token()
+		return object, err
+	case '[':
+		array := profileJSONArray{}
+		for decoder.More() {
+			value, err := decodeProfileJSONValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		_, err = decoder.Token()
+		return array, err
+	default:
+		return nil, fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+}
+
+func profileManifestExportTarget(value any, key string) (string, bool, error) {
+	object, isObject := value.(profileJSONObject)
+	if !isObject {
+		if key != "." {
+			return "", false, nil
+		}
+		target, matched, err := profileManifestConditionTarget(value, "")
+		return target, matched, err
+	}
+	hasSubpaths := false
+	hasConditions := false
+	for _, pair := range object {
+		if strings.HasPrefix(pair.key, ".") {
+			hasSubpaths = true
+		} else {
+			hasConditions = true
+		}
+	}
+	if hasSubpaths && hasConditions {
+		return "", false, errors.New("exports cannot mix subpath and condition keys")
+	}
+	if !hasSubpaths {
+		if key != "." {
+			return "", false, nil
+		}
+		return profileManifestConditionTarget(object, "")
+	}
+	if value, ok := object.get(key); ok {
+		return profileManifestConditionTarget(value, "")
+	}
+	pattern, replacement := profileManifestPattern(object, key)
+	if pattern == "" {
+		return "", false, nil
+	}
+	value, _ = object.get(pattern)
+	return profileManifestConditionTarget(value, replacement)
+}
+
+func profileManifestPattern(object profileJSONObject, key string) (string, string) {
+	best, replacement := "", ""
+	for _, pair := range object {
+		star := strings.IndexByte(pair.key, '*')
+		if star < 0 || strings.IndexByte(pair.key[star+1:], '*') >= 0 {
+			continue
+		}
+		prefix, suffix := pair.key[:star], pair.key[star+1:]
+		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) || len(key) < len(prefix)+len(suffix) {
+			continue
+		}
+		if best != "" {
+			bestStar := strings.IndexByte(best, '*')
+			bestPrefix, bestSuffix := best[:bestStar], best[bestStar+1:]
+			if len(prefix) < len(bestPrefix) || len(prefix) == len(bestPrefix) && len(suffix) <= len(bestSuffix) {
+				continue
+			}
+		}
+		best = pair.key
+		replacement = key[len(prefix) : len(key)-len(suffix)]
+	}
+	return best, replacement
+}
+
+func profileManifestConditionTarget(value any, replacement string) (string, bool, error) {
+	switch value := value.(type) {
+	case nil:
+		return "", true, nil
+	case string:
+		return strings.ReplaceAll(value, "*", replacement), true, nil
+	case profileJSONArray:
+		for _, candidate := range value {
+			target, matched, err := profileManifestConditionTarget(candidate, replacement)
+			if err != nil {
+				continue
+			}
+			if matched && target != "" {
+				return target, true, nil
+			}
+		}
+		return "", true, nil
+	case profileJSONObject:
+		for _, pair := range value {
+			switch pair.key {
+			case "node-addons", "node", "import", "default":
+				target, matched, err := profileManifestConditionTarget(pair.value, replacement)
+				if err != nil || matched {
+					return target, matched, err
+				}
+			}
+		}
+		return "", false, nil
+	default:
+		return "", false, fmt.Errorf("unsupported exports target %T", value)
+	}
+}
+
+func profileExportPath(root, target string) (string, error) {
+	if !strings.HasPrefix(target, "./") {
+		return "", fmt.Errorf("target %q must start with ./", target)
+	}
+	path := filepath.Join(root, filepath.FromSlash(target))
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("target %q escapes package root", target)
+	}
+	return path, nil
 }
 
 func resolveProfileJSFile(path string) (string, error) {
@@ -702,6 +1153,7 @@ func resolveProfileJSFile(path string) (string, error) {
 func profileRuntimeBuildPlugins() []api.Plugin {
 	modules := map[string]string{
 		"commander":                profileCommanderModule,
+		"@deepseek-ai/cordis":      profileCordisModule,
 		"@deepseek-ai/dsh-cmdline": profileCmdlineModule,
 		"node:fs":                  profileFSModule,
 		"node:path":                profilePathModule,
@@ -709,7 +1161,7 @@ func profileRuntimeBuildPlugins() []api.Plugin {
 	return []api.Plugin{{
 		Name: "dsh-profile-runtime",
 		Setup: func(build api.PluginBuild) {
-			build.OnResolve(api.OnResolveOptions{Filter: `^(?:commander|@deepseek-ai/dsh-cmdline|node:fs|node:path)$`}, func(args api.OnResolveArgs) (api.OnResolveResult, error) {
+			build.OnResolve(api.OnResolveOptions{Filter: `^(?:commander|@deepseek-ai/cordis|@deepseek-ai/dsh-cmdline|node:fs|node:path)$`}, func(args api.OnResolveArgs) (api.OnResolveResult, error) {
 				return api.OnResolveResult{Path: args.Path, Namespace: "dsh-profile-runtime"}, nil
 			})
 			build.OnLoad(api.OnLoadOptions{Filter: `.*`, Namespace: "dsh-profile-runtime"}, func(args api.OnLoadArgs) (api.OnLoadResult, error) {
@@ -719,6 +1171,74 @@ func profileRuntimeBuildPlugins() []api.Plugin {
 		},
 	}}
 }
+
+const profileCordisModule = `
+export const symbols = Object.freeze({
+  effect: Symbol.for('cordis.effect'),
+  filter: Symbol.for('cordis.filter'),
+  isolate: Symbol.for('cordis.isolate'),
+  intercept: Symbol.for('cordis.intercept'),
+  initHooks: Symbol.for('cordis.initHooks'),
+  init: Symbol.for('cordis.init'),
+  check: Symbol.for('cordis.check'),
+  config: Symbol.for('cordis.config'),
+  invoke: Symbol.for('cordis.invoke'),
+  extend: Symbol.for('cordis.extend'),
+  tracker: Symbol.for('cordis.tracker'),
+  resolveConfig: Symbol.for('cordis.resolveConfig'),
+})
+
+export class Context {
+  static effect = symbols.effect
+  static filter = symbols.filter
+  static isolate = symbols.isolate
+  static intercept = symbols.intercept
+}
+
+export class Service {
+  static init = symbols.init
+  static check = symbols.check
+  static config = symbols.config
+  static invoke = symbols.invoke
+  static extend = symbols.extend
+  static tracker = symbols.tracker
+  static resolveConfig = symbols.resolveConfig
+
+  constructor(ctx, name) {
+    name ??= this.constructor.provide
+    if (typeof name !== 'string' || !name) throw new TypeError('Service requires a non-empty service name')
+    this.ctx = ctx
+    this.name = name
+    ctx.reflect.provide(name, this, this[Service.check])
+  }
+}
+
+export function Inject(name, config) {
+  return function (value, decorator) {
+    if (decorator?.kind === 'class') {
+      if (!Object.hasOwn(value, 'inject')) value.inject = { ...(value.inject ?? {}) }
+      value.inject[name] = config
+      return
+    }
+    if (decorator?.kind === 'method') {
+      decorator.addInitializer(function () {
+        ;(this[symbols.initHooks] ??= []).push(() => value.call(this))
+      })
+      return
+    }
+    throw new Error('@Inject() can only be used on class or class methods')
+  }
+}
+
+export function isConstructor(callback) {
+  if (!callback?.prototype) return false
+  const GeneratorFunction = function* () {}.constructor
+  const AsyncGeneratorFunction = async function* () {}.constructor
+  if (callback instanceof GeneratorFunction) return false
+  if (AsyncGeneratorFunction !== Function && callback instanceof AsyncGeneratorFunction) return false
+  return true
+}
+`
 
 const profileFSModule = `
 export function writeFileSync(path, data) {

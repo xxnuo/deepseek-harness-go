@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -64,8 +65,8 @@ func NewDSHSDKSubagentProvider(config DSHSDKSubagentConfig) (*DSHSDKSubagentProv
 	if model == "" {
 		model = "deepseek-v4-flash"
 	}
-	if config.MaxTokens < 0 {
-		return nil, errors.New("subagent-dsh-sdk: maxTokens must be a positive integer")
+	if config.MaxTokens < 0 || int64(config.MaxTokens) > maxJSONSafeInteger {
+		return nil, errors.New("subagent-dsh-sdk: maxTokens must be a positive safe integer")
 	}
 	cwd, err := validateConfiguredSubagentCWD("subagent-dsh-sdk", config.CWD)
 	if err != nil {
@@ -108,10 +109,11 @@ func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStar
 	if cwd, err = validateSubagentCWD("subagent-dsh-sdk", cwd); err != nil {
 		return nil, err
 	}
-	process, err := startSubagentProcess(p.command, p.args, cwd, p.env)
+	process, err := startSubagentProcessWithStderr(p.command, p.args, cwd, p.env, true)
 	if err != nil {
 		return nil, fmt.Errorf("subagent-dsh-sdk: start child: %w", err)
 	}
+	process.startStderrCapture()
 	state := newSDKSubagentState()
 	rpc := newSubagentRPCClient(process.stdout, process.stdin)
 	rpc.setHandlers(nil, state.notify)
@@ -135,15 +137,15 @@ func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStar
 		if ctx.Err() != nil {
 			return nil, errors.New("subagent request was aborted before the SDK child started")
 		}
-		return nil, fmt.Errorf("subagent-dsh-sdk: initialize: %w", err)
-	}
-	if initialized.ServerInfo.Name == "" || initialized.ServerInfo.Version == "" {
-		_ = startupDispose()
-		return nil, errors.New("subagent-dsh-sdk: initialize returned no server identity")
+		return nil, fmt.Errorf("subagent-dsh-sdk: initialize: %w", sdkProcessError(err, process))
 	}
 	if ctx.Err() != nil {
 		_ = startupDispose()
 		return nil, errors.New("subagent request was aborted before the SDK child started")
+	}
+	if initialized.ServerInfo.Name == "" || initialized.ServerInfo.Version == "" {
+		_ = startupDispose()
+		return nil, errors.New("subagent-dsh-sdk: initialize returned no server identity")
 	}
 
 	childSessionID := newID("session")
@@ -176,11 +178,15 @@ func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStar
 			"sessionId": childSessionID, "contentBlocks": request.Prompt,
 		}, &response)
 		if runCtx.Err() != nil {
-			run.settle(SubagentResult{Output: state.output(""), StopReason: SubagentAborted})
+			run.settle(SubagentResult{Output: state.output(response.MessageID), StopReason: SubagentAborted})
 			return
 		}
 		if err != nil || response.MessageID == "" {
-			run.settle(SubagentResult{Output: state.output(""), StopReason: SubagentError})
+			diagnostic := ""
+			if err != nil {
+				diagnostic = sdkProcessError(err, process).Error()
+			}
+			run.settle(SubagentResult{Output: state.output(""), Diagnostic: diagnostic, StopReason: SubagentError})
 			return
 		}
 		result, err := state.wait(runCtx, rpc, response.MessageID)
@@ -189,12 +195,35 @@ func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStar
 			return
 		}
 		if err != nil {
-			run.settle(SubagentResult{Output: state.output(response.MessageID), StopReason: SubagentError})
+			diagnostic := sdkProcessError(err, process).Error()
+			run.settle(SubagentResult{Output: state.output(response.MessageID), Diagnostic: diagnostic, StopReason: SubagentError})
 			return
 		}
 		run.settle(result)
 	}()
 	return run, nil
+}
+
+func sdkProcessError(err error, process *subagentProcess) error {
+	if process == nil || (!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe)) {
+		return err
+	}
+	parts := []string{err.Error()}
+	select {
+	case <-process.done:
+		outcome := process.result()
+		if outcome.exitCode >= 0 {
+			parts = append(parts, fmt.Sprintf("exit code: %d", outcome.exitCode))
+		}
+		if outcome.signal != "" {
+			parts = append(parts, "signal: "+outcome.signal)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	if stderr := process.stderrDiagnostic(100 * time.Millisecond); stderr != "" {
+		parts = append(parts, "stderr tail: "+stderr)
+	}
+	return errors.New(strings.Join(parts, "; "))
 }
 
 type sdkSubagentNotification struct {
@@ -273,14 +302,17 @@ func (s *sdkSubagentState) output(messageID string) []ContentBlock {
 	notifications := append([]sdkSubagentNotification(nil), s.notifications...)
 	s.mu.Unlock()
 	if messageID == "" {
-		return sdkOutput(notifications)
+		return nil
 	}
-	receipt := 0
+	receipt := -1
 	for index, notification := range notifications {
 		if notification.method == "session.event" && sdkInboxReceipt(notification.params["event"], messageID) {
 			receipt = index
 			break
 		}
+	}
+	if receipt < 0 {
+		return nil
 	}
 	return sdkOutput(notifications[receipt:])
 }

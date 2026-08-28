@@ -242,6 +242,169 @@ func TestEngineConfigUsesActiveClientRoster(t *testing.T) {
 	if !reflect.DeepEqual(cfg.PluginDirs, []string{filepath.Join(profileDir, "node_modules")}) {
 		t.Fatalf("plugin dirs = %#v", cfg.PluginDirs)
 	}
+	if len(cfg.PluginInventory) != 2 || cfg.PluginInventory[0].EntryID != "active" || !cfg.PluginInventory[0].Enabled || cfg.PluginInventory[0].FiberPhase == nil || *cfg.PluginInventory[0].FiberPhase != "active" {
+		t.Fatalf("active inventory = %#v", cfg.PluginInventory)
+	}
+	if cfg.PluginInventory[1].EntryID != "disabled" || cfg.PluginInventory[1].Enabled || cfg.PluginInventory[1].FiberPhase != nil {
+		t.Fatalf("disabled inventory = %#v", cfg.PluginInventory)
+	}
+}
+
+func TestCompositionPluginInventoryUsesLoaderOrderAndEffectiveDisablement(t *testing.T) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: first
+  name: '@example/first'
+- id: disabled-group
+  name: 'cordis:group'
+  group: true
+  disabled: !!js true
+  config:
+    - id: inherited-disabled
+      name: '@example/inherited-disabled'
+- id: last
+  name: '@example/last'
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{entries: document.Content[0].Content}
+	entries := composed.pluginInventoryEntries()
+	if len(entries) != 3 {
+		t.Fatalf("inventory = %#v", entries)
+	}
+	wantIDs := []string{"first", "disabled-group:inherited-disabled", "last"}
+	for i, id := range wantIDs {
+		if entries[i].EntryID != id {
+			t.Fatalf("inventory order = %#v", entries)
+		}
+	}
+	if entries[1].Enabled || entries[1].FiberPhase != nil {
+		t.Fatalf("inherited disabled inventory = %#v", entries[1])
+	}
+}
+
+func TestCompositionDisabledJSExpressionControlsActiveRoster(t *testing.T) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: off
+  name: '@example/off'
+  disabled: !!js true
+- id: on
+  name: '@example/on'
+  disabled: !!js false
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{entries: document.Content[0].Content}
+	active := composed.activePluginEntries()
+	if len(active) != 1 || active[0].id != "on" {
+		t.Fatalf("active entries = %#v", active)
+	}
+}
+
+func TestCompositionValidationRejectsDuplicateQualifiedLoaderIDs(t *testing.T) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: duplicate
+  name: '@example/one'
+- id: duplicate
+  name: '@example/two'
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{entries: document.Content[0].Content}
+	if err := composed.validateEntryIDs(); err == nil || !strings.Contains(err.Error(), "duplicate loader entry id: duplicate") {
+		t.Fatalf("duplicate entry validation = %v", err)
+	}
+}
+
+func TestCompositionValidationAllowsSameIDInSeparateGroups(t *testing.T) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: first
+  name: cordis:group
+  group: true
+  config:
+    - id: child
+      name: '@example/one'
+- id: second
+  name: cordis:group
+  group: true
+  config:
+    - id: child
+      name: '@example/two'
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{entries: document.Content[0].Content}
+	if err := composed.validateEntryIDs(); err != nil {
+		t.Fatalf("same local IDs in separate groups rejected: %v", err)
+	}
+}
+
+func TestEngineHonorsDisabledHostToolPlugin(t *testing.T) {
+	active := "active"
+	cfg := harness.DefaultConfig()
+	cfg.Persist = false
+	cfg.PluginInventory = []harness.PluginInventoryEntry{
+		{EntryID: "tool-fs", ModuleName: "@deepseek-ai/dsh-tool-fs", Enabled: false},
+		{EntryID: "tool-fs-search", ModuleName: "@deepseek-ai/dsh-tool-fs-search", Enabled: true, FiberPhase: &active},
+	}
+	engine, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	names := make(map[string]bool)
+	for _, schema := range engine.ListTools() {
+		names[schema.Name] = true
+	}
+	if names["read"] || names["write"] || names["edit"] || names["read_image"] {
+		t.Fatalf("disabled tool-fs still registered: %#v", names)
+	}
+	if !names["glob"] || !names["grep"] {
+		t.Fatalf("enabled tool-fs-search tools missing: %#v", names)
+	}
+}
+
+func TestApplyRuntimeConfigReconcilesDisabledHostTools(t *testing.T) {
+	active := "active"
+	cfg := harness.DefaultConfig()
+	cfg.Persist = false
+	cfg.PluginInventory = []harness.PluginInventoryEntry{
+		{EntryID: "tool-fs", ModuleName: "@deepseek-ai/dsh-tool-fs", Enabled: true, FiberPhase: &active},
+		{EntryID: "tool-fs-search", ModuleName: "@deepseek-ai/dsh-tool-fs-search", Enabled: true, FiberPhase: &active},
+	}
+	engine, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	if err := engine.ApplyRuntimeConfig(func() harness.Config {
+		next := cfg
+		next.PluginInventory = []harness.PluginInventoryEntry{
+			{EntryID: "tool-fs", ModuleName: "@deepseek-ai/dsh-tool-fs", Enabled: false},
+			{EntryID: "tool-fs-search", ModuleName: "@deepseek-ai/dsh-tool-fs-search", Enabled: true, FiberPhase: &active},
+		}
+		return next
+	}()); err != nil {
+		t.Fatal(err)
+	}
+	for _, schema := range engine.ListTools() {
+		if schema.Name == "read" || schema.Name == "write" || schema.Name == "edit" || schema.Name == "read_image" {
+			t.Fatalf("disabled fs tool survived runtime update: %s", schema.Name)
+		}
+	}
+	if err := engine.ApplyRuntimeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, schema := range engine.ListTools() {
+		names[schema.Name] = true
+	}
+	if !names["read"] || !names["write"] || !names["edit"] || !names["read_image"] {
+		t.Fatalf("re-enabled fs tools missing: %#v", names)
+	}
 }
 
 func TestCompositionRejectsUnknownEnabledPlugin(t *testing.T) {
@@ -283,6 +446,33 @@ func TestCompositionRejectsInvalidRuntimeConfig(t *testing.T) {
 	setMappingValue(mappingValue(composed.index["tools"].node, "config"), "mode", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "native"})
 	if err := composed.validate(); err == nil || !strings.Contains(err.Error(), "llm-pi-ai") {
 		t.Fatalf("invalid llm-pi-ai config = %v", err)
+	}
+}
+
+func TestCompositionConfigHelpersEvaluateIndependentJSValues(t *testing.T) {
+	t.Setenv("DSH_TEST_TOOLS_MODE", "code")
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config:
+    mode: !!js process.env.DSH_TEST_TOOLS_MODE
+- id: limits
+  name: '@example/limits'
+  config:
+    values: [!!js 2 + 1, 4]
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{entries: document.Content[0].Content, index: map[string]entryRef{}}
+	for index, entry := range composed.entries {
+		composed.buildIndex(entry, index)
+	}
+	if mode, ok := composed.configString("tools", "mode"); !ok || mode != "code" {
+		t.Fatalf("JS config string = %q, %v", mode, ok)
+	}
+	if values, ok := composed.configInts("limits", "values"); !ok || !reflect.DeepEqual(values, []int{3, 4}) {
+		t.Fatalf("JS config ints = %#v, %v", values, ok)
 	}
 }
 

@@ -210,14 +210,8 @@ func dynamicCordisCallBounded(vm *goja.Runtime, timeout time.Duration, call func
 
 func (e *Engine) dynamicCordisMissingServices(run *dynamicCordisRun) []string {
 	e.dynamicCordis.RLock()
-	missing := make([]string, 0)
-	for _, name := range run.inject {
-		if _, ok := e.dynamicCordis.services[name]; !ok && !e.dynamicCordisBuiltinService(name) {
-			missing = append(missing, name)
-		}
-	}
+	missing := dynamicCordisMissingServicesLocked(e, run)
 	e.dynamicCordis.RUnlock()
-	sort.Strings(missing)
 	return missing
 }
 
@@ -226,7 +220,7 @@ func (e *Engine) dynamicCordisBuiltinService(name string) bool {
 		return true
 	}
 	switch name {
-	case "tools", "systemPrompt", "timer", "fs", "shell", "webServer":
+	case "tools", "systemPrompt", "timer", "fs", "shell", "shellEnv", "webServer":
 		return true
 	case "web":
 		return true
@@ -287,6 +281,12 @@ func (e *Engine) configureDynamicCordisContext(run *dynamicCordisRun, owner stri
 		return vm.ToValue(func() { e.removeDynamicCordisService(run, name) })
 	})
 	set("effect", func(call goja.FunctionCall) goja.Value {
+		run.mu.Lock()
+		inactive := run.cleaning || run.disposed
+		run.mu.Unlock()
+		if inactive {
+			panic(vm.ToValue("cannot register a Cordis effect while its owner is unloading"))
+		}
 		fn, ok := goja.AssertFunction(call.Argument(0))
 		if !ok {
 			panic(vm.ToValue("ctx.effect requires a function"))
@@ -295,14 +295,40 @@ func (e *Engine) configureDynamicCordisContext(run *dynamicCordisRun, owner stri
 		if err != nil {
 			panic(vm.ToValue(dynamicJSMessage(err)))
 		}
-		dispose, ok := goja.AssertFunction(value)
-		if !ok {
-			return vm.ToValue(func() {})
+		state := &dynamicCordisEffectState{}
+		dispose := func() goja.Value {
+			return dynamicCordisDisposeEffect(run, state)
 		}
-		var once sync.Once
-		cleanup := func() { once.Do(func() { _, _ = dispose(goja.Undefined()) }) }
-		run.disposers = append(run.disposers, cleanup)
-		return vm.ToValue(cleanup)
+		run.disposers = append(run.disposers, func() {
+			dynamicCordisTrackCleanup(run, dispose())
+		})
+		if _, pending := value.Export().(*goja.Promise); pending {
+			run.effectSetups++
+			dynamicCordisAwaitOnLoop(run, value, func(resolved goja.Value, setupErr error) {
+				if setupErr == nil {
+					setupErr = dynamicCordisCollectEffectCleanup(run, state, resolved)
+				}
+				dynamicCordisFinishEffectSetup(run, setupErr)
+			})
+		} else if iterator, ok, iteratorErr := dynamicCordisEffectIterator(vm, value, false); iteratorErr != nil {
+			panic(vm.ToValue(iteratorErr.Error()))
+		} else if ok {
+			if err := dynamicCordisConsumeEffectIterator(run, state, iterator); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		} else if iterator, ok, iteratorErr := dynamicCordisEffectIterator(vm, value, true); iteratorErr != nil {
+			panic(vm.ToValue(iteratorErr.Error()))
+		} else if ok {
+			run.effectSetups++
+			dynamicCordisConsumeAsyncEffectIterator(run, state, iterator, func(setupErr error) {
+				dynamicCordisFinishEffectSetup(run, setupErr)
+			})
+		} else {
+			if err := dynamicCordisCollectEffectCleanup(run, state, value); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+		}
+		return vm.ToValue(func(goja.FunctionCall) goja.Value { return dispose() })
 	})
 	listen := func(once bool) func(goja.FunctionCall) goja.Value {
 		return func(call goja.FunctionCall) goja.Value {
@@ -380,7 +406,7 @@ func (e *Engine) configureDynamicCordisContext(run *dynamicCordisRun, owner stri
 				stateMu.Unlock()
 				e.dynamicCordis.loop.post(func() {
 					run.mu.Lock()
-					active := !run.disposed && (run.active || run.activating)
+					active := !run.disposed && (run.active || run.activating || run.cleaning)
 					run.mu.Unlock()
 					if active {
 						if _, err := fn(goja.Undefined()); err != nil {
@@ -871,7 +897,7 @@ func (e *Engine) dynamicCordisServiceValue(target *dynamicCordisRun, name string
 		return e.dynamicCordisWebFacade(target)
 	case "webServer":
 		return e.dynamicCordisWebServerFacade(target)
-	case "systemPrompt", "timer", "fs", "shell":
+	case "systemPrompt", "timer", "fs", "shell", "shellEnv":
 		return e.dynamicCordisBuiltinServiceValue(target, name)
 	}
 	e.dynamicCordis.RLock()
@@ -891,24 +917,265 @@ func (e *Engine) dynamicCordisWebFacade(run *dynamicCordisRun) *goja.Object {
 		if err := dynamicCordisDecode(call.Argument(0), &request); err != nil {
 			panic(vm.ToValue("ctx.web.search request: " + err.Error()))
 		}
-		result, err := e.webSearch(withWebSession(context.Background(), run.sessionID), request)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		return vm.ToValue(cloneJSON(result))
+		return e.dynamicCordisWebCall(run, "search", request, call.Argument(1))
 	})
 	_ = service.Set("fetch", func(call goja.FunctionCall) goja.Value {
 		var request WebFetchRequest
 		if err := dynamicCordisDecode(call.Argument(0), &request); err != nil {
 			panic(vm.ToValue("ctx.web.fetch request: " + err.Error()))
 		}
-		result, err := e.webFetch(context.Background(), request)
+		return e.dynamicCordisWebCall(run, "fetch", request, call.Argument(1))
+	})
+	_ = service.Set("registerSearchProvider", func(call goja.FunctionCall) goja.Value {
+		dispose, err := e.registerDynamicCordisWebProvider(run, call.Argument(0), true)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		return vm.ToValue(cloneJSON(result))
+		return vm.ToValue(dispose)
+	})
+	_ = service.Set("registerFetchProvider", func(call goja.FunctionCall) goja.Value {
+		dispose, err := e.registerDynamicCordisWebProvider(run, call.Argument(0), false)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(dispose)
 	})
 	return service
+}
+
+// dynamicCordisWebCall keeps the JS runtime responsive while a provider (possibly
+// another dynamic package) performs asynchronous work in the host.
+func (e *Engine) dynamicCordisWebCall(run *dynamicCordisRun, kind string, request any, signalValue goja.Value) goja.Value {
+	vm := run.runtime
+	ctx, cancel, removeAbort, err := dynamicContextFromSignal(run, signalValue, "web "+kind)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	promise, resolve, reject := vm.NewPromise()
+	go func() {
+		if ctx.Err() != nil {
+			_ = e.dynamicCordis.loop.post(func() {
+				removeAbort()
+				cancel(ctx.Err())
+				_ = reject(vm.NewGoError(ctx.Err()))
+			})
+			return
+		}
+		var value any
+		var callErr error
+		switch kind {
+		case "search":
+			value, callErr = e.webSearch(withWebSession(ctx, run.sessionID), request.(WebSearchRequest))
+		case "fetch":
+			value, callErr = e.webFetch(ctx, request.(WebFetchRequest))
+		default:
+			callErr = fmt.Errorf("unknown web operation %q", kind)
+		}
+		_ = e.dynamicCordis.loop.post(func() {
+			removeAbort()
+			cancel(callErr)
+			if callErr != nil {
+				_ = reject(dynamicCordisWebErrorValue(vm, callErr))
+				return
+			}
+			_ = resolve(vm.ToValue(cloneJSON(value)))
+		})
+	}()
+	return vm.ToValue(promise)
+}
+
+func (e *Engine) registerDynamicCordisWebProvider(run *dynamicCordisRun, value goja.Value, search bool) (func(), error) {
+	object, ok := value.(*goja.Object)
+	if !ok {
+		return nil, errors.New("web provider must be an object")
+	}
+	idValue := object.Get("id")
+	id, idOK := idValue.Export().(string)
+	id = strings.TrimSpace(id)
+	if !idOK || id == "" {
+		return nil, errors.New("web provider requires a non-empty string id")
+	}
+	available, ok := goja.AssertFunction(object.Get("available"))
+	if !ok {
+		return nil, errors.New("web provider requires an available() function")
+	}
+	operationName := "fetch"
+	if search {
+		operationName = "search"
+	}
+	operation, ok := goja.AssertFunction(object.Get(operationName))
+	if !ok {
+		return nil, fmt.Errorf("web provider requires a %s() function", operationName)
+	}
+	provider := &dynamicCordisJSWebProvider{id: id, engine: e, run: run, object: object, available: available, operation: operation, search: search}
+	var dispose func()
+	var err error
+	if search {
+		dispose, err = e.RegisterWebSearchProvider(provider)
+	} else {
+		dispose, err = e.RegisterWebFetchProvider(provider)
+	}
+	if err != nil {
+		return nil, err
+	}
+	run.disposers = append(run.disposers, dispose)
+	return dispose, nil
+}
+
+type dynamicCordisJSWebProvider struct {
+	id        string
+	engine    *Engine
+	run       *dynamicCordisRun
+	object    *goja.Object
+	available goja.Callable
+	operation goja.Callable
+	search    bool
+}
+
+func (p *dynamicCordisJSWebProvider) ID() string {
+	return p.id
+}
+
+func (p *dynamicCordisJSWebProvider) Available() bool {
+	var available bool
+	if !p.engine.dynamicCordis.loop.call(func() {
+		p.run.mu.Lock()
+		active := !p.run.disposed && (p.run.active || p.run.activating)
+		p.run.mu.Unlock()
+		if !active {
+			return
+		}
+		value, err := p.available(p.object)
+		available = err == nil && value.ToBoolean()
+	}) {
+		return false
+	}
+	return available
+}
+
+func (p *dynamicCordisJSWebProvider) Search(ctx context.Context, request WebSearchRequest) (WebSearchResult, error) {
+	if !p.search {
+		return WebSearchResult{}, errors.New("dynamic web provider does not support search")
+	}
+	value, err := p.invoke(ctx, request)
+	if err != nil {
+		return WebSearchResult{}, err
+	}
+	var result WebSearchResult
+	if err := dynamicCordisDecodeJSON(value, &result); err != nil {
+		return WebSearchResult{}, &WebError{Code: "WEB_PROVIDER_ERROR", Message: "dynamic web search returned an invalid result"}
+	}
+	return result, nil
+}
+
+func (p *dynamicCordisJSWebProvider) Fetch(ctx context.Context, request WebFetchRequest) (WebFetchResult, error) {
+	if p.search {
+		return WebFetchResult{}, errors.New("dynamic web provider does not support fetch")
+	}
+	value, err := p.invoke(ctx, request)
+	if err != nil {
+		return WebFetchResult{}, err
+	}
+	var result WebFetchResult
+	if err := dynamicCordisDecodeJSON(value, &result); err != nil {
+		return WebFetchResult{}, &WebError{Code: "WEB_PROVIDER_ERROR", Message: "dynamic web fetch returned an invalid result"}
+	}
+	return result, nil
+}
+
+func (p *dynamicCordisJSWebProvider) invoke(ctx context.Context, request any) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type outcome struct {
+		value any
+		err   error
+	}
+	result := make(chan outcome, 1)
+	if !p.engine.dynamicCordis.loop.post(func() {
+		p.run.mu.Lock()
+		active := !p.run.disposed && (p.run.active || p.run.activating)
+		p.run.mu.Unlock()
+		if !active {
+			result <- outcome{err: errors.New("dynamic web provider is no longer active")}
+			return
+		}
+		signal, stop := dynamicAuthorizationSignal(p.run, ctx)
+		value, callErr := p.operation(p.object, p.run.runtime.ToValue(cloneJSON(request)), signal)
+		if callErr != nil {
+			stop()
+			result <- outcome{err: dynamicCordisWebError(callErr)}
+			return
+		}
+		finish := func(value goja.Value, awaitErr error) {
+			stop()
+			if awaitErr != nil {
+				result <- outcome{err: dynamicCordisWebError(awaitErr)}
+				return
+			}
+			canonical, err := dynamicCordisJSONValue(value)
+			if err != nil {
+				result <- outcome{err: err}
+				return
+			}
+			result <- outcome{value: canonical}
+		}
+		dynamicCordisAwaitOnLoop(p.run, value, finish)
+	}) {
+		return nil, errors.New("dynamic Cordis runtime is closed")
+	}
+	select {
+	case resolved := <-result:
+		return resolved.value, resolved.err
+	case <-ctx.Done():
+		return nil, &WebError{Code: "WEB_ABORTED", Message: "web request aborted"}
+	}
+}
+
+func dynamicCordisDecodeJSON(value any, target any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
+}
+
+func dynamicCordisWebError(err error) error {
+	if webErr, ok := err.(*WebError); ok {
+		return webErr
+	}
+	message, _ := dynamicJSErrorDetails(err)
+	code := dynamicJSErrorCode(err)
+	if message == "" {
+		message = err.Error()
+	}
+	if code == "" {
+		code = "WEB_PROVIDER_ERROR"
+	}
+	return &WebError{Code: code, Message: message}
+}
+
+func dynamicJSErrorCode(err error) string {
+	var jsErr *dynamicCordisJSError
+	if errors.As(err, &jsErr) {
+		return jsErr.code
+	}
+	var exception *goja.Exception
+	if errors.As(err, &exception) {
+		return dynamicJSValueCode(exception.Value())
+	}
+	return ""
+}
+
+func dynamicCordisWebErrorValue(vm *goja.Runtime, err error) goja.Value {
+	value := vm.NewGoError(err)
+	var webErr *WebError
+	if errors.As(err, &webErr) && webErr.Code != "" {
+		_ = value.Set("code", webErr.Code)
+	}
+	return value
 }
 
 func dynamicCordisDecode(value goja.Value, target any) error {
@@ -942,7 +1209,7 @@ func dynamicCordisProxyValue(target, owner *dynamicCordisRun, value goja.Value) 
 		return vm.ToValue(value.Export())
 	}
 	proxy := vm.NewObject()
-	for _, key := range object.Keys() {
+	for _, key := range dynamicCordisProxyKeys(object) {
 		member := object.Get(key)
 		if function, ok := goja.AssertFunction(member); ok {
 			fn := function
@@ -954,6 +1221,28 @@ func dynamicCordisProxyValue(target, owner *dynamicCordisRun, value goja.Value) 
 		_ = proxy.Set(key, dynamicCordisProxyValue(target, owner, member))
 	}
 	return proxy
+}
+
+func dynamicCordisProxyKeys(object *goja.Object) []string {
+	seen := map[string]struct{}{}
+	keys := make([]string, 0, len(object.Keys()))
+	for _, key := range object.Keys() {
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	for prototype := object.Prototype(); prototype != nil && prototype.Prototype() != nil; prototype = prototype.Prototype() {
+		for _, key := range prototype.GetOwnPropertyNames() {
+			if key == "constructor" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func dynamicCordisProxyCall(target, owner *dynamicCordisRun, function goja.Callable, this goja.Value, arguments []goja.Value) goja.Value {
@@ -1091,22 +1380,29 @@ func (e *Engine) activateDynamicCordisRunNow(run *dynamicCordisRun, owner string
 		e.setDynamicCordisRunWaiting(run, nil)
 		finish(nil, nil)
 	}
+	completeApply := func(err error) {
+		if err != nil {
+			complete(err)
+			return
+		}
+		dynamicCordisAwaitEffectSetups(run, complete)
+	}
 	if run.apply == nil {
-		complete(nil)
+		completeApply(nil)
 		return
 	}
 	value, err := dynamicCordisCallBounded(run.runtime, run.vmTimeout, func() (goja.Value, error) {
 		return run.apply(run.plugin, run.ctx)
 	})
 	if err != nil {
-		complete(errors.New(dynamicJSMessage(err)))
+		completeApply(errors.New(dynamicJSMessage(err)))
 		return
 	}
 	if goja.IsUndefined(value) {
-		complete(nil)
+		completeApply(nil)
 		return
 	}
-	dynamicCordisAwaitOnLoop(run, value, func(_ goja.Value, err error) { complete(err) })
+	dynamicCordisAwaitOnLoop(run, value, func(_ goja.Value, err error) { completeApply(err) })
 }
 
 func (e *Engine) activateAvailableDynamicCordisRuns() {
@@ -1171,6 +1467,7 @@ func (e *Engine) cleanupDynamicCordisRunNow(run *dynamicCordisRun, final bool) {
 	run.mu.Lock()
 	run.active = false
 	run.activating = false
+	run.cleaning = true
 	disposers := append([]func(){}, run.disposers...)
 	run.disposers = nil
 	if final {
@@ -1181,14 +1478,25 @@ func (e *Engine) cleanupDynamicCordisRunNow(run *dynamicCordisRun, final bool) {
 	for name := range run.provided {
 		provided = append(provided, name)
 	}
-	if final {
-		run.disposed = true
-	}
 	run.mu.Unlock()
 	e.jobs.releaseControllers(run.sessionID, run)
 	for index := len(disposers) - 1; index >= 0; index-- {
 		disposers[index]()
+		for len(run.cleanupWaits) > 0 {
+			wait := run.cleanupWaits[0]
+			if !e.dynamicCordis.loop.pumpUntil(func() bool { return wait.done }) {
+				break
+			}
+			run.cleanupWaits[0] = nil
+			run.cleanupWaits = run.cleanupWaits[1:]
+		}
 	}
+	run.mu.Lock()
+	run.cleaning = false
+	if final {
+		run.disposed = true
+	}
+	run.mu.Unlock()
 	pendingErr := errors.New("dynamic package lifecycle changed while JavaScript was pending")
 	if final {
 		pendingErr = errors.New("dynamic package is no longer active")

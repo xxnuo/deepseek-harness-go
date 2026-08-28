@@ -28,7 +28,13 @@ func executeRegisteredTool(t *testing.T, e *Engine, name, sessionID string, args
 		workspace = session.Header.CWD
 		session.mu.Unlock()
 	}
-	result, err := tool.Execute(context.Background(), ToolCall{ID: "call-test", Name: name, Arguments: data, SessionID: sessionID, Workspace: workspace})
+	call := ToolCall{ID: "call-test", Name: name, Arguments: data, SessionID: sessionID, Workspace: workspace}
+	var result ToolResult
+	if tool.Execute != nil {
+		result, err = tool.Execute(context.Background(), call)
+	} else {
+		result, err = executeToolRuntime(context.Background(), tool, call, nil)
+	}
 	if err != nil {
 		t.Fatalf("%s: %v", name, err)
 	}
@@ -37,6 +43,23 @@ func executeRegisteredTool(t *testing.T, e *Engine, name, sessionID string, args
 
 func modelToolResultText(result ToolResult) string {
 	return contentValueText(result.Content)
+}
+
+func newPersistentModelSubagentEngine(t *testing.T) *Engine {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Workspace = cfg.DataDir
+	cfg.Provider = "echo"
+	cfg.Model = "echo"
+	cfg.SessionTitleLLM.Enabled = false
+	cfg.Persist = true
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	return e
 }
 
 func TestAskUserQuestionRoundTripAndSubagentFence(t *testing.T) {
@@ -103,6 +126,19 @@ func TestGoalToolsPersistAndCompareRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s, _ := e.getSession(id)
+	s.mu.Lock()
+	s.Running = true
+	s.mu.Unlock()
+	if _, err := e.appendEvent(s, "turn/start", map[string]any{"turn": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.appendEvent(s, "user/message", map[string]any{
+		"id": newID("msg"), "role": "user", "content": []ContentBlock{{Type: "text", Text: "set the goal"}},
+		"source": map[string]any{"kind": "user"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	created := executeRegisteredTool(t, e, "create_goal", id, map[string]any{"objective": "ship parity", "max_goal_rounds": 4})
 	if text := modelToolResultText(created); !strings.Contains(text, `"objective":"ship parity"`) || !strings.Contains(text, `"activation":"armed"`) {
@@ -127,9 +163,101 @@ func TestGoalToolsPersistAndCompareRevision(t *testing.T) {
 	e.mu.RLock()
 	tool := e.tools["update_goal"]
 	e.mu.RUnlock()
-	_, err = tool.Execute(context.Background(), ToolCall{Name: "update_goal", SessionID: id, Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"complete"}`)})
+	_, err = executeToolRuntime(context.Background(), tool, ToolCall{Name: "update_goal", SessionID: id, Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"complete"}`)}, nil)
 	if err == nil || !strings.Contains(err.Error(), "goal-conflict") {
 		t.Fatalf("stale goal update error = %v", err)
+	}
+}
+
+func TestGoalToolsRequireOpenDriverAndOperationAuthority(t *testing.T) {
+	e := newIntegrationEngine(t)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "goal-authority", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.mu.RLock()
+	getTool := e.tools["get_goal"]
+	createTool := e.tools["create_goal"]
+	e.mu.RUnlock()
+	_, err = executeToolRuntime(context.Background(), getTool, ToolCall{Name: "get_goal", SessionID: id, Arguments: json.RawMessage(`{}`)}, nil)
+	if err == nil || !strings.Contains(err.Error(), "GOAL_TOOL_DRIVER_REQUIRED") {
+		t.Fatalf("get_goal outside driver error = %v", err)
+	}
+	s := mustSession(t, e, id)
+	s.mu.Lock()
+	s.Running = true
+	s.mu.Unlock()
+	if _, err := e.appendEvent(s, "turn/start", map[string]any{"turn": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeToolRuntime(context.Background(), getTool, ToolCall{Name: "get_goal", SessionID: id, Arguments: json.RawMessage(`{}`)}, nil); err != nil {
+		t.Fatalf("get_goal in open driver = %v", err)
+	}
+	_, err = executeToolRuntime(context.Background(), createTool, ToolCall{Name: "create_goal", SessionID: id, Arguments: json.RawMessage(`{"objective":"ship"}`)}, nil)
+	if err == nil || !strings.Contains(err.Error(), "GOAL_TOOL_AUTHORITY_REQUIRED") {
+		t.Fatalf("create_goal without human source error = %v", err)
+	}
+	if _, err := e.appendEvent(s, "user/message", map[string]any{
+		"id": newID("msg"), "role": "user", "content": []ContentBlock{{Type: "text", Text: "ship it"}},
+		"source": map[string]any{"kind": "user"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeToolRuntime(context.Background(), createTool, ToolCall{Name: "create_goal", SessionID: id, Arguments: json.RawMessage(`{"objective":"ship"}`)}, nil); err != nil {
+		t.Fatalf("create_goal with human source = %v", err)
+	}
+	if _, err := e.appendEvent(s, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = executeToolRuntime(context.Background(), getTool, ToolCall{Name: "get_goal", SessionID: id, Arguments: json.RawMessage(`{}`)}, nil)
+	if err == nil || !strings.Contains(err.Error(), "GOAL_TOOL_DRIVER_REQUIRED") {
+		t.Fatalf("get_goal after turn error = %v", err)
+	}
+}
+
+func TestAutonomousGoalTerminalUpdateDefersWrapupContext(t *testing.T) {
+	e := newIntegrationEngine(t)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "goal-wrapup", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "finish the release", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	s := mustSession(t, e, id)
+	s.mu.Lock()
+	s.Running = true
+	s.mu.Unlock()
+	if _, err := e.appendEvent(s, "turn/start", map[string]any{"turn": 1}); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	item := &queuedPrompt{
+		id: newID("msg"), content: []ContentBlock{{Type: "text", Text: renderGoalRoundPrompt(e.goals[id], 1)}},
+		source:          map[string]any{"kind": "goal", "goalId": goal.ID, "revision": goal.Revision, "round": 1},
+		goalReservation: true,
+	}
+	if _, err := e.admitPrompt(context.Background(), s, item); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.RLock()
+	tool := e.tools["update_goal"]
+	e.mu.RUnlock()
+	runtime := &ToolRunContext{}
+	result, err := executeToolRuntime(context.Background(), tool, ToolCall{
+		Name: "update_goal", SessionID: id,
+		Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"complete"}`),
+	}, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ConcludesTurn || len(result.AdditionalContexts) != 1 {
+		t.Fatalf("terminal goal result = %#v", result)
+	}
+	context := result.AdditionalContexts[0]
+	if context.Source["plugin"] != "tool-goal" || context.Source["summary"] != "complete: finish the release" ||
+		!strings.Contains(contentValueText(context.Content), "<goal_complete>") || !strings.Contains(contentValueText(context.Content), "Do not call any more tools") {
+		t.Fatalf("goal wrapup context = %#v", context)
 	}
 }
 
@@ -152,53 +280,30 @@ func TestSubagentToolsRunContinueForkAndList(t *testing.T) {
 	if text := modelToolResultText(result); text != "child task" {
 		t.Fatalf("subagent result = %q", text)
 	}
+	value, _ := result.Value.(map[string]any)
+	child, _ := value["runId"].(string)
+	childSession := mustSession(t, e, child)
+	childSession.mu.Lock()
+	childMode, childAttached := childSession.Header.Mode, childSession.attached
+	childSession.mu.Unlock()
+	if childMode != "one-shot" || childAttached {
+		t.Fatalf("foreground child mode=%q attached=%v", childMode, childAttached)
+	}
 	entries, err := e.listModelAgents(context.Background(), parent, false)
-	if err != nil || len(entries) != 1 {
+	if err != nil || len(entries) != 0 {
 		t.Fatalf("list agents = %#v, %v", entries, err)
 	}
-	child := entries[0].ID
-	if entries[0].Label != "echo child" || entries[0].Status != "idle" {
-		t.Fatalf("child entry = %#v", entries[0])
-	}
 
-	executeRegisteredTool(t, e, "send_message", parent, map[string]any{"subagent_id": child, "message": "follow up"})
-	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := e.WaitForIdle(waitCtx, child); err != nil {
-		t.Fatal(err)
-	}
-	history, _, err := e.History(child, -1, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundFollowup := false
-	for _, entry := range history {
-		if entry.Event.Type == "user/message" && strings.Contains(contentValueText(entry.Event.Data), "follow up") {
-			foundFollowup = true
-		}
-	}
-	if !foundFollowup {
-		t.Fatal("continued subagent history does not contain follow up")
-	}
-
-	forked := executeRegisteredTool(t, e, "subagent_fork", parent, map[string]any{"description": "fork child", "prompt": "fork task"})
+	forked := executeRegisteredTool(t, e, "subagent_fork", parent, map[string]any{"description": "fork child", "prompt": "fork task", "run_in_background": false})
 	if text := modelToolResultText(forked); text != "fork task" {
 		t.Fatalf("subagent_fork result = %q", text)
 	}
-	entries, err = e.listModelAgents(context.Background(), parent, false)
-	if err != nil || len(entries) != 2 {
-		t.Fatalf("children after fork = %#v, %v", entries, err)
-	}
-	var seeded bool
-	for _, entry := range entries {
-		if entry.Label != "fork child" {
-			continue
-		}
-		s, _ := e.getSession(entry.ID)
-		s.mu.Lock()
-		seeded = s.Header.SeedLength > 0
-		s.mu.Unlock()
-	}
+	forkValue, _ := forked.Value.(map[string]any)
+	forkID, _ := forkValue["runId"].(string)
+	forkSession := mustSession(t, e, forkID)
+	forkSession.mu.Lock()
+	seeded := forkSession.Header.SeedLength > 0
+	forkSession.mu.Unlock()
 	if !seeded {
 		t.Fatal("forked subagent did not inherit completed turns")
 	}
@@ -232,12 +337,12 @@ func TestModelSubagentConfigRestrictsOnlyGlobalTools(t *testing.T) {
 		t.Fatalf("child model = %#v", selection)
 	}
 	identity := currentSubagentIdentity(events)
-	if !reflect.DeepEqual(identity, map[string]any{"mode": "continuable", "label": "configured child", "seq": 0}) {
+	if !reflect.DeepEqual(identity, map[string]any{"mode": "continuable", "label": "configured child", "seq": 1}) {
 		t.Fatalf("child descriptor projection = %#v", identity)
 	}
-	descriptor, _ := events[0].Data.(map[string]any)
-	if events[0].Type != "subagent/descriptor" || descriptor["provider"] != "spawn" || descriptor["agentProvider"] != "echo" || descriptor["agentModel"] != "child-model" || descriptor["persona"] != "You are the focused child." {
-		t.Fatalf("child descriptor = %#v", events[0])
+	descriptor, _ := events[1].Data.(map[string]any)
+	if events[0].Type != "approval/policy" || events[1].Type != "subagent/descriptor" || descriptor["provider"] != "spawn" || descriptor["agentProvider"] != "echo" || descriptor["agentModel"] != "child-model" || descriptor["persona"] != "You are the focused child." {
+		t.Fatalf("child descriptor = %#v", events[:2])
 	}
 	runtimeConfig, err := e.runtimeForSession(child)
 	if err != nil || runtimeConfig.persona != "You are the focused child." {
@@ -273,7 +378,7 @@ func TestModelSubagentConfigRestrictsOnlyGlobalTools(t *testing.T) {
 	}
 
 	zero := 0
-	if _, err := e.createModelSubagent(context.Background(), parent, "too deep", false, "continuable", SubagentToolConfig{Provider: "spawn", MaxDepth: &zero}); err == nil || !strings.Contains(err.Error(), "maximum depth 0") {
+	if _, err := e.createModelSubagent(context.Background(), parent, "too deep", false, "continuable", SubagentToolConfig{Provider: "spawn", MaxDepth: &zero}); err == nil || !strings.Contains(err.Error(), "depth 1 exceeds maxDepth 0") {
 		t.Fatalf("maxDepth error = %v", err)
 	}
 }
@@ -334,7 +439,7 @@ func TestModelSubagentCompositionPersistsAcrossRestart(t *testing.T) {
 }
 
 func TestContinuableModelSubagentNotifiesParent(t *testing.T) {
-	e := newIntegrationEngine(t)
+	e := newPersistentModelSubagentEngine(t)
 	parent, err := e.CreateSession(context.Background(), e.Config().Workspace, "settlement-parent", "")
 	if err != nil {
 		t.Fatal(err)
@@ -370,5 +475,41 @@ func TestContinuableModelSubagentNotifiesParent(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("parent did not receive the subagent settlement notice")
+	}
+}
+
+func TestModelSubagentSettlementPreservesCompleteAssistantBlocks(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	provider := newQueuedTestProvider()
+	e.RegisterProvider(provider)
+	parent, err := e.CreateSession(t.Context(), e.Config().Workspace, "settlement-block-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(parent, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	e.notifyModelSubagentSettlement(parent, "custom-child", []ContentBlock{
+		{Type: "reasoning", Text: "complete reasoning"},
+		{Type: "provider-artifact", Extra: map[string]any{"uri": "artifact://one", "count": float64(2)}},
+	}, "completed")
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("settlement notice did not wake the parent")
+	}
+	requests := provider.requestSnapshot()
+	if len(requests) != 1 || len(requests[0].Messages) == 0 {
+		t.Fatalf("settlement requests = %#v", requests)
+	}
+	blocks := requests[0].Messages[len(requests[0].Messages)-1].Blocks
+	want := []ContentBlock{
+		{Type: "text", Text: "Background subagent custom-child finished and will do no further work unless you send it more."},
+		{Type: "text", Text: "Its closing message:"},
+		{Type: "reasoning", Text: "complete reasoning"},
+		{Type: "provider-artifact", Extra: map[string]any{"uri": "artifact://one", "count": json.Number("2")}},
+	}
+	if !reflect.DeepEqual(blocks, want) {
+		t.Fatalf("settlement blocks = %#v", blocks)
 	}
 }

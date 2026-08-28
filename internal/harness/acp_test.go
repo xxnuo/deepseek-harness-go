@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -418,8 +419,9 @@ func TestACPRejectsInvalidImagesAsInvalidParams(t *testing.T) {
 	sessionID := acpTestNewSession(t, client, engine.Config().Workspace)
 
 	for name, block := range map[string]map[string]any{
-		"mime":   {"type": "image", "data": "AQ==", "mimeType": "image/tiff"},
-		"base64": {"type": "image", "data": "not base64", "mimeType": "image/png"},
+		"mime":       {"type": "image", "data": "AQ==", "mimeType": "image/tiff"},
+		"base64":     {"type": "image", "data": "not base64", "mimeType": "image/png"},
+		"image-data": {"type": "image", "data": "AQ==", "mimeType": "image/png"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			frame := client.request(t, name, "session/prompt", map[string]any{"sessionId": sessionID, "prompt": []any{block}})
@@ -433,6 +435,106 @@ func TestACPRejectsInvalidImagesAsInvalidParams(t *testing.T) {
 	case <-provider.started:
 		t.Fatal("invalid image reached the provider")
 	default:
+	}
+}
+
+func TestACPCancelDuringImageAdmissionDoesNotQueueLatePrompt(t *testing.T) {
+	vision := &readImageProvider{id: "acp-cancel-vision", model: "vision", modalities: []string{"text", "image"}}
+	engine := newACPProviderEngine(t, vision, vision.model)
+	for index := 0; index < cap(engine.imageCompression); index++ {
+		engine.imageCompression <- struct{}{}
+	}
+	defer func() {
+		for len(engine.imageCompression) > 0 {
+			<-engine.imageCompression
+		}
+	}()
+	client := newACPTestClient(t, engine)
+	acpTestResult(t, client.request(t, "init-admission-cancel", "initialize", map[string]any{"protocolVersion": ACPProtocolVersion}))
+	sessionID := acpTestNewSession(t, client, engine.Config().Workspace)
+	start := client.send(t, map[string]any{
+		"jsonrpc": "2.0", "id": "prompt-admission-cancel", "method": "session/prompt",
+		"params": map[string]any{"sessionId": sessionID, "prompt": []any{map[string]any{"type": "image", "mimeType": "image/png", "data": readImagePNG}}},
+	})
+	time.Sleep(20 * time.Millisecond)
+	client.send(t, map[string]any{"jsonrpc": "2.0", "method": "session/cancel", "params": map[string]any{"sessionId": sessionID}})
+	response, _ := client.waitFrame(t, start, func(frame map[string]any) bool { return frame["id"] == "prompt-admission-cancel" })
+	result := acpTestResult(t, response)
+	if result["stopReason"] != "cancelled" {
+		t.Fatalf("admission cancellation response = %#v", response)
+	}
+	session, err := engine.getSession(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for _, event := range session.Events {
+		if event.Type == "user/message" {
+			t.Fatalf("cancelled admission queued a late prompt: %#v", event)
+		}
+	}
+}
+
+type acpSwitchingImageProvider struct {
+	*readImageProvider
+	mu       sync.Mutex
+	calls    int
+	onSecond func()
+}
+
+func (p *acpSwitchingImageProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	callback := p.onSecond
+	p.mu.Unlock()
+	if call == 2 && callback != nil {
+		callback()
+	}
+	return p.readImageProvider.ResolveModelInfo(ctx, model)
+}
+
+func TestACPImagesUseExactDefaultAndLatestSessionRoutes(t *testing.T) {
+	vision := &acpSwitchingImageProvider{readImageProvider: &readImageProvider{id: "acp-vision", model: "hidden-vision", modalities: []string{"text", "image"}, catalog: []ModelInfo{}}}
+	textOnly := &readImageProvider{id: "acp-text", model: "text", modalities: []string{"text"}}
+	engine := newACPProviderEngine(t, vision, vision.readImageProvider.model)
+	engine.RegisterProvider(textOnly)
+	client := newACPTestClient(t, engine)
+	initialized := acpTestResult(t, client.request(t, "init-exact", "initialize", map[string]any{"protocolVersion": ACPProtocolVersion}))
+	capabilities, _ := initialized["agentCapabilities"].(map[string]any)
+	promptCapabilities, _ := capabilities["promptCapabilities"].(map[string]any)
+	if promptCapabilities["image"] != true {
+		t.Fatalf("exact visual route was not advertised: %#v", promptCapabilities)
+	}
+	sessionID := acpTestNewSession(t, client, engine.Config().Workspace)
+	session, err := engine.getSession(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vision.mu.Lock()
+	vision.onSecond = func() {
+		if _, appendErr := engine.appendEvent(session, "request/header", map[string]any{"header": map[string]any{"config": map[string]any{
+			"provider": textOnly.ID(), "model": textOnly.model,
+		}}, "reason": "change"}); appendErr != nil {
+			t.Errorf("append changed request header: %v", appendErr)
+		}
+	}
+	vision.mu.Unlock()
+	response := client.request(t, "prompt-latest-route", "session/prompt", map[string]any{
+		"sessionId": sessionID,
+		"prompt":    []any{map[string]any{"type": "image", "mimeType": "image/png", "data": readImagePNG}},
+	})
+	failure, _ := response["error"].(map[string]any)
+	if failure["code"] != float64(-32602) || !strings.Contains(fmt.Sprint(failure["message"]), "does not declare image input") {
+		t.Fatalf("latest text route response = %#v", response)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for _, event := range session.Events {
+		if event.Type == "user/message" {
+			t.Fatalf("route changed during admission but prompt was queued: %#v", event)
+		}
 	}
 }
 

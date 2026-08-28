@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -19,6 +20,7 @@ const (
 	maxJSONSafeIntegerValue   = int64(1<<53 - 1)
 	maxScheduleTimerDelay     = time.Duration(2_147_483_647) * time.Millisecond
 	scheduleReminderSourceKey = "schedule"
+	scheduleLockPollInterval  = time.Millisecond
 )
 
 var (
@@ -85,6 +87,74 @@ func scheduleErrorValue(code, message string) map[string]any {
 
 func scheduleInternalError() map[string]any {
 	return scheduleErrorValue("internal_error", "The schedule operation failed.")
+}
+
+func schedulePersistenceError(operation, id string) map[string]any {
+	value := map[string]any{
+		"code":      "persistence_uncertain",
+		"message":   "Schedule persistence is uncertain; retry with schedule_list before relying on this result.",
+		"operation": operation,
+	}
+	if id != "" {
+		value["id"] = id
+	}
+	return value
+}
+
+func isScheduleToolName(name string) bool {
+	return name == "schedule_create" || name == "schedule_list" || name == "schedule_delete"
+}
+
+func installScheduleInvariant(scope *InvariantScope, fail InvariantFailure) error {
+	scope.CheckSessions(func(header SessionHeader, events []Event) error {
+		// Fork construction appends the inherited prefix incrementally while the
+		// header already advertises its final seed length. The owned suffix does
+		// not exist until that prefix is complete.
+		if len(events) < header.SeedLength {
+			return nil
+		}
+		if _, err := foldScheduleEvents(events, header.SeedLength); err != nil {
+			seq := -1
+			if len(events) > 0 {
+				seq = events[len(events)-1].Seq
+			}
+			return fail(fmt.Sprintf("session event %d violates the durable schedule stream: %s", seq, err))
+		}
+		return nil
+	})
+	return nil
+}
+
+func lockScheduleTransaction(ctx context.Context, session *Session) error {
+	for {
+		if session.scheduleMu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				session.scheduleMu.Unlock()
+				return err
+			}
+			return nil
+		}
+		timer := time.NewTimer(scheduleLockPollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func flushSchedulePersistence(ctx context.Context, session *Session) error {
+	if session.store == nil {
+		return errors.New("schedule persistence is unavailable")
+	}
+	flusher, ok := session.store.(SessionPersistenceFlusher)
+	if !ok {
+		return errors.New("schedule persistence has no durability checkpoint")
+	}
+	return flusher.Flush(ctx, session.Header.ID)
 }
 
 func scheduleCorruptError() map[string]any {
@@ -538,11 +608,86 @@ func scheduleToolResult(value any) (ToolResult, error) {
 	return result, nil
 }
 
+func scheduleBasicErrorSchema(code string) map[string]any {
+	return objectSchema(map[string]any{
+		"code":    map[string]any{"type": "string", "const": code},
+		"message": map[string]any{"type": "string"},
+	}, "code", "message")
+}
+
+func scheduleErrorSchemas() []any {
+	values := make([]any, 0, 10)
+	for _, code := range []string{
+		"invalid_prompt", "invalid_selector", "invalid_rule", "invalid_time_zone", "not_future",
+		"time_out_of_range", "frequency_too_high", "corrupt_schedule_log", "internal_error",
+	} {
+		values = append(values, scheduleBasicErrorSchema(code))
+	}
+	values = append(values, objectSchema(map[string]any{
+		"code":      map[string]any{"type": "string", "const": "persistence_uncertain"},
+		"message":   map[string]any{"type": "string"},
+		"operation": map[string]any{"type": "string", "enum": []string{"create", "list", "delete"}},
+		"id":        map[string]any{"type": "string"},
+	}, "code", "message", "operation"))
+	return values
+}
+
+func scheduleViewSchema() map[string]any {
+	shared := map[string]any{
+		"id":           map[string]any{"type": "string"},
+		"prompt":       map[string]any{"type": "string"},
+		"scheduledAt":  map[string]any{"type": "string"},
+		"state":        map[string]any{"type": "string", "enum": []string{"scheduled", "overdue"}},
+		"deliveryMode": map[string]any{"type": "string", "const": "session-local"},
+	}
+	variant := func(kind string, extra map[string]any) map[string]any {
+		properties := cloneJSON(shared).(map[string]any)
+		properties["kind"] = map[string]any{"type": "string", "const": kind}
+		required := []string{"id", "kind", "prompt", "scheduledAt", "state", "deliveryMode"}
+		for name, schema := range extra {
+			properties[name] = schema
+			required = append(required, name)
+		}
+		return objectSchema(properties, required...)
+	}
+	return map[string]any{"oneOf": []any{
+		variant("after", map[string]any{"afterSeconds": map[string]any{"type": "integer"}}),
+		variant("at", nil),
+		variant("every", map[string]any{"everySeconds": map[string]any{"type": "integer"}}),
+	}}
+}
+
+func scheduleCreateOutputSchema() map[string]any {
+	variants := []any{scheduleViewSchema()}
+	return map[string]any{"oneOf": append(variants, scheduleErrorSchemas()...)}
+}
+
+func scheduleListOutputSchema() map[string]any {
+	variants := []any{map[string]any{"type": "array", "items": scheduleViewSchema()}}
+	return map[string]any{"oneOf": append(variants, scheduleErrorSchemas()...)}
+}
+
+func scheduleDeleteOutputSchema() map[string]any {
+	variants := []any{
+		objectSchema(map[string]any{
+			"id": map[string]any{"type": "string"}, "deleted": map[string]any{"type": "boolean", "const": true},
+		}, "id", "deleted"),
+		objectSchema(map[string]any{
+			"id": map[string]any{"type": "string"}, "deleted": map[string]any{"type": "boolean", "const": false},
+			"code": map[string]any{"type": "string", "const": "schedule_not_found"},
+		}, "id", "deleted", "code"),
+	}
+	return map[string]any{"oneOf": append(variants, scheduleErrorSchemas()...)}
+}
+
 func registerScheduleTools(e *Engine) error {
+	if !e.hostPluginActive("@deepseek-ai/dsh-schedule") {
+		return nil
+	}
 	create := Tool{Schema: ToolSchema{Name: "schedule_create", Description: "Create one session-local reminder using exactly one of after_seconds, at, or every_seconds.", Parameters: objectSchema(map[string]any{
 		"prompt": map[string]any{"type": "string"}, "after_seconds": map[string]any{"type": "number"}, "every_seconds": map[string]any{"type": "number"},
 		"at": map[string]any{"oneOf": []any{map[string]any{"type": "string"}, objectSchema(map[string]any{"date": map[string]any{"type": "string"}, "time": map[string]any{"type": "string"}, "time_zone": map[string]any{"type": "string"}}, "date", "time", "time_zone")}},
-	}, "prompt"), Output: map[string]any{}}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+	}, "prompt"), Output: scheduleCreateOutputSchema()}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		args, invalid := decodeScheduleCreateArgs(call)
 		if invalid != nil {
 			return scheduleToolResult(invalid)
@@ -551,11 +696,20 @@ func registerScheduleTools(e *Engine) error {
 			return ToolResult{}, err
 		}
 		session, err := e.getSession(call.SessionID)
-		if err != nil {
+		if err != nil || isSubagentSession(session) {
 			return scheduleToolResult(scheduleInternalError())
 		}
-		session.scheduleMu.Lock()
+		if err := lockScheduleTransaction(ctx, session); err != nil {
+			return ToolResult{}, err
+		}
 		defer session.scheduleMu.Unlock()
+		if err := flushSchedulePersistence(ctx, session); err != nil {
+			return scheduleToolResult(schedulePersistenceError("create", ""))
+		}
+		e.scheduleWake(call.SessionID)
+		if err := ctx.Err(); err != nil {
+			return ToolResult{}, err
+		}
 		session.mu.Lock()
 		folded, foldErr := foldScheduleEvents(session.Events, session.Header.SeedLength)
 		if foldErr != nil {
@@ -584,20 +738,29 @@ func registerScheduleTools(e *Engine) error {
 			return scheduleToolResult(scheduleInternalError())
 		}
 		e.publishEvent(call.SessionID, event)
+		if err := flushSchedulePersistence(ctx, session); err != nil {
+			return scheduleToolResult(schedulePersistenceError("create", id))
+		}
 		e.scheduleWake(call.SessionID)
 		return scheduleToolResult(record.view(now))
 	}}
 
-	list := Tool{Schema: ToolSchema{Name: "schedule_list", Description: "List active reminders in creation order.", Parameters: objectSchema(map[string]any{}), Output: map[string]any{}}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+	list := Tool{Schema: ToolSchema{Name: "schedule_list", Description: "List active reminders in creation order.", Parameters: objectSchema(map[string]any{}), Output: scheduleListOutputSchema()}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		if err := ctx.Err(); err != nil {
 			return ToolResult{}, err
 		}
 		session, err := e.getSession(call.SessionID)
-		if err != nil {
+		if err != nil || isSubagentSession(session) {
 			return scheduleToolResult(scheduleInternalError())
 		}
-		session.scheduleMu.Lock()
+		if err := lockScheduleTransaction(ctx, session); err != nil {
+			return ToolResult{}, err
+		}
 		defer session.scheduleMu.Unlock()
+		if err := flushSchedulePersistence(ctx, session); err != nil {
+			return scheduleToolResult(schedulePersistenceError("list", ""))
+		}
+		e.scheduleWake(call.SessionID)
 		session.mu.Lock()
 		folded, foldErr := foldScheduleEvents(session.Events, session.Header.SeedLength)
 		session.mu.Unlock()
@@ -612,7 +775,7 @@ func registerScheduleTools(e *Engine) error {
 		return scheduleToolResult(values)
 	}}
 
-	deleteTool := Tool{Schema: ToolSchema{Name: "schedule_delete", Description: "Delete one active reminder by id.", Parameters: objectSchema(map[string]any{"id": map[string]any{"type": "string"}}, "id"), Output: map[string]any{}}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
+	deleteTool := Tool{Schema: ToolSchema{Name: "schedule_delete", Description: "Delete one active reminder by id.", Parameters: objectSchema(map[string]any{"id": map[string]any{"type": "string"}}, "id"), Output: scheduleDeleteOutputSchema()}, Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		var args struct {
 			ID string `json:"id"`
 		}
@@ -623,11 +786,20 @@ func registerScheduleTools(e *Engine) error {
 			return ToolResult{}, err
 		}
 		session, err := e.getSession(call.SessionID)
-		if err != nil {
+		if err != nil || isSubagentSession(session) {
 			return scheduleToolResult(scheduleInternalError())
 		}
-		session.scheduleMu.Lock()
+		if err := lockScheduleTransaction(ctx, session); err != nil {
+			return ToolResult{}, err
+		}
 		defer session.scheduleMu.Unlock()
+		if err := flushSchedulePersistence(ctx, session); err != nil {
+			return scheduleToolResult(schedulePersistenceError("delete", args.ID))
+		}
+		e.scheduleWake(call.SessionID)
+		if err := ctx.Err(); err != nil {
+			return ToolResult{}, err
+		}
 		session.mu.Lock()
 		folded, foldErr := foldScheduleEvents(session.Events, session.Header.SeedLength)
 		if foldErr != nil {
@@ -648,14 +820,22 @@ func registerScheduleTools(e *Engine) error {
 			return scheduleToolResult(scheduleInternalError())
 		}
 		e.publishEvent(call.SessionID, event)
+		if err := flushSchedulePersistence(ctx, session); err != nil {
+			return scheduleToolResult(schedulePersistenceError("delete", args.ID))
+		}
 		e.scheduleWake(call.SessionID)
 		return scheduleToolResult(map[string]any{"id": args.ID, "deleted": true})
 	}}
 
+	registered := make([]string, 0, 3)
 	for _, tool := range []Tool{create, list, deleteTool} {
 		if err := e.RegisterTool(tool); err != nil {
+			for index := len(registered) - 1; index >= 0; index-- {
+				e.UnregisterTool(registered[index])
+			}
 			return err
 		}
+		registered = append(registered, tool.Schema.Name)
 	}
 	return nil
 }
@@ -731,10 +911,12 @@ func renderRecurringSchedules(reminders []scheduleOccurrence) string {
 }
 
 type scheduleRuntime struct {
-	wake chan struct{}
-	stop chan struct{}
-	done chan struct{}
-	once sync.Once
+	wake   chan struct{}
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func (runtime *scheduleRuntime) notify() {
@@ -744,10 +926,15 @@ func (runtime *scheduleRuntime) notify() {
 	}
 }
 
-func (runtime *scheduleRuntime) close() { runtime.once.Do(func() { close(runtime.stop) }) }
+func (runtime *scheduleRuntime) close() {
+	runtime.once.Do(func() {
+		runtime.cancel()
+		close(runtime.stop)
+	})
+}
 
 func (e *Engine) startScheduleRuntime(session *Session) {
-	if !e.cfg.ScheduleEnabled || session == nil {
+	if !e.cfg.ScheduleEnabled || session == nil || isSubagentSession(session) {
 		return
 	}
 	id := session.Header.ID
@@ -757,7 +944,11 @@ func (e *Engine) startScheduleRuntime(session *Session) {
 		runtime.notify()
 		return
 	}
-	runtime := &scheduleRuntime{wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	runtime := &scheduleRuntime{
+		wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}),
+		ctx: runtimeCtx, cancel: cancel,
+	}
 	e.scheduleRuntimes[id] = runtime
 	e.scheduleRuntimeMu.Unlock()
 	go e.runScheduleRuntime(session, runtime)
@@ -799,7 +990,7 @@ func (e *Engine) runScheduleRuntime(session *Session, runtime *scheduleRuntime) 
 		e.scheduleRuntimeMu.Unlock()
 	}()
 	for {
-		target, wakeOnly, fault := e.driveScheduleRuntime(session)
+		target, wakeOnly, fault := e.driveScheduleRuntime(runtime.ctx, session)
 		if fault {
 			return
 		}
@@ -834,35 +1025,56 @@ func (e *Engine) runScheduleRuntime(session *Session, runtime *scheduleRuntime) 
 	}
 }
 
-func (e *Engine) driveScheduleRuntime(session *Session) (target int64, wakeOnly, fault bool) {
-	session.scheduleMu.Lock()
+func (e *Engine) driveScheduleRuntime(ctx context.Context, session *Session) (target int64, wakeOnly, fault bool) {
+	if err := lockScheduleTransaction(ctx, session); err != nil {
+		return 0, true, false
+	}
+	defer session.scheduleMu.Unlock()
 	session.mu.Lock()
 	if !session.attached {
 		session.mu.Unlock()
-		session.scheduleMu.Unlock()
+		return 0, true, false
+	}
+	if session.Header.SeedLength < 0 || session.Header.SeedLength > len(session.Events) {
+		session.mu.Unlock()
+		return 0, true, false
+	}
+	hasSchedule := false
+	for _, event := range session.Events[session.Header.SeedLength:] {
+		if event.Type == "schedule/change" {
+			hasSchedule = true
+			break
+		}
+	}
+	session.mu.Unlock()
+	if !hasSchedule {
+		return 0, true, false
+	}
+	if err := flushSchedulePersistence(ctx, session); err != nil {
+		return 0, true, false
+	}
+	session.mu.Lock()
+	if !session.attached {
+		session.mu.Unlock()
 		return 0, true, false
 	}
 	folded, err := foldScheduleEvents(session.Events, session.Header.SeedLength)
 	if err != nil {
 		session.mu.Unlock()
-		session.scheduleMu.Unlock()
 		return 0, false, true
 	}
 	decision, err := decideSchedules(folded, time.Now().UnixMilli())
 	if err != nil {
 		session.mu.Unlock()
-		session.scheduleMu.Unlock()
 		return 0, false, true
 	}
 	if decision.kind == "wait" {
 		target = decision.target
 		session.mu.Unlock()
-		session.scheduleMu.Unlock()
 		return target, target == 0, false
 	}
 	if session.Running || len(session.pending) > 0 || len(session.steering) > 0 {
 		session.mu.Unlock()
-		session.scheduleMu.Unlock()
 		return 0, true, false
 	}
 	text := renderOneShotSchedule(decision.oneShot)
@@ -895,7 +1107,10 @@ func (e *Engine) driveScheduleRuntime(session *Session) (target int64, wakeOnly,
 	}
 	id, started := session.Header.ID, len(events) > 0
 	session.mu.Unlock()
-	session.scheduleMu.Unlock()
+	var barrierErr error
+	if appendErr == nil {
+		barrierErr = flushSchedulePersistence(ctx, session)
+	}
 	for _, event := range events {
 		e.publishEvent(id, event)
 	}
@@ -904,5 +1119,5 @@ func (e *Engine) driveScheduleRuntime(session *Session) (target int64, wakeOnly,
 		e.emitHost(map[string]any{"type": "host/session-status", "sessionId": id, "running": true})
 		e.launchSessionWorker(session)
 	}
-	return 0, false, appendErr != nil
+	return 0, barrierErr != nil, appendErr != nil
 }

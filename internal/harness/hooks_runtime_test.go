@@ -117,6 +117,32 @@ func TestHookRuntimeRejectsPromptBeforeAdmission(t *testing.T) {
 	}
 }
 
+func TestGoalRoundPromptRejectionBlocksExactGoal(t *testing.T) {
+	dir := t.TempDir()
+	deny := writeHookRuntimeScript(t, dir, "deny-goal.sh", "echo 'goal denied' >&2\nexit 2\n")
+	engine, provider, _ := newHookRuntimeEngine(t, HookDialectClaudeCode, map[string]any{
+		"UserPromptSubmit": []any{map[string]any{"hooks": []any{map[string]any{"command": deny}}}},
+	})
+	id, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "goal-rejected", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.GoalMutation(id, "create", "must enter a valid round", 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	engine.startSessionWorker(mustSession(t, engine, id))
+	if err := engine.WaitForIdle(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := engine.GetGoal(id)
+	if err != nil || goal == nil || goal.Phase != "blocked" || goal.BlockedReason == nil || goal.BlockedReason.Code != "prompt-rejected" {
+		t.Fatalf("rejected goal = %#v, %v", goal, err)
+	}
+	if len(provider.snapshot()) != 0 {
+		t.Fatal("provider ran after goal prompt rejection")
+	}
+}
+
 func TestHookRuntimeToolDecisionsAndContext(t *testing.T) {
 	t.Run("pre deny", func(t *testing.T) {
 		dir := t.TempDir()

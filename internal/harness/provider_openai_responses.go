@@ -44,6 +44,11 @@ func NewOpenAIResponsesProvider(id, baseURL, apiKey, model string) *OpenAIRespon
 
 func (p *OpenAIResponsesProvider) ID() string   { return p.id }
 func (p *OpenAIResponsesProvider) Name() string { return p.id }
+func (p *OpenAIResponsesProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	provider := NewOpenAIProvider(p.id, p.baseURL, p.apiKey, p.model)
+	provider.modelSpec = p.modelSpec
+	return provider.ResolveModelInfo(ctx, model)
+}
 func (p *OpenAIResponsesProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	provider := NewOpenAIProvider(p.id, p.baseURL, p.apiKey, p.model)
 	provider.client, provider.headers = p.client, clonePIAIHeaders(p.headers)

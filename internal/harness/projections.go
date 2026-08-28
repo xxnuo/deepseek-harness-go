@@ -651,68 +651,14 @@ func currentSessionListMetadata(events []Event) map[string]any {
 }
 
 func validSubagentDescriptor(data map[string]any) (mode, label string, ok bool) {
-	version, versionOK := projectionNonnegativeInt(data["version"])
-	if !versionOK || version != SubagentDescriptorVersion {
+	descriptor, supported, err := parseSubagentDescriptor(data)
+	if err != nil || !supported {
 		return "", "", false
 	}
-	mode, modeOK := data["mode"].(string)
-	provider, providerOK := data["provider"].(string)
-	if !modeOK || !providerOK || provider == "" || mode != "one-shot" && mode != "continuable" {
-		return "", "", false
+	if descriptor.Label != nil {
+		label = *descriptor.Label
 	}
-	allowed := map[string]bool{"version": true, "mode": true, "provider": true, "label": true}
-	if mode == "continuable" {
-		allowed["agentProvider"], allowed["agentModel"], allowed["persona"], allowed["toolFilter"] = true, true, true, true
-	}
-	for key := range data {
-		if !allowed[key] {
-			return "", "", false
-		}
-	}
-	if raw, present := data["label"]; present {
-		var labelOK bool
-		label, labelOK = raw.(string)
-		if !labelOK {
-			return "", "", false
-		}
-	} else if mode == "continuable" {
-		return "", "", false
-	}
-	for _, key := range []string{"agentProvider", "agentModel", "persona"} {
-		if raw, present := data[key]; present {
-			if _, stringOK := raw.(string); !stringOK {
-				return "", "", false
-			}
-		}
-	}
-	if raw, present := data["toolFilter"]; present {
-		filter, filterOK := raw.(map[string]any)
-		if !filterOK || len(filter) == 0 {
-			return "", "", false
-		}
-		for key, value := range filter {
-			if key != "allow" && key != "deny" {
-				return "", "", false
-			}
-			items, arrayOK := value.([]any)
-			if !arrayOK {
-				if stringsValue, ok := value.([]string); ok {
-					items = make([]any, len(stringsValue))
-					for index, item := range stringsValue {
-						items[index] = item
-					}
-				} else {
-					return "", "", false
-				}
-			}
-			for _, item := range items {
-				if _, stringOK := item.(string); !stringOK {
-					return "", "", false
-				}
-			}
-		}
-	}
-	return mode, label, true
+	return descriptor.Mode, label, true
 }
 
 func currentSubagentIdentity(events []Event) any {

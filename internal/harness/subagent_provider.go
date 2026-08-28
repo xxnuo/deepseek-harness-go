@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,34 @@ type SubagentCapabilities struct {
 	Persona      bool `json:"persona"`
 }
 
+// SubagentServiceError carries the stable error codes exposed by the upstream
+// subagent service. The name differs from the TypeScript class because
+// SubagentError is retained as the public stop-reason constant in Go.
+type SubagentServiceError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Cause   error  `json:"-"`
+}
+
+func (e *SubagentServiceError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+func (e *SubagentServiceError) Unwrap() error { return e.Cause }
+
+func subagentServiceError(code, message string, cause error) error {
+	return &SubagentServiceError{Code: code, Message: message, Cause: cause}
+}
+
+// IsSubagentServiceError reports whether err carries the requested stable code.
+func IsSubagentServiceError(err error, code string) bool {
+	var target *SubagentServiceError
+	return errors.As(err, &target) && target.Code == code
+}
+
 // NoSubagentStartCapabilities returns the capability set shared by
 // out-of-process providers.
 func NoSubagentStartCapabilities() SubagentCapabilities { return SubagentCapabilities{} }
@@ -50,12 +79,14 @@ func NoSubagentStartCapabilities() SubagentCapabilities { return SubagentCapabil
 type SubagentStartRequest struct {
 	ParentSessionID string
 	CWD             string
+	Label           string
 	Prompt          []ContentBlock
 	OutputSchema    map[string]any
 	MaxDepth        *int
 	AgentOptions    *SubagentAgentOptions
 	ToolFilter      *SubagentToolFilter
 	Persona         string
+	Descriptor      SubagentDescriptorData
 }
 
 // SubagentAgentOptions selects child model defaults for providers that expose
@@ -78,6 +109,7 @@ const SubagentDescriptorVersion = 2
 // SubagentResult is the terminal output of one published run.
 type SubagentResult struct {
 	Output     []ContentBlock     `json:"output"`
+	Structured any                `json:"structured,omitempty"`
 	Diagnostic string             `json:"diagnostic,omitempty"`
 	StopReason SubagentStopReason `json:"stopReason"`
 }
@@ -111,6 +143,7 @@ type SubagentRun struct {
 	disposeOnce sync.Once
 	disposeDone chan struct{}
 	disposeErr  error
+	local       bool
 }
 
 func newSubagentRun(id string, cancel context.CancelFunc, dispose func() error) *SubagentRun {
@@ -177,6 +210,9 @@ func (r *SubagentRun) Close() error { return r.Dispose() }
 
 func cloneSubagentResult(result SubagentResult) SubagentResult {
 	result.Output = append([]ContentBlock(nil), result.Output...)
+	if result.Structured != nil {
+		result.Structured = cloneJSON(result.Structured)
+	}
 	result.Diagnostic = limitSubagentDiagnostic(result.Diagnostic)
 	return result
 }
@@ -211,12 +247,35 @@ func (e *Engine) RegisterSubagentProvider(provider SubagentProvider) error {
 	if e.subagentProviders == nil {
 		e.subagentProviders = map[string]SubagentProvider{}
 	}
+	if e.subagentProviderTokens == nil {
+		e.subagentProviderTokens = map[string]uint64{}
+	}
 	if _, exists := e.subagentProviders[name]; exists {
 		e.mu.Unlock()
-		return fmt.Errorf("subagent provider already registered: %s", name)
+		return subagentServiceError("DUPLICATE_PROVIDER", fmt.Sprintf("a subagent provider named %q is already registered", name), nil)
 	}
+	e.nextSubagentProviderToken++
+	token := e.nextSubagentProviderToken
 	e.subagentProviders[name] = provider
+	e.subagentProviderTokens[name] = token
+	e.subagentProviderOrder = append(e.subagentProviderOrder, name)
 	e.mu.Unlock()
+	info := subagentProviderInfo(name, provider)
+	if err := e.emitDynamicCordisEvent("subagent/provider-added", info); err != nil {
+		rolledBack := false
+		e.mu.Lock()
+		if e.subagentProviderTokens[name] == token {
+			delete(e.subagentProviders, name)
+			delete(e.subagentProviderTokens, name)
+			e.subagentProviderOrder = removeSubagentProviderName(e.subagentProviderOrder, name)
+			rolledBack = true
+		}
+		e.mu.Unlock()
+		if rolledBack {
+			e.emitDynamicCordisScopedContained("", "subagent/provider-removed", name)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -230,25 +289,49 @@ func (e *Engine) UnregisterSubagentProvider(name string) bool {
 		return false
 	}
 	delete(e.subagentProviders, name)
+	delete(e.subagentProviderTokens, name)
+	e.subagentProviderOrder = removeSubagentProviderName(e.subagentProviderOrder, name)
 	e.mu.Unlock()
 	e.emitDynamicCordisScopedContained("", "subagent/provider-removed", name)
 	return true
 }
 
-// ListSubagentProviders returns deterministic descriptors for custom CLIs and
-// frontends.
+// GetSubagentProvider returns the provider currently registered under name.
+func (e *Engine) GetSubagentProvider(name string) SubagentProvider {
+	e.mu.RLock()
+	provider := e.subagentProviders[strings.TrimSpace(name)]
+	e.mu.RUnlock()
+	return provider
+}
+
+// ListSubagentProviders returns descriptors in registration order for custom
+// CLIs and frontends.
 func (e *Engine) ListSubagentProviders() []SubagentProviderInfo {
 	e.mu.RLock()
-	rows := make([]SubagentProviderInfo, 0, len(e.subagentProviders))
-	for name, provider := range e.subagentProviders {
-		rows = append(rows, SubagentProviderInfo{
-			Name: name, Capabilities: provider.Capabilities(),
-			InheritsParentContext: provider.InheritsParentContext(),
-		})
+	rows := make([]SubagentProviderInfo, 0, len(e.subagentProviderOrder))
+	for _, name := range e.subagentProviderOrder {
+		if provider := e.subagentProviders[name]; provider != nil {
+			rows = append(rows, subagentProviderInfo(name, provider))
+		}
 	}
 	e.mu.RUnlock()
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows
+}
+
+func subagentProviderInfo(name string, provider SubagentProvider) SubagentProviderInfo {
+	return SubagentProviderInfo{
+		Name: name, Capabilities: provider.Capabilities(),
+		InheritsParentContext: provider.InheritsParentContext(),
+	}
+}
+
+func removeSubagentProviderName(order []string, name string) []string {
+	for index, current := range order {
+		if current == name {
+			return append(order[:index], order[index+1:]...)
+		}
+	}
+	return order
 }
 
 // StartSubagent starts a registered one-shot provider. The returned run is
@@ -265,11 +348,28 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 		return nil, errors.New("engine is closed")
 	}
 	if provider == nil {
-		return nil, fmt.Errorf("subagent provider not found: %s", providerName)
+		return nil, subagentServiceError("NO_PROVIDER", fmt.Sprintf("no subagent provider registered for %q", providerName), nil)
 	}
 	if err := validateSubagentCapabilities(provider, request); err != nil {
 		return nil, err
 	}
+	if err := validateSubagentMaxDepth(request.MaxDepth); err != nil {
+		return nil, err
+	}
+	if request.OutputSchema != nil {
+		if err := validateObjectJSONSchema(request.OutputSchema); err != nil {
+			return nil, err
+		}
+	}
+	descriptor := SubagentDescriptorData{Mode: "one-shot", Provider: strings.TrimSpace(provider.Name())}
+	if request.Label != "" {
+		descriptor.Label = descriptorString(request.Label)
+	}
+	descriptor, err := SnapshotSubagentDescriptor(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	request.Descriptor = descriptor
 	if request.CWD == "" && request.ParentSessionID != "" {
 		parent, err := e.getSession(request.ParentSessionID)
 		if err != nil {
@@ -288,7 +388,7 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 		return nil, errors.New("subagent provider returned an invalid run")
 	}
 	identity := map[string]any{
-		"runId": newRunID(), "provider": strings.TrimSpace(provider.Name()), "id": run.ID, "local": false,
+		"runId": newRunID(), "provider": strings.TrimSpace(provider.Name()), "id": run.ID, "local": run.local,
 	}
 	e.emitDynamicCordisScopedContained(request.ParentSessionID, "subagent/start", identity)
 	go func() {
@@ -296,7 +396,7 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 		result, _ := run.Wait(context.Background())
 		terminal := map[string]any{
 			"runId": identity["runId"], "provider": identity["provider"], "id": run.ID,
-			"local": false, "stopReason": result.StopReason,
+			"local": run.local, "stopReason": result.StopReason,
 		}
 		if len(result.Output) > 0 {
 			terminal["lastAssistantMessage"] = result.Output
@@ -309,18 +409,331 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 func validateSubagentCapabilities(provider SubagentProvider, request SubagentStartRequest) error {
 	capabilities := provider.Capabilities()
 	if request.OutputSchema != nil && !capabilities.OutputSchema {
-		return fmt.Errorf("subagent provider %q does not support outputSchema", provider.Name())
+		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "outputSchema"), nil)
 	}
 	if request.MaxDepth != nil && !capabilities.DepthLimit {
-		return fmt.Errorf("subagent provider %q does not support maxDepth", provider.Name())
+		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "depthLimit"), nil)
 	}
 	if request.ToolFilter != nil && !capabilities.ToolFilter {
-		return fmt.Errorf("subagent provider %q does not support toolFilter", provider.Name())
+		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "toolFilter"), nil)
 	}
 	if request.Persona != "" && !capabilities.Persona {
-		return fmt.Errorf("subagent provider %q does not support persona", provider.Name())
+		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "persona"), nil)
 	}
 	return nil
+}
+
+func validateSubagentMaxDepth(maxDepth *int) error {
+	if maxDepth != nil && (*maxDepth < 0 || int64(*maxDepth) > maxJSONSafeInteger) {
+		return errors.New("subagent maxDepth must be a non-negative safe integer")
+	}
+	return nil
+}
+
+var subagentSchemaKeywords = map[string]bool{
+	"type": true, "oneOf": true, "properties": true, "required": true,
+	"additionalProperties": true, "items": true, "enum": true, "const": true,
+	"description": true, "title": true, "default": true, "examples": true,
+}
+
+func validateObjectJSONSchema(schema map[string]any) error {
+	violations := make([]string, 0)
+	validateSubagentSchemaNode(schema, "schema", map[uintptr]bool{}, &violations)
+	if schema["type"] != "object" {
+		violations = append(violations, `schema.type must be "object" (structured output is object-rooted)`)
+	}
+	if len(violations) > 0 {
+		return subagentServiceError("UNSUPPORTED_SCHEMA", "unsupported JSON schema: "+strings.Join(violations, "; "), nil)
+	}
+	return nil
+}
+
+func validateSubagentSchemaNode(node any, path string, seen map[uintptr]bool, violations *[]string) {
+	record, ok := node.(map[string]any)
+	if !ok || record == nil {
+		*violations = append(*violations, path+" must be a schema object")
+		return
+	}
+	pointer := reflect.ValueOf(record).Pointer()
+	if seen[pointer] {
+		*violations = append(*violations, path+" is circular")
+		return
+	}
+	seen[pointer] = true
+	defer delete(seen, pointer)
+
+	for key, value := range record {
+		if !subagentSchemaKeywords[key] {
+			*violations = append(*violations, fmt.Sprintf("%s.%s is not a supported keyword (subset: type/oneOf/properties/required/additionalProperties/items/enum/const + annotations)", path, key))
+			continue
+		}
+		if (key == "default" || key == "examples") && !isLosslessSubagentJSON(value, map[uintptr]bool{}) {
+			*violations = append(*violations, fmt.Sprintf("%s.%s annotation must be lossless JSON data", path, key))
+		}
+	}
+	if value, exists := record["description"]; exists {
+		if _, ok := value.(string); !ok {
+			*violations = append(*violations, path+".description must be a string")
+		}
+	}
+	if value, exists := record["title"]; exists {
+		if _, ok := value.(string); !ok {
+			*violations = append(*violations, path+".title must be a string")
+		}
+	}
+
+	typeValue, hasType := record["type"]
+	oneOf, hasOneOf := record["oneOf"]
+	if hasType && hasOneOf {
+		*violations = append(*violations, path+" cannot declare both type and oneOf")
+		return
+	}
+	constraintKeys := []string{"properties", "required", "additionalProperties", "items", "enum", "const"}
+	if !hasType && !hasOneOf {
+		for _, key := range constraintKeys {
+			if _, exists := record[key]; exists {
+				*violations = append(*violations, fmt.Sprintf("%s.%s requires type or oneOf", path, key))
+			}
+		}
+		return
+	}
+	if hasOneOf {
+		branches, ok := subagentAnySlice(oneOf)
+		if !ok || len(branches) < 2 {
+			*violations = append(*violations, path+".oneOf must be an array of at least two schemas")
+		} else {
+			for index, branch := range branches {
+				validateSubagentSchemaNode(branch, fmt.Sprintf("%s.oneOf[%d]", path, index), seen, violations)
+			}
+		}
+		for _, key := range constraintKeys {
+			if _, exists := record[key]; exists {
+				*violations = append(*violations, fmt.Sprintf("%s.%s is not supported beside oneOf", path, key))
+			}
+		}
+		return
+	}
+
+	typeName, ok := typeValue.(string)
+	if !ok || !map[string]bool{"object": true, "array": true, "string": true, "number": true, "integer": true, "boolean": true, "null": true}[typeName] {
+		*violations = append(*violations, path+".type must be one of object/array/string/number/integer/boolean/null")
+		return
+	}
+	allowedFor := map[string]map[string]bool{
+		"properties": {"object": true}, "required": {"object": true}, "additionalProperties": {"object": true},
+		"items": {"array": true}, "enum": {"string": true, "number": true, "integer": true, "boolean": true, "null": true},
+		"const": {"string": true, "number": true, "integer": true, "boolean": true, "null": true},
+	}
+	for key, types := range allowedFor {
+		if _, exists := record[key]; exists && !types[typeName] {
+			*violations = append(*violations, fmt.Sprintf("%s.%s is not supported on type %q", path, key, typeName))
+		}
+	}
+	switch typeName {
+	case "object":
+		properties, hasProperties := record["properties"]
+		propertyMap, propertiesOK := properties.(map[string]any)
+		if hasProperties {
+			if !propertiesOK || propertyMap == nil {
+				*violations = append(*violations, path+".properties must be an object of schemas")
+			} else {
+				for name, child := range propertyMap {
+					validateSubagentSchemaNode(child, path+".properties."+name, seen, violations)
+				}
+			}
+		}
+		if required, exists := record["required"]; exists {
+			items, ok := subagentStringSlice(required)
+			if !ok {
+				*violations = append(*violations, path+".required must be an array of strings")
+			} else {
+				for _, name := range items {
+					if !propertiesOK {
+						*violations = append(*violations, fmt.Sprintf("%s.required names %q which is not in properties", path, name))
+					} else if _, exists := propertyMap[name]; !exists {
+						*violations = append(*violations, fmt.Sprintf("%s.required names %q which is not in properties", path, name))
+					}
+				}
+			}
+		}
+		if additional, exists := record["additionalProperties"]; exists {
+			if _, ok := additional.(bool); !ok {
+				*violations = append(*violations, path+".additionalProperties must be a boolean")
+			}
+		}
+	case "array":
+		if items, exists := record["items"]; exists {
+			validateSubagentSchemaNode(items, path+".items", seen, violations)
+		}
+	default:
+		validateSubagentScalarConstraints(record, path, typeName, violations)
+	}
+}
+
+func validateSubagentScalarConstraints(record map[string]any, path, typeName string, violations *[]string) {
+	enum, hasEnum := record["enum"]
+	values, enumOK := subagentAnySlice(enum)
+	if hasEnum {
+		enumOK = enumOK && len(values) > 0
+		if enumOK {
+			for _, value := range values {
+				if !subagentScalarMatches(typeName, value) {
+					enumOK = false
+					break
+				}
+			}
+		}
+		if !enumOK {
+			*violations = append(*violations, fmt.Sprintf("%s.enum must be a non-empty array of %s values", path, typeName))
+		}
+	}
+	if value, hasConst := record["const"]; hasConst {
+		if !subagentScalarMatches(typeName, value) {
+			*violations = append(*violations, fmt.Sprintf("%s.const must be a %s value", path, typeName))
+		} else if enumOK && !subagentScalarContains(values, value) {
+			*violations = append(*violations, fmt.Sprintf("%s.const must be one of %s.enum when both are declared", path, path))
+		}
+	}
+}
+
+func subagentAnySlice(value any) ([]any, bool) {
+	if values, ok := value.([]any); ok {
+		return values, true
+	}
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() || rv.Kind() != reflect.Slice {
+		return nil, false
+	}
+	values := make([]any, rv.Len())
+	for index := range values {
+		values[index] = rv.Index(index).Interface()
+	}
+	return values, true
+}
+
+func subagentStringSlice(value any) ([]string, bool) {
+	values, ok := subagentAnySlice(value)
+	if !ok {
+		return nil, false
+	}
+	result := make([]string, len(values))
+	for index, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		result[index] = text
+	}
+	return result, true
+}
+
+func subagentScalarMatches(typeName string, value any) bool {
+	switch typeName {
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "null":
+		return value == nil
+	case "number", "integer":
+		number, ok := subagentJSONNumber(value)
+		return ok && (typeName != "integer" || math.Trunc(number) == number)
+	default:
+		return false
+	}
+}
+
+func subagentJSONNumber(value any) (float64, bool) {
+	var number float64
+	switch value := value.(type) {
+	case int:
+		number = float64(value)
+	case int8:
+		number = float64(value)
+	case int16:
+		number = float64(value)
+	case int32:
+		number = float64(value)
+	case int64:
+		number = float64(value)
+	case uint:
+		number = float64(value)
+	case uint8:
+		number = float64(value)
+	case uint16:
+		number = float64(value)
+	case uint32:
+		number = float64(value)
+	case uint64:
+		number = float64(value)
+	case float32:
+		number = float64(value)
+	case float64:
+		number = value
+	default:
+		return 0, false
+	}
+	return number, !math.IsNaN(number) && !math.IsInf(number, 0) && !(number == 0 && math.Signbit(number))
+}
+
+func subagentScalarContains(values []any, target any) bool {
+	for _, value := range values {
+		if reflect.DeepEqual(value, target) {
+			return true
+		}
+		left, leftOK := subagentJSONNumber(value)
+		right, rightOK := subagentJSONNumber(target)
+		if leftOK && rightOK && left == right {
+			return true
+		}
+	}
+	return false
+}
+
+func isLosslessSubagentJSON(value any, seen map[uintptr]bool) bool {
+	if value == nil {
+		return true
+	}
+	switch value := value.(type) {
+	case string, bool:
+		return true
+	case float32, float64, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		_, ok := subagentJSONNumber(value)
+		return ok
+	case map[string]any:
+		pointer := reflect.ValueOf(value).Pointer()
+		if seen[pointer] {
+			return false
+		}
+		seen[pointer] = true
+		defer delete(seen, pointer)
+		for _, child := range value {
+			if !isLosslessSubagentJSON(child, seen) {
+				return false
+			}
+		}
+		return true
+	default:
+		items, ok := subagentAnySlice(value)
+		if !ok {
+			return false
+		}
+		rv := reflect.ValueOf(value)
+		pointer := rv.Pointer()
+		if seen[pointer] {
+			return false
+		}
+		seen[pointer] = true
+		defer delete(seen, pointer)
+		for _, child := range items {
+			if !isLosslessSubagentJSON(child, seen) {
+				return false
+			}
+		}
+		return true
+	}
 }
 
 func validateSubagentCWD(prefix, cwd string) (string, error) {
@@ -332,6 +745,9 @@ func validateSubagentCWD(prefix, cwd string) (string, error) {
 	}
 	info, err := os.Stat(cwd)
 	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("%s: working directory is not an accessible directory: %s", prefix, cwd)
+	}
+	if err := validateSubagentCWDSearch(cwd); err != nil {
 		return "", fmt.Errorf("%s: working directory is not an accessible directory: %s", prefix, cwd)
 	}
 	return cwd, nil
@@ -360,6 +776,7 @@ func positiveSubagentDuration(prefix, name string, value, fallback time.Duration
 
 type subagentProcessResult struct {
 	exitCode int
+	signal   string
 	err      error
 }
 
@@ -367,17 +784,26 @@ type subagentProcess struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	stderr io.ReadCloser
 
-	done chan struct{}
-	mu   sync.Mutex
-	res  subagentProcessResult
+	done       chan struct{}
+	mu         sync.Mutex
+	res        subagentProcessResult
+	stderrMu   sync.Mutex
+	stderrTail []byte
+	stderrDone chan struct{}
 }
 
+const maxSubagentStderrBytes = 16 << 10
+
 func startSubagentProcess(command string, args []string, cwd string, env map[string]string) (*subagentProcess, error) {
+	return startSubagentProcessWithStderr(command, args, cwd, env, false)
+}
+
+func startSubagentProcessWithStderr(command string, args []string, cwd string, env map[string]string, captureStderr bool) (*subagentProcess, error) {
 	cmd := exec.Command(command, args...)
 	cmd.Dir = cwd
 	cmd.Env = scrubbedChildEnv(env)
-	cmd.Stderr = os.Stderr
 	configureChildProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -388,14 +814,34 @@ func startSubagentProcess(command string, args []string, cwd string, env map[str
 		_ = stdin.Close()
 		return nil, err
 	}
+	var stderr io.ReadCloser
+	var stderrWriter *os.File
+	if captureStderr {
+		stderr, stderrWriter, err = os.Pipe()
+		if err != nil {
+			_ = stdin.Close()
+			_ = stdout.Close()
+			_ = stdoutWriter.Close()
+			return nil, err
+		}
+		cmd.Stderr = stderrWriter
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 	cmd.Stdout = stdoutWriter
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stdoutWriter.Close()
+		if stderr != nil {
+			_ = stderr.Close()
+		}
+		if stderrWriter != nil {
+			_ = stderrWriter.Close()
+		}
 		return nil, err
 	}
-	process := &subagentProcess{cmd: cmd, stdin: stdin, stdout: stdout, done: make(chan struct{})}
+	process := &subagentProcess{cmd: cmd, stdin: stdin, stdout: stdout, stderr: stderr, done: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
 		exitCode := -1
@@ -405,12 +851,62 @@ func startSubagentProcess(command string, args []string, cwd string, env map[str
 		// Close only the explicit pipe write end. The consumer can then drain
 		// buffered stream-json bytes before observing EOF on the read end.
 		_ = stdoutWriter.Close()
+		if stderrWriter != nil {
+			_ = stderrWriter.Close()
+		}
 		process.mu.Lock()
-		process.res = subagentProcessResult{exitCode: exitCode, err: err}
+		process.res = subagentProcessResult{exitCode: exitCode, signal: childProcessExitSignal(cmd.ProcessState), err: err}
 		close(process.done)
 		process.mu.Unlock()
 	}()
 	return process, nil
+}
+
+func (p *subagentProcess) startStderrCapture() {
+	if p == nil || p.stderr == nil {
+		return
+	}
+	p.stderrDone = make(chan struct{})
+	go p.captureStderr()
+}
+
+func (p *subagentProcess) captureStderr() {
+	defer close(p.stderrDone)
+	buffer := make([]byte, 4096)
+	for {
+		n, err := p.stderr.Read(buffer)
+		if n > 0 {
+			p.stderrMu.Lock()
+			p.stderrTail = append(p.stderrTail, buffer[:n]...)
+			if len(p.stderrTail) > maxSubagentStderrBytes {
+				p.stderrTail = append([]byte(nil), p.stderrTail[len(p.stderrTail)-maxSubagentStderrBytes:]...)
+			}
+			p.stderrMu.Unlock()
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+func (p *subagentProcess) stderrDiagnostic(settleGrace time.Duration) string {
+	if p == nil {
+		return ""
+	}
+	if p.stderrDone != nil {
+		timer := time.NewTimer(settleGrace)
+		select {
+		case <-p.stderrDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
+	}
+	p.stderrMu.Lock()
+	data := append([]byte(nil), p.stderrTail...)
+	p.stderrMu.Unlock()
+	return strings.TrimSpace(string(data))
 }
 
 func (p *subagentProcess) result() subagentProcessResult {

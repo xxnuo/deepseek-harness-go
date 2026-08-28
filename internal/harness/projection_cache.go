@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	sessionProjectionCacheVersion = 3
-	projectionValuesVersion       = 3
+	sessionProjectionCacheVersion = 4
+	projectionValuesVersion       = 4
 )
 
 type SessionProjectionCacheConfig struct {
@@ -45,8 +45,13 @@ func validateSessionProjectionCacheConfig(config *SessionProjectionCacheConfig) 
 }
 
 type projectionCacheIdentity struct {
-	CreatedAt int64  `json:"createdAt"`
-	CWD       string `json:"cwd,omitempty"`
+	Version         int    `json:"version"`
+	ID              string `json:"id"`
+	CreatedAt       int64  `json:"createdAt"`
+	CWD             string `json:"cwd,omitempty"`
+	ParentSession   string `json:"parentSession,omitempty"`
+	SeedLength      int    `json:"seedLength,omitempty"`
+	DelegationDepth int    `json:"delegationDepth,omitempty"`
 }
 
 type projectionCacheRecord struct {
@@ -58,11 +63,14 @@ type projectionCacheRecord struct {
 }
 
 func projectionIdentity(header SessionHeader) projectionCacheIdentity {
-	return projectionCacheIdentity{CreatedAt: header.CreatedAt, CWD: header.CWD}
+	return projectionCacheIdentity{
+		Version: header.Version, ID: header.ID, CreatedAt: header.CreatedAt, CWD: header.CWD,
+		ParentSession: header.ParentSession, SeedLength: header.SeedLength, DelegationDepth: header.DelegationDepth,
+	}
 }
 
 func sameProjectionIdentity(a, b projectionCacheIdentity) bool {
-	return a.CreatedAt == b.CreatedAt && a.CWD == b.CWD
+	return a == b
 }
 
 type projectionCacheMedium struct {
@@ -205,6 +213,20 @@ func (medium *projectionCacheMedium) snapshot(header SessionHeader, lastSeq int,
 	record, ok := medium.records[header.ID]
 	medium.mu.RUnlock()
 	if !ok || record.Composition != composition || !sameProjectionIdentity(record.Identity, projectionIdentity(header)) || record.Seq > lastSeq || exact && record.Seq != lastSeq {
+		return ProjectionSnapshot{}, false
+	}
+	detached, err := cloneProjectionRecord(record)
+	if err != nil {
+		return ProjectionSnapshot{}, false
+	}
+	return ProjectionSnapshot{AsOfSeq: detached.Seq, Values: detached.Values}, true
+}
+
+func (medium *projectionCacheMedium) identitySnapshot(header SessionHeader, composition string) (ProjectionSnapshot, bool) {
+	medium.mu.RLock()
+	record, ok := medium.records[header.ID]
+	medium.mu.RUnlock()
+	if !ok || record.Composition != composition || !sameProjectionIdentity(record.Identity, projectionIdentity(header)) {
 		return ProjectionSnapshot{}, false
 	}
 	detached, err := cloneProjectionRecord(record)

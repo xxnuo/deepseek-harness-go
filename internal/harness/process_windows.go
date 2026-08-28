@@ -180,3 +180,5 @@ func killChildProcessPID(pid int) error {
 	}
 	return err
 }
+
+func childProcessExitSignal(*os.ProcessState) string { return "" }

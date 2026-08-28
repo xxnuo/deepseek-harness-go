@@ -269,8 +269,8 @@ func builtinTerminalTools(engine *Engine) []Tool {
 							operation.Cancel()
 							return nil
 						},
-						ReadOutput: func() (string, bool) {
-							return renderTerminalSendRead(operation.ReadOutput()), false
+						ReadOutput: func() (string, bool, error) {
+							return renderTerminalSendRead(operation.ReadOutput()), false, nil
 						},
 					}, nil
 				})

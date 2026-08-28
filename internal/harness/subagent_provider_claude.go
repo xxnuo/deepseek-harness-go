@@ -112,8 +112,12 @@ func (p *ClaudeCodeSubagentProvider) Start(ctx context.Context, request Subagent
 	}
 	args := []string{
 		"--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
-		"--disallowedTools", "AskUserQuestion", "--permission-mode", string(p.permissionMode), "--no-session-persistence",
+		"--disallowedTools", "AskUserQuestion",
 	}
+	if p.permissionMode == ClaudeCodePermissionPlan {
+		args = append(args, "ExitPlanMode")
+	}
+	args = append(args, "--permission-mode", string(p.permissionMode), "--no-session-persistence")
 	if p.permissionMode == ClaudeCodePermissionBypassPermissions {
 		args = append(args, "--dangerously-skip-permissions")
 	}
@@ -157,9 +161,16 @@ func (p *ClaudeCodeSubagentProvider) Start(ctx context.Context, request Subagent
 		go func() { _ = dispose() }()
 	}
 	run := newSubagentRun(newRunID(), cancel, dispose)
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-run.Done():
+		}
+	}()
 	resultReady := make(chan SubagentResult, 1)
 	go func() {
-		resultReady <- consumeClaudeCodeProcess(process)
+		resultReady <- consumeClaudeCodeProcess(process, p.permissionMode)
 	}()
 	go func() {
 		select {
@@ -195,58 +206,77 @@ func claudeCodeTextTask(prompt []ContentBlock) (string, error) {
 	return text.String(), nil
 }
 
-func consumeClaudeCodeProcess(process *subagentProcess) SubagentResult {
+func consumeClaudeCodeProcess(process *subagentProcess, permissionMode ClaudeCodePermissionMode) SubagentResult {
 	scanner := bufio.NewScanner(process.stdout)
 	scanner.Buffer(make([]byte, 4096), 16<<20)
 	var answer string
 	hasAnswer := false
+	permissionDiagnostic := ""
 	for scanner.Scan() {
 		var message map[string]any
 		if json.Unmarshal(scanner.Bytes(), &message) != nil {
+			return claudeCodeFailureResult("query-run", "unknown", permissionDiagnostic, subagentProcessResult{})
+		}
+		if message["type"] == "system" && message["subtype"] == "permission_denied" {
+			permissionDiagnostic = fmt.Sprintf("Claude Code unattended decision (mode: %s; request: tool permission; decision: denied): the provider does not request human approval", permissionMode)
 			continue
 		}
 		if message["type"] != "result" {
 			continue
 		}
-		text, err := successfulClaudeCodeResult(message)
+		text, category, err := classifyClaudeCodeResult(message)
 		if err != nil {
-			return SubagentResult{StopReason: SubagentError}
+			return claudeCodeFailureResult("query-run", category, permissionDiagnostic, subagentProcessResult{})
 		}
 		answer, hasAnswer = text, true
 	}
 	if scanner.Err() != nil {
-		return SubagentResult{StopReason: SubagentError}
+		return claudeCodeFailureResult("query-run", "unknown", permissionDiagnostic, subagentProcessResult{})
 	}
 	processResult := process.result()
 	if processResult.exitCode != 0 || processResult.err != nil {
-		return SubagentResult{StopReason: SubagentError}
+		return claudeCodeFailureResult("process", "process-exit", permissionDiagnostic, processResult)
 	}
 	if !hasAnswer {
-		return SubagentResult{StopReason: SubagentError}
+		return claudeCodeFailureResult("query-run", "missing-result", permissionDiagnostic, processResult)
 	}
 	return SubagentResult{Output: []ContentBlock{{Type: "text", Text: answer}}, StopReason: SubagentCompleted}
 }
 
 func successfulClaudeCodeResult(message map[string]any) (string, error) {
+	result, _, err := classifyClaudeCodeResult(message)
+	return result, err
+}
+
+func classifyClaudeCodeResult(message map[string]any) (string, string, error) {
 	subtype, _ := message["subtype"].(string)
 	isError, _ := message["is_error"].(bool)
 	result, _ := message["result"].(string)
 	if subtype == "success" && !isError && strings.TrimSpace(result) != "" {
-		return result, nil
+		return result, "", nil
 	}
-	detail := subtype
 	if subtype == "success" {
-		detail = "success result was marked as an error or contained no answer"
-	} else if raw, ok := message["errors"].([]any); ok {
-		parts := make([]string, 0, len(raw))
-		for _, item := range raw {
-			if text, ok := item.(string); ok {
-				parts = append(parts, text)
-			}
-		}
-		if len(parts) > 0 {
-			detail = strings.Join(parts, "; ")
-		}
+		return "", "invalid-success", errors.New("subagent-claude-code: Claude Code returned an invalid success result")
 	}
-	return "", fmt.Errorf("subagent-claude-code: Claude Code failed: %s", detail)
+	category := "unknown"
+	switch subtype {
+	case "error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
+		category = subtype
+	}
+	return "", category, fmt.Errorf("subagent-claude-code: Claude Code failed: %s", category)
+}
+
+func claudeCodeFailureResult(stage, category, permission string, outcome subagentProcessResult) SubagentResult {
+	fields := []string{"product: Claude Code", "stage: " + stage, "category: " + category}
+	if outcome.exitCode >= 0 && stage == "process" {
+		fields = append(fields, fmt.Sprintf("exit code: %d", outcome.exitCode))
+	}
+	if outcome.signal != "" {
+		fields = append(fields, "signal: "+outcome.signal)
+	}
+	diagnostic := "Product subagent failure (" + strings.Join(fields, "; ") + ")"
+	if permission != "" {
+		diagnostic += "\n" + permission
+	}
+	return SubagentResult{Diagnostic: diagnostic, StopReason: SubagentError}
 }

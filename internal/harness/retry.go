@@ -440,6 +440,9 @@ func cloneContentBlocks(blocks []ContentBlock) []ContentBlock {
 	cloned := append([]ContentBlock(nil), blocks...)
 	for index := range cloned {
 		cloned[index].Content = cloneContentBlocks(cloned[index].Content)
+		if cloned[index].Extra != nil {
+			cloned[index].Extra = cloneJSON(cloned[index].Extra).(map[string]any)
+		}
 		if cloned[index].Attachment != nil {
 			attachment := *cloned[index].Attachment
 			cloned[index].Attachment = &attachment

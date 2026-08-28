@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -191,6 +192,145 @@ func TestCancelPreservesQueuedPrompt(t *testing.T) {
 	}
 }
 
+func TestCancelAgentClearsQueuedTailAndRunsPostCancelReplacement(t *testing.T) {
+	e := newIntegrationEngine(t)
+	provider := newQueuedTestProvider()
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "cancel-clear-session", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: "queue-test"}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := func(text string) {
+		t.Helper()
+		if _, promptErr := e.Prompt(t.Context(), id, PromptRequest{SessionID: id, Mode: "queue", Content: []PromptContentPart{{Type: "text", Text: text}}}); promptErr != nil {
+			t.Fatal(promptErr)
+		}
+	}
+	prompt("active")
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("active provider request did not start")
+	}
+	prompt("discarded tail")
+	if err := e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	prompt("replacement")
+	select {
+	case request := <-provider.started:
+		if request != 2 {
+			t.Fatalf("replacement provider request = %d, want 2", request)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement prompt did not replay after cancellation")
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := e.WaitForIdle(waitCtx, id); err != nil {
+		t.Fatal(err)
+	}
+	requests := provider.requestSnapshot()
+	if len(requests) != 2 || requests[1].Messages[len(requests[1].Messages)-1].Content != "replacement" {
+		t.Fatalf("provider requests = %#v", requests)
+	}
+	session, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	var canceledSplice bool
+	var userTexts []string
+	for _, event := range session.Events {
+		data, _ := event.Data.(map[string]any)
+		if event.Type == "agent/inbox/spliced" && data["target"] == "next-turn" && data["outcome"] == "canceled" && eventInt(data["removedCount"]) == 1 {
+			canceledSplice = true
+		}
+		if event.Type == "user/message" {
+			userTexts = append(userTexts, contentValueText(event.Data))
+		}
+	}
+	if !canceledSplice {
+		t.Fatalf("missing durable canceled splice: %#v", session.Events)
+	}
+	if got := strings.Join(userTexts, ","); got != "active,replacement" {
+		t.Fatalf("admitted user messages = %q", got)
+	}
+}
+
+func TestCancelAgentIdleDoesNotLeakOntoNextPrompt(t *testing.T) {
+	e := newIntegrationEngine(t)
+	if err := e.CancelAgent("missing", AgentCancelCause{Kind: "user"}, CancelAgentOptions{}); err == nil {
+		t.Fatal("missing session cancellation succeeded")
+	}
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "cancel-idle-session", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	output, err := e.Run(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "real prompt"}}})
+	if err != nil || output != "real prompt" {
+		t.Fatalf("prompt after idle cancel = %q, %v", output, err)
+	}
+}
+
+func TestCancelAgentFirstTypedCauseWins(t *testing.T) {
+	e := newIntegrationEngine(t)
+	provider := newQueuedTestProvider()
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "cancel-cause-session", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: "queue-test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Prompt(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "active"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider request did not start")
+	}
+	if err := e.CancelAgent(id, AgentCancelCause{Kind: "parent"}, CancelAgentOptions{KeepInbox: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{KeepInbox: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := e.WaitForIdle(waitCtx, id); err != nil {
+		t.Fatal(err)
+	}
+	session, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for index := len(session.Events) - 1; index >= 0; index-- {
+		if session.Events[index].Type != "turn/end" {
+			continue
+		}
+		data, _ := session.Events[index].Data.(map[string]any)
+		reason, _ := data["reason"].(map[string]any)
+		cause, _ := reason["reason"].(map[string]any)
+		if reason["kind"] != "aborted" || cause["kind"] != "parent" {
+			t.Fatalf("turn cancellation reason = %#v", reason)
+		}
+		return
+	}
+	t.Fatal("missing turn/end")
+}
+
 func TestPromptRejectsMismatchedSessionID(t *testing.T) {
 	e := newIntegrationEngine(t)
 	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "session-id-check", "")
@@ -200,6 +340,21 @@ func TestPromptRejectsMismatchedSessionID(t *testing.T) {
 	_, err = e.Prompt(context.Background(), id, PromptRequest{SessionID: "other", Mode: "queue", Content: []PromptContentPart{{Type: "text", Text: "x"}}})
 	if err == nil || err.Error() != "bad-request: sessionId does not match target session" {
 		t.Fatalf("mismatched session id error = %v", err)
+	}
+}
+
+func TestFinishClosedSessionWorkerDoesNotQueueNilClaim(t *testing.T) {
+	e := newIntegrationEngine(t)
+	done := make(chan promptOutcome, 1)
+	session := &Session{pending: []*queuedPrompt{{done: done}}}
+	e.finishClosedSessionWorker(session)
+	select {
+	case outcome := <-done:
+		if outcome.err == nil || outcome.err.Error() != "engine-closed" {
+			t.Fatalf("closed outcome = %#v", outcome)
+		}
+	default:
+		t.Fatal("pending prompt was not settled")
 	}
 }
 

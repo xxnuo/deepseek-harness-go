@@ -19,6 +19,7 @@ type compactRequest struct {
 	tools           []ToolSchema
 	retainTokens    int
 	wholeSurface    bool
+	config          CompactionConfig
 }
 
 type compactResult struct {
@@ -31,8 +32,12 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if e.cfg.Compaction.Disabled {
-		return result, errors.New("compaction disabled")
+	runtimeConfig, runtimeErr := e.runtimeForSession(s)
+	if runtimeErr != nil {
+		return result, runtimeErr
+	}
+	if !runtimeConfig.compactionEnabled {
+		return result, errors.New("compaction service unavailable")
 	}
 	s.mu.Lock()
 	events := append([]Event(nil), s.Events...)
@@ -61,15 +66,24 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	if selection.Model == "" {
 		selection.Model = e.cfg.Model
 	}
+	config := request.config
+	if config.ThresholdRatio == 0 {
+		config = compactionPolicyFor(runtimeConfig.compactionConfig, selection)
+	}
+	summarySelection := selection
+	if config.SummarizationProvider != "" {
+		summarySelection.Provider = config.SummarizationProvider
+		summarySelection.Model = config.SummarizationModel
+	}
 	messages := e.hydrateChatMessagesWithLimit(transcriptMessages(selected, int(^uint(0)>>1)), e.requestImageLimit(selection.Provider))
 	if len(messages) == 0 || !toolMessagesBalanced(messages) {
 		return result, errNoCompactableHistory
 	}
 	e.mu.RLock()
-	provider := e.providers[selection.Provider]
+	provider := e.providers[summarySelection.Provider]
 	e.mu.RUnlock()
 	if provider == nil {
-		return result, fmt.Errorf("compaction model unavailable: %s/%s", selection.Provider, selection.Model)
+		return result, fmt.Errorf("compaction model unavailable: %s/%s", summarySelection.Provider, summarySelection.Model)
 	}
 	compactionID := newID("compact")
 	owner := any(nil)
@@ -95,8 +109,8 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	}()
 	requestMessages := append(append([]ChatMessage(nil), messages...), ChatMessage{Role: "user", Content: compactionInstruction})
 	completion, completeErr := provider.Complete(ctx, ChatRequest{
-		SessionID: s.Header.ID, Model: selection.Model, System: request.system, Messages: requestMessages, Tools: request.tools,
-		MaxTokens: e.cfg.Compaction.MaxTokens,
+		SessionID: s.Header.ID, Model: summarySelection.Model, System: request.system, Messages: requestMessages, Tools: request.tools,
+		MaxTokens: config.MaxTokens,
 	}, func(Delta) error { return nil })
 	if completeErr != nil {
 		return result, completeErr
@@ -138,9 +152,9 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	summaryData["shadowedRange"] = map[string]any{"start": shadowedSeqs[0], "end": shadowedSeqs[len(shadowedSeqs)-1]}
 	summaryData["shadowedSeqs"] = shadowedSeqs
 	summaryData["shadowedTokenCount"] = shadowedTokens
-	summaryData["provider"] = selection.Provider
-	summaryData["model"] = selection.Model
-	summaryData["maxTokens"] = e.cfg.Compaction.MaxTokens
+	summaryData["provider"] = summarySelection.Provider
+	summaryData["model"] = summarySelection.Model
+	summaryData["maxTokens"] = config.MaxTokens
 	if len(completion.Usage) > 0 {
 		summaryData["usage"] = completion.Usage
 	}
@@ -236,34 +250,64 @@ func (e *Engine) durableMessages(s *Session, turn int) []ChatMessage {
 	return e.hydrateChatMessagesWithLimit(transcriptMessages(events, turn), e.requestImageLimit(provider))
 }
 
-func (e *Engine) contextWindowFor(selection ModelSelection) int {
-	provider := selection.Provider
-	if provider == "" {
-		provider = e.cfg.Provider
-	}
-	if provider != "deepseek-official" {
-		return 0
-	}
-	modelID := selection.Model
-	if modelID == "" {
-		modelID = e.cfg.Model
-	}
-	for _, model := range deepSeekCatalog(deepSeekEffectiveSettings(e)) {
-		if model.ID == modelID {
-			return model.ContextWindow
+func routedCompactionRequest(s *Session) (ModelSelection, string, []ToolSchema, bool) {
+	s.mu.Lock()
+	events := append([]Event(nil), s.Events...)
+	s.mu.Unlock()
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].Type != "request/header" {
+			continue
+		}
+		var data struct {
+			Header struct {
+				Config ModelSelection `json:"config"`
+				System string         `json:"system"`
+				Tools  []ToolSchema   `json:"tools"`
+			} `json:"header"`
+		}
+		encoded, err := json.Marshal(events[index].Data)
+		if err == nil && json.Unmarshal(encoded, &data) == nil && data.Header.Config.Provider != "" && data.Header.Config.Model != "" {
+			return data.Header.Config, data.Header.System, data.Header.Tools, true
 		}
 	}
-	return deepSeekDefaultContext
+	return ModelSelection{}, "", nil, false
+}
+
+func (e *Engine) contextWindowFor(ctx context.Context, selection ModelSelection) (int, error) {
+	if selection.Provider == "" {
+		selection.Provider = e.cfg.Provider
+	}
+	if selection.Model == "" {
+		selection.Model = e.cfg.Model
+	}
+	model, err := resolveExactModelInfo(ctx, e, selection)
+	if err != nil {
+		return 0, err
+	}
+	return model.ContextWindow, nil
 }
 
 func (e *Engine) compactForPressure(ctx context.Context, s *Session, turn int, selection ModelSelection, system string, tools []ToolSchema) (bool, error) {
-	config := e.cfg.Compaction
-	if config.Disabled || config.AutoDisabled {
+	runtimeConfig, err := e.runtimeForSession(s)
+	if err != nil {
+		return false, err
+	}
+	if !runtimeConfig.compactionEnabled || !runtimeConfig.compactionAuto {
 		return false, nil
 	}
-	contextWindow := e.contextWindowFor(selection)
-	if contextWindow == 0 {
+	routed, routedSystem, routedTools, ok := routedCompactionRequest(s)
+	if !ok {
 		return false, nil
+	}
+	selection = routed
+	system, tools = routedSystem, routedTools
+	config := compactionPolicyFor(runtimeConfig.compactionConfig, selection)
+	contextWindow, err := e.contextWindowFor(ctx, selection)
+	if err != nil {
+		return false, err
+	}
+	if contextWindow == 0 {
+		return false, fmt.Errorf("compaction-basic: no context capacity for %s/%s; configure contextWindow on that adapter model", selection.Provider, selection.Model)
 	}
 	threshold := int(float64(contextWindow) * config.ThresholdRatio)
 	retainTokens := config.RetainTokens
@@ -273,8 +317,11 @@ func (e *Engine) compactForPressure(ctx context.Context, s *Session, turn int, s
 	if retainTokens >= threshold {
 		return false, fmt.Errorf("compaction retain tokens %d must be below threshold %d", retainTokens, threshold)
 	}
-	messages := e.durableMessages(s, turn)
-	if estimatedRequestTokens(system, tools, messages) < threshold {
+	measurement, err := measureSessionTokens(s)
+	if err != nil {
+		return false, err
+	}
+	if measurement.totalTokens < threshold {
 		return false, nil
 	}
 	pruned, err := e.pruneToolResults(s)
@@ -282,14 +329,17 @@ func (e *Engine) compactForPressure(ctx context.Context, s *Session, turn int, s
 	if err != nil {
 		return changed, err
 	}
-	messages = e.durableMessages(s, turn)
-	if estimatedRequestTokens(system, tools, messages) < threshold {
+	measurement, err = measureSessionTokens(s)
+	if err != nil {
+		return changed, err
+	}
+	if measurement.totalTokens < threshold {
 		return changed, nil
 	}
 	for attempt := 0; attempt <= config.CompactionRetries; attempt++ {
 		_, err = e.compactSession(ctx, s, compactRequest{
 			turn: &turn, selection: selection, system: system, tools: tools,
-			retainTokens: retainTokens, wholeSurface: true,
+			retainTokens: retainTokens, wholeSurface: true, config: config,
 		})
 		if errors.Is(err, errNoCompactableHistory) {
 			break
@@ -298,19 +348,32 @@ func (e *Engine) compactForPressure(ctx context.Context, s *Session, turn int, s
 			return changed, err
 		}
 		changed = true
-		messages = e.durableMessages(s, turn)
-		if estimatedRequestTokens(system, tools, messages) < threshold {
+		measurement, err = measureSessionTokens(s)
+		if err != nil {
+			return changed, err
+		}
+		if measurement.totalTokens < threshold {
 			return true, nil
 		}
 	}
-	return changed, fmt.Errorf("compaction still above threshold (%d estimated tokens >= %d)", estimatedRequestTokens(system, tools, e.durableMessages(s, turn)), threshold)
+	return changed, fmt.Errorf("compaction still above threshold (%d estimated tokens >= %d)", measurement.totalTokens, threshold)
 }
 
 func (e *Engine) compactForOverflow(ctx context.Context, s *Session, turn int, selection ModelSelection, system string, tools []ToolSchema) (bool, error) {
-	config := e.cfg.Compaction
-	if config.Disabled || config.AutoDisabled {
+	runtimeConfig, runtimeErr := e.runtimeForSession(s)
+	if runtimeErr != nil {
+		return false, runtimeErr
+	}
+	if !runtimeConfig.compactionEnabled || !runtimeConfig.compactionAuto {
 		return false, nil
 	}
+	routed, routedSystem, routedTools, ok := routedCompactionRequest(s)
+	if !ok {
+		return false, nil
+	}
+	selection = routed
+	system, tools = routedSystem, routedTools
+	config := compactionPolicyFor(runtimeConfig.compactionConfig, selection)
 	pruned, err := e.pruneToolResults(s)
 	changed := pruned > 0
 	if err != nil {
@@ -318,7 +381,7 @@ func (e *Engine) compactForOverflow(ctx context.Context, s *Session, turn int, s
 	}
 	_, err = e.compactSession(ctx, s, compactRequest{
 		turn: &turn, selection: selection, system: system, tools: tools,
-		wholeSurface: true,
+		wholeSurface: true, config: config,
 	})
 	if errors.Is(err, errNoCompactableHistory) {
 		return changed, nil
@@ -328,6 +391,22 @@ func (e *Engine) compactForOverflow(ctx context.Context, s *Session, turn int, s
 
 func (e *Engine) pruneToolResults(s *Session) (int, error) {
 	config := e.cfg.ToolResultPruner
+	runtimeConfig, err := e.runtimeForSession(s)
+	if err != nil {
+		return 0, err
+	}
+	if !runtimeConfig.toolResultPrunerEnabled {
+		return 0, nil
+	}
+	if runtimeConfig.toolResultPruneThresholdChars > 0 {
+		config.ThresholdChars = runtimeConfig.toolResultPruneThresholdChars
+	}
+	if runtimeConfig.toolResultPruneHeadChars >= 0 {
+		config.HeadChars = runtimeConfig.toolResultPruneHeadChars
+	}
+	if runtimeConfig.toolResultPruneTailChars >= 0 {
+		config.TailChars = runtimeConfig.toolResultPruneTailChars
+	}
 	if config.Disabled {
 		return 0, nil
 	}
@@ -343,33 +422,155 @@ func (e *Engine) pruneToolResults(s *Session) (int, error) {
 		if event.Type != "tool/result" {
 			continue
 		}
-		data, _ := cloneJSON(event.Data).(map[string]any)
-		message := nestedMessage(data)
-		blocks := contentBlocks(message["content"])
-		if len(blocks) != 1 || blocks[0].Type != "tool-result" {
+		data, ok := cloneJSON(event.Data).(map[string]any)
+		if !ok {
 			continue
 		}
-		content, changed := pruneToolResultContent(blocks[0].Content, config)
+		message := nestedMessage(data)
+		outerBlocks, ok := rawContentBlockMaps(message["content"])
+		if !ok || len(outerBlocks) != 1 || stringValue(outerBlocks[0]["type"]) != "tool-result" {
+			continue
+		}
+		content, changed, err := pruneRawToolResultContent(outerBlocks[0]["content"], config)
+		if err != nil {
+			return pruned, err
+		}
 		if !changed {
 			continue
 		}
-		blocks[0].Content = content
-		message["content"] = blocks
-		shadowedTokens := estimateProjectionEvent(event)
-		if _, err := e.appendEvent(s, "compaction/prune", map[string]any{
-			"shadowedRange": map[string]any{"start": event.Seq, "end": event.Seq},
-			"shadowedSeqs":  []int{event.Seq}, "shadowedTokenCount": shadowedTokens,
-		}); err != nil {
-			return pruned, err
+		// Keep the original JSON maps intact and replace only the nested
+		// `content` field. The TypeScript plugin spreads every block and the
+		// complete event data, so provider-specific fields on core blocks must
+		// survive this rewrite too.
+		outerBlocks[0]["content"] = content
+		outerValues := make([]any, len(outerBlocks))
+		for index, block := range outerBlocks {
+			outerValues[index] = block
 		}
-		if _, err := e.appendEventWithMetadata(s, "tool/result", data, map[string]any{
-			"op": "replace", "start": event.Seq, "end": event.Seq,
-		}, []int{event.Seq}, false); err != nil {
+		message["content"] = outerValues
+		shadowedTokens := estimateProjectionEvent(event)
+		if err := e.appendToolResultPruneReplacement(s, event.Seq, shadowedTokens, data); err != nil {
 			return pruned, err
 		}
 		pruned++
 	}
 	return pruned, nil
+}
+
+// appendToolResultPruneReplacement keeps the shadow-price event and its
+// replacement adjacent even when other goroutines append to the session. If
+// the replacement is rejected after the price event commits, the committed
+// price remains durable, matching the upstream session.append sequence.
+func (e *Engine) appendToolResultPruneReplacement(s *Session, originalSeq, shadowedTokens int, data map[string]any) error {
+	pruneData := map[string]any{
+		"shadowedRange": map[string]any{"start": originalSeq, "end": originalSeq},
+		"shadowedSeqs":  []int{originalSeq}, "shadowedTokenCount": shadowedTokens,
+	}
+	replacementOp := map[string]any{"op": "replace", "start": originalSeq, "end": originalSeq}
+
+	s.mu.Lock()
+	id := s.Header.ID
+	price, err := appendEventLocked(s, "compaction/prune", pruneData, nil, nil, false)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	replacement, replacementErr := appendEventLocked(s, "tool/result", data, replacementOp, []int{originalSeq}, false)
+	s.mu.Unlock()
+
+	e.publishEvent(id, price)
+	e.observeSessionTitleEvent(s, price)
+	if replacementErr != nil {
+		return replacementErr
+	}
+	e.publishEvent(id, replacement)
+	e.observeSessionTitleEvent(s, replacement)
+	return nil
+}
+
+// rawContentBlockMaps returns the mutable JSON maps produced by cloneJSON.
+// Keeping these maps instead of round-tripping through ContentBlock preserves
+// extension fields on otherwise core block types.
+func rawContentBlockMaps(value any) ([]map[string]any, bool) {
+	blocks, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]map[string]any, len(blocks))
+	for index, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		out[index] = block
+	}
+	return out, true
+}
+
+// pruneRawToolResultContent mirrors pruneToolResultContent while preserving
+// arbitrary fields on every retained content block.
+func pruneRawToolResultContent(value any, config ToolResultPruneConfig) ([]any, bool, error) {
+	blocks, ok := value.([]any)
+	if !ok {
+		return nil, false, nil
+	}
+	total := 0
+	for _, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok || stringValue(block["type"]) != "text" {
+			continue
+		}
+		text, _ := block["text"].(string)
+		total += len([]rune(text))
+	}
+	if total <= config.ThresholdChars {
+		return nil, false, nil
+	}
+	removedStart := config.HeadChars
+	removedEnd := total - config.TailChars
+	result := make([]any, 0, len(blocks)+1)
+	consumed := 0
+	markerInserted := false
+	for _, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok || stringValue(block["type"]) != "text" {
+			result = append(result, value)
+			continue
+		}
+		text, _ := block["text"].(string)
+		points := []rune(text)
+		blockStart, blockEnd := consumed, consumed+len(points)
+		headEnd := min(len(points), max(0, removedStart-blockStart))
+		tailStart := min(len(points), max(0, removedEnd-blockStart))
+		replacement := string(points[:headEnd])
+		if blockStart < removedEnd && blockEnd > removedStart && !markerInserted {
+			replacement += toolResultPruneMarker
+			markerInserted = true
+		}
+		replacement += string(points[tailStart:])
+		if replacement != "" {
+			retained := cloneJSON(block).(map[string]any)
+			retained["text"] = replacement
+			result = append(result, retained)
+		}
+		consumed = blockEnd
+	}
+	if !markerInserted {
+		return nil, false, errors.New("tool-result prune: failed to locate the removed text span")
+	}
+	charsAfter := 0
+	for _, value := range result {
+		block, ok := value.(map[string]any)
+		if !ok || stringValue(block["type"]) != "text" {
+			continue
+		}
+		text, _ := block["text"].(string)
+		charsAfter += len([]rune(text))
+	}
+	if charsAfter > config.ThresholdChars || charsAfter >= total {
+		return nil, false, errors.New("tool-result prune: replacement must be smaller and within threshold")
+	}
+	return result, true, nil
 }
 
 func pruneToolResultContent(blocks []ContentBlock, config ToolResultPruneConfig) ([]ContentBlock, bool) {

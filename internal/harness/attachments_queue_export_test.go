@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -18,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -97,7 +100,7 @@ func TestAttachmentAdmissionFormatsAndIntegrity(t *testing.T) {
 				t.Fatalf("readImage() err=%v", err)
 			}
 			if mediaType == "image/gif" {
-				if ref.MediaType != "image/jpeg" || ref.OriginalDimensions == nil {
+				if ref.MediaType != "image/png" || ref.OriginalDimensions != nil {
 					t.Fatalf("GIF normalization metadata = %#v", ref)
 				}
 			} else if !bytes.Equal(got, data) {
@@ -130,6 +133,143 @@ func TestAttachmentAdmissionFormatsAndIntegrity(t *testing.T) {
 	}
 	if _, err := e.readImage(ref); err == nil || !strings.Contains(err.Error(), "integrity") {
 		t.Fatalf("tampered read error = %v", err)
+	}
+}
+
+func TestAttachmentRejectsCorruptLaterGIFFrame(t *testing.T) {
+	e := attachmentEngine(t, false)
+	palette := color.Palette{color.Black, color.White}
+	first := image.NewPaletted(image.Rect(0, 0, 2, 1), palette)
+	second := image.NewPaletted(image.Rect(0, 0, 2, 1), palette)
+	second.SetColorIndex(1, 0, 1)
+	var encoded bytes.Buffer
+	if err := gif.EncodeAll(&encoded, &gif.GIF{Image: []*image.Paletted{first, second}, Delay: []int{0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	data := encoded.Bytes()
+	corrupt := append([]byte(nil), data[:len(data)-4]...)
+	if _, _, err := image.Decode(bytes.NewReader(corrupt)); err != nil {
+		t.Fatalf("fixture no longer isolates later-frame corruption: %v", err)
+	}
+	if _, err := e.StoreImage("image/gif", b64(corrupt), "corrupt.gif"); err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("corrupt later GIF frame error = %v", err)
+	}
+}
+
+func TestAttachmentPromptAdmissionPreservesCancellation(t *testing.T) {
+	e := attachmentEngine(t, false)
+	reason := errors.New("cancel prompt image admission")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(reason)
+	_, err := e.durablePromptContentContext(ctx, []PromptContentPart{{Type: "image", MediaType: "image/png", Data: readImagePNG}})
+	if !errors.Is(err, reason) {
+		t.Fatalf("prompt image cancellation = %v", err)
+	}
+}
+
+func TestAttachmentBatchPolicyPrecedesPerImageValidation(t *testing.T) {
+	e := attachmentEngine(t, false)
+	parts := make([]PromptContentPart, maxImagesPerMessage+1)
+	for index := range parts {
+		parts[index] = PromptContentPart{Type: "image", MediaType: "image/png", Data: "AQ=="}
+	}
+	if _, err := e.durablePromptContent(parts); err == nil || !strings.Contains(err.Error(), "image-count limit") {
+		t.Fatalf("batch policy error = %v", err)
+	}
+}
+
+func TestAttachmentBatchAggregateUsesSubmittedBytes(t *testing.T) {
+	inputs := []*decodedImageInput{
+		{mediaType: "image/png", data: []byte{1, 2, 3}},
+		{mediaType: "image/png", data: []byte{4, 5, 6}},
+	}
+	if err := validateDecodedImageBatch(inputs, 2, 5); err == nil || !strings.Contains(err.Error(), "aggregate image-byte limit") {
+		t.Fatalf("aggregate policy error = %v", err)
+	}
+}
+
+func jpegWithOrientation(t *testing.T, orientation uint16) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{G: 255, A: 255})
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	tiff := make([]byte, 26)
+	copy(tiff[:2], "II")
+	binary.LittleEndian.PutUint16(tiff[2:4], 42)
+	binary.LittleEndian.PutUint32(tiff[4:8], 8)
+	binary.LittleEndian.PutUint16(tiff[8:10], 1)
+	binary.LittleEndian.PutUint16(tiff[10:12], 0x0112)
+	binary.LittleEndian.PutUint16(tiff[12:14], 3)
+	binary.LittleEndian.PutUint32(tiff[14:18], 1)
+	binary.LittleEndian.PutUint16(tiff[18:20], orientation)
+	payload := append([]byte("Exif\x00\x00"), tiff...)
+	segment := []byte{0xff, 0xe1, byte((len(payload) + 2) >> 8), byte(len(payload) + 2)}
+	segment = append(segment, payload...)
+	jpegBytes := encoded.Bytes()
+	return append(append([]byte(nil), jpegBytes[:2]...), append(segment, jpegBytes[2:]...)...)
+}
+
+func TestAttachmentAppliesEXIFOrientationAndStripsMetadata(t *testing.T) {
+	e := attachmentEngine(t, false)
+	source := jpegWithOrientation(t, 6)
+	ref, err := e.StoreImage("image/jpeg", b64(source), "oriented.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := e.readImage(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Width != 1 || ref.Height != 2 || ref.OriginalDimensions != nil || bytes.Equal(stored, source) {
+		t.Fatalf("oriented attachment = %#v equal=%v", ref, bytes.Equal(stored, source))
+	}
+}
+
+func TestAttachmentNormalizes16BitPNGTo8Bit(t *testing.T) {
+	e := attachmentEngine(t, false)
+	image16 := image.NewNRGBA64(image.Rect(0, 0, 2, 1))
+	image16.SetNRGBA64(0, 0, color.NRGBA64{R: 0xffff, A: 0xffff})
+	image16.SetNRGBA64(1, 0, color.NRGBA64{G: 0xffff, A: 0x8000})
+	var source bytes.Buffer
+	if err := png.Encode(&source, image16); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := e.StoreImage("image/png", b64(source.Bytes()), "16-bit.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := e.readImage(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(stored, source.Bytes()) || len(stored) <= 24 || stored[24] != 8 {
+		t.Fatalf("stored PNG was not normalized to 8-bit: equal=%v bitDepth=%d", bytes.Equal(stored, source.Bytes()), stored[24])
+	}
+}
+
+func TestAttachmentNormalizesGrayscaleToSRGB(t *testing.T) {
+	e := attachmentEngine(t, false)
+	gray := image.NewGray(image.Rect(0, 0, 2, 1))
+	gray.SetGray(0, 0, color.Gray{Y: 20})
+	gray.SetGray(1, 0, color.Gray{Y: 220})
+	var source bytes.Buffer
+	if err := png.Encode(&source, gray); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := e.StoreImage("image/png", b64(source.Bytes()), "gray.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := e.readImage(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(stored, source.Bytes()) || encodedColourSpace(stored) != "srgb" {
+		t.Fatalf("grayscale normalization equal=%v space=%q", bytes.Equal(stored, source.Bytes()), encodedColourSpace(stored))
 	}
 }
 
@@ -190,6 +330,260 @@ func TestRequestImageVersionIsStableAndCached(t *testing.T) {
 	}
 	if _, err := e.ReadImageRequest(ref, ImageRequestPolicy{}); err == nil {
 		t.Fatal("zero request policy unexpectedly accepted")
+	}
+}
+
+func TestRequestImageVariantCoversCompleteTransformDescriptor(t *testing.T) {
+	ref := ImageAttachmentRef{AttachmentID: "sha256:" + strings.Repeat("a", 64)}
+	policy := ImageRequestPolicy{MaxPixels: 640_000, MaxBytes: 1 << 20}
+	if got, want := requestImageVariantID(ref, policy), "sha256:225e411fbabcf9deb1d4cef93b8abf70ac716ee77e061a63a75babdf6c316598"; got != want {
+		t.Fatalf("variant id = %q, want %q", got, want)
+	}
+}
+
+func TestSharedRequestImageKeepsWaiterCancellationIndependent(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	underlyingCancelled := make(chan error, 1)
+	shared := newSharedRequestImage(func(ctx context.Context) (RequestImageAttachment, error) {
+		close(started)
+		select {
+		case <-release:
+			return RequestImageAttachment{VariantID: "done"}, nil
+		case <-ctx.Done():
+			underlyingCancelled <- context.Cause(ctx)
+			return RequestImageAttachment{}, context.Cause(ctx)
+		}
+	})
+	<-started
+	firstCtx, cancelFirst := context.WithCancelCause(context.Background())
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { _, err := shared.wait(firstCtx); firstDone <- err }()
+	go func() { _, err := shared.wait(context.Background()); secondDone <- err }()
+	waitForSharedRequestWaiters(t, shared, 2)
+	reason := errors.New("cancel one waiter")
+	cancelFirst(reason)
+	if err := <-firstDone; !errors.Is(err, reason) {
+		t.Fatalf("cancelled waiter error = %v", err)
+	}
+	select {
+	case err := <-underlyingCancelled:
+		t.Fatalf("shared transform cancelled with live waiter: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("live waiter error = %v", err)
+	}
+}
+
+func TestSharedRequestImageCancelsUnderlyingAfterLastWaiter(t *testing.T) {
+	started := make(chan struct{})
+	underlyingCancelled := make(chan error, 1)
+	shared := newSharedRequestImage(func(ctx context.Context) (RequestImageAttachment, error) {
+		close(started)
+		<-ctx.Done()
+		underlyingCancelled <- context.Cause(ctx)
+		return RequestImageAttachment{}, context.Cause(ctx)
+	})
+	<-started
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := shared.wait(ctx); done <- err }()
+	waitForSharedRequestWaiters(t, shared, 1)
+	reason := errors.New("cancel last waiter")
+	cancel(reason)
+	if err := <-done; !errors.Is(err, reason) {
+		t.Fatalf("waiter error = %v", err)
+	}
+	if err := <-underlyingCancelled; !errors.Is(err, reason) {
+		t.Fatalf("underlying cancellation = %v", err)
+	}
+}
+
+func waitForSharedRequestWaiters(t *testing.T, shared *sharedRequestImage, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		shared.mu.Lock()
+		got := shared.waiters
+		shared.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("shared request waiter count did not reach %d", want)
+}
+
+func TestRequestImagePassesThroughInBudgetAttachment(t *testing.T) {
+	e := attachmentEngine(t, false)
+	alphaImage := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	alphaImage.SetNRGBA(0, 0, color.NRGBA{R: 255, A: 254})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, alphaImage); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := e.StoreImage("image/png", b64(encoded.Bytes()), "passthrough.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := e.readImage(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := e.ReadImageRequest(ref, ImageRequestPolicy{MaxPixels: ref.Width * ref.Height, MaxBytes: len(stored)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(request.Data, stored) || request.MediaType != ref.MediaType {
+		t.Fatalf("in-budget request was transformed: request=%#v equal=%v", request, bytes.Equal(request.Data, stored))
+	}
+	if !request.HasAlpha {
+		t.Fatalf("opaque RGBA PNG lost its declared alpha plane: %#v", request)
+	}
+}
+
+func TestRequestImageForcedTransformUsesVerifiedWebPAndPreservesAlpha(t *testing.T) {
+	e := attachmentEngine(t, false)
+	alphaImage := image.NewNRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			alphaImage.SetNRGBA(x, y, color.NRGBA{
+				R: uint8(x * 8), G: uint8(y * 8), B: uint8((x*17 + y*29) % 256), A: uint8(64 + (x*5+y*3)%192),
+			})
+		}
+	}
+	var source bytes.Buffer
+	if err := png.Encode(&source, alphaImage); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := e.StoreImage("image/png", b64(source.Bytes()), "complex-alpha.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := e.ReadImageRequest(ref, ImageRequestPolicy{MaxPixels: 16 * 16, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.MediaType != "image/webp" || !request.HasAlpha || request.Depth != "uchar" || request.Space != "srgb" {
+		t.Fatalf("forced request facts = %#v", request)
+	}
+	if request.Width*request.Height > 16*16 || request.Bytes != len(request.Data) {
+		t.Fatalf("forced request policy = %#v", request)
+	}
+	mediaType, width, height, alpha, depth, space, err := detectedRequestImage(request.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mediaType != request.MediaType || width != request.Width || height != request.Height || alpha != request.HasAlpha || depth != request.Depth || space != request.Space {
+		t.Fatalf("decoded request facts = %q %dx%d alpha=%v depth=%q space=%q", mediaType, width, height, alpha, depth, space)
+	}
+}
+
+func TestRequestImageRejectsCacheDepthSpaceAndAlphaMismatch(t *testing.T) {
+	alphaImage := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	alphaImage.SetNRGBA(0, 0, color.NRGBA{R: 255, A: 128})
+	alphaImage.SetNRGBA(1, 0, color.NRGBA{G: 255, A: 255})
+	var alphaSource bytes.Buffer
+	if err := png.Encode(&alphaSource, alphaImage); err != nil {
+		t.Fatal(err)
+	}
+
+	gray := image.NewGray(image.Rect(0, 0, 2, 1))
+	gray.SetGray(0, 0, color.Gray{Y: 32})
+	gray.SetGray(1, 0, color.Gray{Y: 224})
+	var grayCache bytes.Buffer
+	if err := png.Encode(&grayCache, gray); err != nil {
+		t.Fatal(err)
+	}
+
+	image16 := image.NewNRGBA64(image.Rect(0, 0, 2, 1))
+	image16.SetNRGBA64(0, 0, color.NRGBA64{R: 0xffff, A: 0xffff})
+	image16.SetNRGBA64(1, 0, color.NRGBA64{G: 0xffff, A: 0xffff})
+	var depthCache bytes.Buffer
+	if err := png.Encode(&depthCache, image16); err != nil {
+		t.Fatal(err)
+	}
+
+	opaque := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	opaque.SetRGBA(0, 0, color.RGBA{R: 255, A: 255})
+	opaque.SetRGBA(1, 0, color.RGBA{G: 255, A: 255})
+	var alphaCache bytes.Buffer
+	if err := png.Encode(&alphaCache, opaque); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, invalidCache := range map[string][]byte{
+		"depth": depthCache.Bytes(),
+		"space": grayCache.Bytes(),
+		"alpha": alphaCache.Bytes(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := attachmentEngine(t, false)
+			ref, err := e.StoreImage("image/png", b64(alphaSource.Bytes()), "source.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := e.readImage(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := ImageRequestPolicy{MaxPixels: ref.Width * ref.Height, MaxBytes: 1 << 20}
+			cache := requestImageCachePath(filepath.Join(e.cfg.DataDir, "attachments", "v1"), requestImageVariantID(ref, policy))
+			if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cache, invalidCache, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			request, err := e.ReadImageRequest(ref, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(request.Data, stored) || request.Depth != "uchar" || request.Space != "srgb" || !request.HasAlpha {
+				t.Fatalf("invalid %s cache was accepted: %#v", name, request)
+			}
+		})
+	}
+}
+
+func TestRequestImageRebuildsCachedVariantOutsidePixelPolicy(t *testing.T) {
+	e := attachmentEngine(t, false)
+	data := attachmentFixtureBytes(t)["image/png"]
+	ref, err := e.StoreImage("image/png", b64(data), "cached.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := ImageRequestPolicy{MaxPixels: 1, MaxBytes: 1024}
+	cache := requestImageCachePath(filepath.Join(e.cfg.DataDir, "attachments", "v1"), requestImageVariantID(ref, policy))
+	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request, err := e.ReadImageRequest(ref, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Width*request.Height > policy.MaxPixels {
+		t.Fatalf("cached request exceeded pixel policy: %#v", request)
+	}
+}
+
+func TestReadImageRequestContextPreservesCancellation(t *testing.T) {
+	e := attachmentEngine(t, false)
+	ref, err := e.StoreImage("image/png", readImagePNG, "cancel.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := errors.New("cancel request image")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(reason)
+	if _, err := e.ReadImageRequestContext(ctx, ref, ImageRequestPolicy{MaxPixels: 1, MaxBytes: 1024}); !errors.Is(err, reason) {
+		t.Fatalf("cancellation error = %v", err)
 	}
 }
 

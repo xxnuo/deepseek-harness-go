@@ -533,13 +533,15 @@ func (r *terminalRegistry) open(ctx context.Context, spec TerminalBackendSpawnSp
 	r.mu.Unlock()
 
 	stop := context.AfterFunc(r.ctx, func() { cancel(context.Cause(r.ctx)) })
+	published := false
 	defer func() {
 		stop()
-		cancel(nil)
+		if !published {
+			cancel(nil)
+		}
 		r.mu.Lock()
-		delete(r.pendingByOwner[spec.OwnerID], pending)
-		if len(r.pendingByOwner[spec.OwnerID]) == 0 {
-			delete(r.pendingByOwner, spec.OwnerID)
+		if pending.cleanupErr == nil {
+			r.removePendingLocked(spec.OwnerID, pending)
 		}
 		r.mu.Unlock()
 		close(pending.done)
@@ -549,11 +551,17 @@ func (r *terminalRegistry) open(ctx context.Context, spec TerminalBackendSpawnSp
 
 	rollback := func(cause error) (TerminalSpawnResult, error) {
 		r.releaseName(spec.OwnerID, spec.Name)
+		if cancellation := context.Cause(spawnCtx); cancellation != nil {
+			cause = cancellation
+		}
 		if session == nil {
 			return TerminalSpawnResult{}, cause
 		}
 		if closeErr := session.Close("PTY spawn rolled back"); closeErr != nil {
 			pending.cleanupErr = closeErr
+			if context.Cause(spawnCtx) != nil {
+				return TerminalSpawnResult{}, cause
+			}
 			return TerminalSpawnResult{}, errors.Join(cause, closeErr)
 		}
 		return TerminalSpawnResult{}, cause
@@ -563,7 +571,11 @@ func (r *terminalRegistry) open(ctx context.Context, spec TerminalBackendSpawnSp
 		if errors.As(spawnErr, &cleanup) {
 			pending.cleanupErr = cleanup.CleanupError
 		}
-		return rollback(spawnErr)
+		cause := spawnErr
+		if cancellation := context.Cause(spawnCtx); cancellation != nil {
+			cause = cancellation
+		}
+		return rollback(cause)
 	}
 	if session == nil {
 		return rollback(errors.New("PTY backend returned a nil session"))
@@ -584,7 +596,16 @@ func (r *terminalRegistry) open(ctx context.Context, spec TerminalBackendSpawnSp
 	}
 	snapshot := snapshotTerminal(record)
 	r.mu.Unlock()
+	published = true
 	return TerminalSpawnResult{TerminalSessionSnapshot: snapshot, MOTD: session.MOTD()}, nil
+}
+
+func (r *terminalRegistry) removePendingLocked(owner string, pending *terminalPendingSpawn) {
+	owned := r.pendingByOwner[owner]
+	delete(owned, pending)
+	if len(owned) == 0 {
+		delete(r.pendingByOwner, owner)
+	}
 }
 
 func (r *terminalRegistry) releaseName(owner, name string) {
@@ -789,6 +810,11 @@ func (r *terminalRegistry) closeOwner(owner string) error {
 			failures = append(failures, spawn.cleanupErr)
 		}
 	}
+	r.mu.Lock()
+	for _, spawn := range pending {
+		r.removePendingLocked(owner, spawn)
+	}
+	r.mu.Unlock()
 
 	r.mu.Lock()
 	ids := make([]string, 0)
@@ -820,6 +846,15 @@ func (r *terminalRegistry) close() error {
 	r.pending.Wait()
 
 	r.mu.Lock()
+	var failures []error
+	for owner, pending := range r.pendingByOwner {
+		for spawn := range pending {
+			if spawn.cleanupErr != nil {
+				failures = append(failures, spawn.cleanupErr)
+			}
+			r.removePendingLocked(owner, spawn)
+		}
+	}
 	records := make([]*terminalRecord, 0, len(r.sessions))
 	for _, id := range r.order {
 		if record := r.sessions[id]; record != nil {
@@ -827,7 +862,6 @@ func (r *terminalRegistry) close() error {
 		}
 	}
 	r.mu.Unlock()
-	var failures []error
 	for _, record := range records {
 		if _, err := r.closeOne(record.owner, record.id, "PTY service disposed"); err != nil && !isTerminalErrorCode(err, "NO_SESSION") {
 			failures = append(failures, fmt.Errorf("terminal %s: %w", record.id, err))
@@ -969,7 +1003,7 @@ func (e *Engine) ListTerminals(owner string) ([]TerminalSessionSnapshot, error) 
 }
 
 func (e *Engine) HasTerminalActivity(owner string) bool {
-	return e.terminals.hasOwnerActivity(owner)
+	return e.terminals.hasOwnerActivity(owner) || e.shells.hasOwnerActivity(owner)
 }
 
 func validTerminalSignal(signal string) bool {

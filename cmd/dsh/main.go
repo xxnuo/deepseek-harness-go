@@ -413,6 +413,12 @@ func quoteArgs(args []string) string {
 
 func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	cfg := harness.DefaultConfig()
+	// Profile composition supplies the same execution-time selection fields as
+	// the upstream WebRuntime. Start from the process environment explicitly so
+	// an empty env value means "unset" rather than inheriting DefaultConfig's
+	// library default; a profile's explicit web config below still wins.
+	cfg.WebSearchProvider = strings.TrimSpace(os.Getenv("DSH_WEB_SEARCH_PROVIDER"))
+	cfg.WebFetchProvider = strings.TrimSpace(os.Getenv("DSH_WEB_FETCH_PROVIDER"))
 	cfg.LaunchEnvironment = loader.launchEnvironment
 	if cfg.LaunchEnvironment != nil {
 		cfg.APIKey = ""
@@ -424,10 +430,12 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 		cfg.PluginDirs = []string{filepath.Join(composed.profileDir, "node_modules")}
 	}
 	cfg.ClientPlugins = composed.activePluginNames()
+	cfg.PluginInventory = composed.pluginInventoryEntries()
 	if composed.clientHMRPollInterval > 0 {
 		cfg.ClientHMRPollInterval = composed.clientHMRPollInterval
 	}
 	cfg.MCPServers = append([]harness.MCPConfig(nil), composed.mcpConfigs...)
+	cfg.Jobs = composed.jobs
 	cfg.Hooks = append([]harness.HookBridgeConfig(nil), composed.hooks...)
 	cfg.LSPServers = composed.lspServers
 	cfg.LSPTool = composed.lspTool
@@ -446,6 +454,9 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	if composed.exaSearch != nil {
 		cfg.ExaSearch = *composed.exaSearch
 	}
+	if composed.deepSeekWebSearch != nil {
+		cfg.DeepSeekWebSearch = *composed.deepSeekWebSearch
+	}
 	if composed.perplexitySearch != nil {
 		cfg.PerplexitySearch = *composed.perplexitySearch
 	}
@@ -455,6 +466,12 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 		webTools = *composed.webTools
 	}
 	cfg.WebTools = &webTools
+	timeoutPolicyEnabled := composed.pluginEnabled("@deepseek-ai/dsh-tool-call-timeout-policy")
+	cfg.ToolTimeoutPolicyEnabled = &timeoutPolicyEnabled
+	if composed.todoAllowParallel != nil {
+		value := *composed.todoAllowParallel
+		cfg.TodoAllowParallelInProgress = &value
+	}
 	if composed.httpFetchConfig != nil {
 		cfg.HTTPWebFetch = *composed.httpFetchConfig
 	}

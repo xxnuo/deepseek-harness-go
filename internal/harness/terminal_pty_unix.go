@@ -432,6 +432,12 @@ func (operation *localTerminalSendOperation) finish(result TerminalSendResult, e
 	close(operation.done)
 }
 
+func (operation *localTerminalSendOperation) isSettled() bool {
+	operation.mu.Lock()
+	defer operation.mu.Unlock()
+	return operation.settled
+}
+
 type localPTYSession struct {
 	mu           sync.Mutex
 	writeMu      sync.Mutex
@@ -443,6 +449,7 @@ type localPTYSession struct {
 	status       TerminalSessionStatus
 	scrollback   *terminalTextBuffer
 	active       *localTerminalSendOperation
+	interrupting *localTerminalSendOperation
 	closing      bool
 	closeDone    chan struct{}
 	closeErr     error
@@ -521,7 +528,7 @@ func (session *localPTYSession) StartSend(ctx context.Context, request TerminalS
 		return nil, &TerminalError{Code: "SEND_ACTIVE", Message: "PTY session already has an active send"}
 	}
 	var operation *localTerminalSendOperation
-	operation = newLocalTerminalSendOperation(session.config.MaxReadBytes, func() { go session.interrupt(operation) })
+	operation = newLocalTerminalSendOperation(session.config.MaxReadBytes, func() { session.requestInterrupt(operation) })
 	session.active = operation
 	session.resetReadinessLocked()
 	session.mu.Unlock()
@@ -625,7 +632,10 @@ func (session *localPTYSession) settleActive(operation *localTerminalSendOperati
 		session.mu.Unlock()
 		return
 	}
-	session.active = nil
+	retainOwnership := session.interrupting == operation
+	if !retainOwnership {
+		session.active = nil
+	}
 	status := cloneTerminalStatus(session.status)
 	_, scrollbackTruncated := session.scrollback.snapshot()
 	session.mu.Unlock()
@@ -634,6 +644,13 @@ func (session *localPTYSession) settleActive(operation *localTerminalSendOperati
 		Viewport: viewport, WaitReason: reason, SessionStatus: status,
 		Truncated: operationTruncated || scrollbackTruncated,
 	}, nil)
+	if retainOwnership {
+		session.mu.Lock()
+		if session.active == operation && session.interrupting != operation {
+			session.active = nil
+		}
+		session.mu.Unlock()
+	}
 }
 
 func (session *localPTYSession) failActive(operation *localTerminalSendOperation, err error) {
@@ -657,6 +674,25 @@ func (session *localPTYSession) interrupt(operation *localTerminalSendOperation)
 	if _, err := session.Signal(TerminalSignalInterrupt); err != nil {
 		session.failActive(operation, err)
 	}
+	session.mu.Lock()
+	if session.interrupting == operation {
+		session.interrupting = nil
+		if session.active == operation && operation.isSettled() {
+			session.active = nil
+		}
+	}
+	session.mu.Unlock()
+}
+
+func (session *localPTYSession) requestInterrupt(operation *localTerminalSendOperation) {
+	session.mu.Lock()
+	if session.active != operation || session.closing {
+		session.mu.Unlock()
+		return
+	}
+	session.interrupting = operation
+	session.mu.Unlock()
+	go session.interrupt(operation)
 }
 
 func (session *localPTYSession) readLoop() {

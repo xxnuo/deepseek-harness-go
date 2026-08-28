@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,15 +103,18 @@ type composition struct {
 	subagentProviders      []harness.SubagentProvider
 	subagentTools          []harness.SubagentToolConfig
 	subagentReportDelivery string
+	deepSeekWebSearch      *harness.DeepSeekWebSearchConfig
 	exaSearch              *harness.ExaSearchProviderOptions
 	perplexitySearch       *harness.PerplexitySearchProviderOptions
 	storage                *harness.StorageRuntimeConfig
 	fileReference          *harness.FileReferenceConfig
 	agentTeams             *harness.AgentTeamConfig
+	jobs                   harness.JobsConfig
 	clientHMRPollInterval  time.Duration
 	httpFetch              bool
 	httpFetchConfig        *harness.HTTPWebFetchConfig
 	webTools               *harness.WebToolConfig
+	todoAllowParallel      *bool
 	webSearchProvider      string
 	webSearchSet           bool
 	webFetchProvider       string
@@ -765,26 +769,91 @@ func (composition *composition) surface() string {
 
 func (composition *composition) activePluginEntries() []pluginEntry {
 	entries := make([]pluginEntry, 0, len(composition.entries))
-	var walk func(*yaml.Node)
-	walk = func(entry *yaml.Node) {
-		if entry == nil || entry.Kind != yaml.MappingNode || scalarValue(mappingValue(entry, "disabled")) == "true" {
+	var walk func(*yaml.Node, string)
+	walk = func(entry *yaml.Node, parentID string) {
+		if entry == nil || entry.Kind != yaml.MappingNode || profileEntryDisabled(entry) {
 			return
 		}
 		id := scalarValue(mappingValue(entry, "id"))
+		entryID := id
+		if parentID != "" && id != "" {
+			entryID = parentID + ":" + id
+		}
 		name := scalarValue(mappingValue(entry, "name"))
 		if id != "" && name != "" && name != "cordis:group" {
-			entries = append(entries, pluginEntry{id: id, name: name, node: entry})
+			entries = append(entries, pluginEntry{id: entryID, name: name, node: entry})
 		}
 		if scalarValue(mappingValue(entry, "group")) == "true" {
 			if config := mappingValue(entry, "config"); config != nil && config.Kind == yaml.SequenceNode {
 				for _, child := range config.Content {
-					walk(child)
+					walk(child, entryID)
 				}
 			}
 		}
 	}
 	for _, entry := range composition.entries {
-		walk(entry)
+		walk(entry, "")
+	}
+	return entries
+}
+
+// pluginInventoryEntries preserves the composed Host Loader roster for the
+// harness runtime. Unlike activePluginEntries, disabled rows remain visible
+// because Loader inventory reports them with a null Fiber phase.
+func (composition *composition) pluginInventoryEntries() []harness.PluginInventoryEntry {
+	entries := make([]harness.PluginInventoryEntry, 0, len(composition.entries))
+	var walk func(*yaml.Node, bool, string)
+	walk = func(entry *yaml.Node, ancestorDisabled bool, parentID string) {
+		if entry == nil || entry.Kind != yaml.MappingNode {
+			return
+		}
+		id := scalarValue(mappingValue(entry, "id"))
+		entryID := id
+		if parentID != "" && id != "" {
+			entryID = parentID + ":" + id
+		}
+		name := scalarValue(mappingValue(entry, "name"))
+		group := scalarValue(mappingValue(entry, "group")) == "true"
+		rawDisabled := false
+		if node := mappingValue(entry, "disabled"); node != nil {
+			if value, err := profileConfigValue(node); err == nil {
+				if flag, ok := value.(bool); ok {
+					rawDisabled = flag
+				}
+			} else {
+				// Composition validation reports malformed expressions elsewhere;
+				// keep inventory construction total for diagnostics.
+				rawDisabled = scalarValue(node) == "true"
+			}
+		}
+		// The upstream plugin-inventory Remote exposes only non-group Loader
+		// entries. Groups still participate in ancestor disablement and child ID
+		// construction, but the group row itself is not observable.
+		if id != "" && name != "" && !group {
+			disabled := ancestorDisabled || rawDisabled
+			var phase *string
+			if !disabled {
+				value := "active"
+				phase = &value
+			}
+			entries = append(entries, harness.PluginInventoryEntry{
+				EntryID: entryID, ModuleName: name, Enabled: !disabled,
+				FiberPhase: phase,
+				Group:      group,
+			})
+		}
+		if group {
+			if config := mappingValue(entry, "config"); config != nil && config.Kind == yaml.SequenceNode {
+				// EntryTree.entries() walks each nested subtree immediately after
+				// its parent root entry, yielding depth-first Loader order.
+				for _, child := range config.Content {
+					walk(child, ancestorDisabled || rawDisabled, entryID)
+				}
+			}
+		}
+	}
+	for _, entry := range composition.entries {
+		walk(entry, false, "")
 	}
 	return entries
 }
@@ -809,6 +878,15 @@ func (composition *composition) activePluginNames() []string {
 		}
 	}
 	return names
+}
+
+func (composition *composition) pluginEnabled(name string) bool {
+	for _, entry := range composition.activePluginEntries() {
+		if entry.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (composition *composition) validateSupportedPlugins() error {
@@ -1058,12 +1136,12 @@ func (composition *composition) resolveSessionTitleLLMConfig() (*harness.Session
 func (composition *composition) resolveWebConfigs() error {
 	composition.exaSearch = nil
 	composition.perplexitySearch = nil
+	composition.deepSeekWebSearch = nil
 	composition.httpFetch = false
 	composition.httpFetchConfig = nil
 	composition.webTools = nil
 	composition.webSearchProvider, composition.webSearchSet = "", false
 	composition.webFetchProvider, composition.webFetchSet = "", false
-	searchPlugins := map[string]bool{}
 	var webSeen bool
 	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
 		switch name {
@@ -1080,37 +1158,52 @@ func (composition *composition) resolveWebConfigs() error {
 				return fmt.Errorf("web(%s): invalid config: %w", id, err)
 			}
 			if raw.SearchProvider != nil {
-				if *raw.SearchProvider == "" {
-					return fmt.Errorf("web(%s): searchProvider must not be empty when supplied", id)
-				}
 				composition.webSearchProvider, composition.webSearchSet = *raw.SearchProvider, true
 			}
 			if raw.FetchProvider != nil {
-				if *raw.FetchProvider == "" {
-					return fmt.Errorf("web(%s): fetchProvider must not be empty when supplied", id)
-				}
 				composition.webFetchProvider, composition.webFetchSet = *raw.FetchProvider, true
 			}
 		case "@deepseek-ai/dsh-web-search-deepseek":
-			searchPlugins["deepseek-official"] = true
+			if composition.deepSeekWebSearch != nil {
+				return errors.New("web-search-deepseek is configured more than once")
+			}
+			var raw struct {
+				APIKey     *string `json:"apiKey"`
+				APIKeyEnv  *string `json:"apiKeyEnv"`
+				BaseURL    *string `json:"baseURL"`
+				Model      *string `json:"model"`
+				APIVersion *string `json:"apiVersion"`
+				MaxTokens  *int    `json:"maxTokens"`
+				MaxUses    *int    `json:"maxUses"`
+			}
+			if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+				return fmt.Errorf("web-search-deepseek(%s): invalid config: %w", id, err)
+			}
+			if raw.APIKeyEnv != nil && *raw.APIKeyEnv == "" {
+				return fmt.Errorf("web-search-deepseek(%s): apiKeyEnv must not be empty when supplied", id)
+			}
+			if raw.MaxTokens != nil && *raw.MaxTokens <= 0 {
+				return fmt.Errorf("web-search-deepseek(%s): maxTokens must be a positive integer", id)
+			}
+			if raw.MaxUses != nil && *raw.MaxUses <= 0 {
+				return fmt.Errorf("web-search-deepseek(%s): maxUses must be a positive integer", id)
+			}
+			composition.deepSeekWebSearch = &harness.DeepSeekWebSearchConfig{APIKey: raw.APIKey, APIKeyEnv: raw.APIKeyEnv, BaseURL: raw.BaseURL, Model: raw.Model, APIVersion: raw.APIVersion, MaxTokens: raw.MaxTokens, MaxUses: raw.MaxUses}
 		case "@deepseek-ai/dsh-web-search-exa":
 			if composition.exaSearch != nil {
 				return errors.New("web-search-exa is configured more than once")
 			}
 			var raw struct {
 				APIKey              *string `json:"apiKey"`
-				BaseURL             string  `json:"baseURL"`
-				SearchType          string  `json:"searchType"`
+				BaseURL             *string `json:"baseURL"`
+				SearchType          *string `json:"searchType"`
 				NumResults          *int    `json:"numResults"`
 				HighlightsPerResult *int    `json:"highlightsPerResult"`
 			}
 			if err := decodeProfileEntryConfig(entry, &raw); err != nil {
 				return fmt.Errorf("web-search-exa(%s): invalid config: %w", id, err)
 			}
-			if raw.APIKey != nil && *raw.APIKey == "" {
-				return fmt.Errorf("web-search-exa(%s): apiKey must not be empty when supplied", id)
-			}
-			if raw.SearchType != "" && raw.SearchType != "auto" && raw.SearchType != "keyword" && raw.SearchType != "neural" {
+			if raw.SearchType != nil && *raw.SearchType != "auto" && *raw.SearchType != "keyword" && *raw.SearchType != "neural" {
 				return fmt.Errorf("web-search-exa(%s): searchType must be auto, keyword, or neural", id)
 			}
 			if raw.NumResults != nil && *raw.NumResults <= 0 {
@@ -1119,9 +1212,15 @@ func (composition *composition) resolveWebConfigs() error {
 			if raw.HighlightsPerResult != nil && *raw.HighlightsPerResult <= 0 {
 				return fmt.Errorf("web-search-exa(%s): highlightsPerResult must be a positive integer", id)
 			}
-			options := &harness.ExaSearchProviderOptions{BaseURL: raw.BaseURL, SearchType: raw.SearchType}
+			options := &harness.ExaSearchProviderOptions{APIKeyConfigured: raw.APIKey, BaseURLConfigured: raw.BaseURL}
 			if raw.APIKey != nil {
 				options.APIKey = *raw.APIKey
+			}
+			if raw.BaseURL != nil {
+				options.BaseURL = *raw.BaseURL
+			}
+			if raw.SearchType != nil {
+				options.SearchType = *raw.SearchType
 			}
 			if raw.NumResults != nil {
 				options.NumResults = *raw.NumResults
@@ -1130,23 +1229,19 @@ func (composition *composition) resolveWebConfigs() error {
 				options.HighlightsPerResult = *raw.HighlightsPerResult
 			}
 			composition.exaSearch = options
-			searchPlugins["exa"] = true
 		case "@deepseek-ai/dsh-web-search-perplexity":
 			if composition.perplexitySearch != nil {
 				return errors.New("web-search-perplexity is configured more than once")
 			}
 			var raw struct {
 				APIKey        *string `json:"apiKey"`
-				BaseURL       string  `json:"baseURL"`
-				Model         string  `json:"model"`
+				BaseURL       *string `json:"baseURL"`
+				Model         *string `json:"model"`
 				MaxTokens     *int    `json:"maxTokens"`
 				SearchRecency string  `json:"searchRecency"`
 			}
 			if err := decodeProfileEntryConfig(entry, &raw); err != nil {
 				return fmt.Errorf("web-search-perplexity(%s): invalid config: %w", id, err)
-			}
-			if raw.APIKey != nil && *raw.APIKey == "" {
-				return fmt.Errorf("web-search-perplexity(%s): apiKey must not be empty when supplied", id)
 			}
 			if raw.MaxTokens != nil && *raw.MaxTokens <= 0 {
 				return fmt.Errorf("web-search-perplexity(%s): maxTokens must be a positive integer", id)
@@ -1154,15 +1249,20 @@ func (composition *composition) resolveWebConfigs() error {
 			if raw.SearchRecency != "" && raw.SearchRecency != "day" && raw.SearchRecency != "week" && raw.SearchRecency != "month" && raw.SearchRecency != "year" {
 				return fmt.Errorf("web-search-perplexity(%s): searchRecency must be day, week, month, or year", id)
 			}
-			options := &harness.PerplexitySearchProviderOptions{BaseURL: raw.BaseURL, Model: raw.Model, SearchRecency: raw.SearchRecency}
+			options := &harness.PerplexitySearchProviderOptions{APIKeyConfigured: raw.APIKey, BaseURLConfigured: raw.BaseURL, ModelConfigured: raw.Model, SearchRecency: raw.SearchRecency}
 			if raw.APIKey != nil {
 				options.APIKey = *raw.APIKey
+			}
+			if raw.BaseURL != nil {
+				options.BaseURL = *raw.BaseURL
+			}
+			if raw.Model != nil {
+				options.Model = *raw.Model
 			}
 			if raw.MaxTokens != nil {
 				options.MaxTokens = *raw.MaxTokens
 			}
 			composition.perplexitySearch = options
-			searchPlugins["perplexity"] = true
 		case "@deepseek-ai/dsh-web-fetch-http":
 			if composition.httpFetch {
 				return errors.New("web-fetch-http is configured more than once")
@@ -1213,6 +1313,7 @@ func (composition *composition) resolveWebConfigs() error {
 				Search              *bool `json:"search"`
 				Fetch               *bool `json:"fetch"`
 				SearchMaxResults    *int  `json:"searchMaxResults"`
+				SearchMaxQueries    *int  `json:"searchMaxQueries"`
 				FetchTimeoutMS      *int  `json:"fetchTimeoutMs"`
 				SearchTimeoutMS     *int  `json:"searchTimeoutMs"`
 				FetchMaxOutputChars *int  `json:"fetchMaxOutputChars"`
@@ -1231,6 +1332,9 @@ func (composition *composition) resolveWebConfigs() error {
 			if raw.SearchMaxResults != nil {
 				config.SearchMaxResults = *raw.SearchMaxResults
 			}
+			if raw.SearchMaxQueries != nil {
+				config.SearchMaxQueries = *raw.SearchMaxQueries
+			}
 			if raw.FetchTimeoutMS != nil {
 				config.FetchTimeout = time.Duration(*raw.FetchTimeoutMS) * time.Millisecond
 			}
@@ -1240,7 +1344,7 @@ func (composition *composition) resolveWebConfigs() error {
 			if raw.FetchMaxOutputChars != nil {
 				config.FetchMaxOutputChars = *raw.FetchMaxOutputChars
 			}
-			if config.SearchMaxResults < 1 || config.FetchTimeout <= 0 || config.SearchTimeout <= 0 || config.FetchMaxOutputChars < 1 {
+			if config.SearchMaxResults < 1 || config.SearchMaxQueries < 1 || config.FetchTimeout <= 0 || config.SearchTimeout <= 0 || config.FetchMaxOutputChars < 1 {
 				return fmt.Errorf("tool-web(%s): result, timeout, and output limits must be positive integers", id)
 			}
 			composition.webTools = &config
@@ -1250,24 +1354,10 @@ func (composition *composition) resolveWebConfigs() error {
 	if err != nil {
 		return err
 	}
-	if composition.webSearchSet {
-		if !searchPlugins[composition.webSearchProvider] {
-			return fmt.Errorf("web: configured search provider %q is not mounted", composition.webSearchProvider)
-		}
-	} else if len(searchPlugins) == 1 {
-		for provider := range searchPlugins {
-			composition.webSearchProvider, composition.webSearchSet = provider, true
-		}
-	}
-	if composition.webFetchSet && composition.webFetchProvider != "http" {
-		return fmt.Errorf("web: configured fetch provider %q is not implemented by the Go runtime", composition.webFetchProvider)
-	}
-	if composition.webFetchSet && !composition.httpFetch {
-		return fmt.Errorf("web: configured fetch provider %q is not mounted", composition.webFetchProvider)
-	}
-	if !composition.webFetchSet && composition.httpFetch {
-		composition.webFetchProvider, composition.webFetchSet = "http", true
-	}
+	// Provider ids are resolved by the web capability at execution time. The
+	// Loader may compose a profile before a provider is mounted (including a
+	// dynamically contributed id), so composition must preserve the requested
+	// id and defer missing/unavailable/ambiguous diagnostics to search/fetch.
 	return nil
 }
 
@@ -1402,6 +1492,34 @@ func (composition *composition) resolveAgentTeamConfig() (*harness.AgentTeamConf
 		return nil, nil
 	}
 	return &config, nil
+}
+
+func (composition *composition) resolveTodoPolicy() (*bool, error) {
+	var resolved *bool
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-tool-todo" {
+			return nil
+		}
+		if resolved != nil {
+			return errors.New("tool-todo is configured more than once")
+		}
+		config := mappingValue(entry, "config")
+		node := mappingValue(config, "allowParallelInProgress")
+		if node == nil {
+			return fmt.Errorf("tool-todo(%s): allowParallelInProgress is required", id)
+		}
+		value, err := profileConfigValue(node)
+		if err != nil {
+			return fmt.Errorf("tool-todo(%s): invalid config: %w", id, err)
+		}
+		flag, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("tool-todo(%s): allowParallelInProgress must be a boolean", id)
+		}
+		resolved = &flag
+		return nil
+	})
+	return resolved, err
 }
 
 func (composition *composition) resolveSessionPersistence() error {
@@ -1564,6 +1682,9 @@ func (composition *composition) resolveStorageRuntime() (*harness.StorageRuntime
 }
 
 func (composition *composition) validate() error {
+	if err := composition.validateEntryIDs(); err != nil {
+		return err
+	}
 	if err := composition.validateSupportedPlugins(); err != nil {
 		return err
 	}
@@ -1590,6 +1711,11 @@ func (composition *composition) validate() error {
 	if err := composition.resolveWebConfigs(); err != nil {
 		return err
 	}
+	jobs, err := composition.resolveJobsConfig()
+	if err != nil {
+		return err
+	}
+	composition.jobs = jobs
 	fileReference, err := composition.resolveFileReferenceConfig()
 	if err != nil {
 		return err
@@ -1600,6 +1726,11 @@ func (composition *composition) validate() error {
 		return err
 	}
 	composition.agentTeams = agentTeams
+	todoAllowParallel, err := composition.resolveTodoPolicy()
+	if err != nil {
+		return err
+	}
+	composition.todoAllowParallel = todoAllowParallel
 	mcpConfigs, err := composition.resolveMCPConfigs()
 	if err != nil {
 		return err
@@ -1656,11 +1787,51 @@ func (composition *composition) validate() error {
 	return composition.resolveSessionPersistence()
 }
 
+// validateEntryIDs mirrors Loader EntryGroup.update's duplicate-id guard. IDs
+// are unique within a tree; nested groups qualify their children with the
+// owning path, so identical local IDs in separate groups remain distinct.
+func (composition *composition) validateEntryIDs() error {
+	seen := make(map[string]struct{})
+	var walk func(*yaml.Node, string) error
+	walk = func(entry *yaml.Node, parentID string) error {
+		if entry == nil || entry.Kind != yaml.MappingNode {
+			return nil
+		}
+		id := scalarValue(mappingValue(entry, "id"))
+		qualified := id
+		if parentID != "" && id != "" {
+			qualified = parentID + ":" + id
+		}
+		if qualified != "" {
+			if _, exists := seen[qualified]; exists {
+				return fmt.Errorf("dsh: duplicate loader entry id: %s", qualified)
+			}
+			seen[qualified] = struct{}{}
+		}
+		if scalarValue(mappingValue(entry, "group")) == "true" {
+			if config := mappingValue(entry, "config"); config != nil && config.Kind == yaml.SequenceNode {
+				for _, child := range config.Content {
+					if err := walk(child, qualified); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	for _, entry := range composition.entries {
+		if err := walk(entry, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (composition *composition) resolveSubagentProviders() ([]harness.SubagentProvider, error) {
 	var providers []harness.SubagentProvider
 	var walk func(*yaml.Node) error
 	walk = func(entry *yaml.Node) error {
-		if entry == nil || entry.Kind != yaml.MappingNode || scalarValue(mappingValue(entry, "disabled")) == "true" {
+		if entry == nil || entry.Kind != yaml.MappingNode || profileEntryDisabled(entry) {
 			return nil
 		}
 		name := scalarValue(mappingValue(entry, "name"))
@@ -1859,17 +2030,39 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 	var tools []harness.SubagentToolConfig
 	var walk func(*yaml.Node) error
 	walk = func(entry *yaml.Node) error {
-		if entry == nil || entry.Kind != yaml.MappingNode || scalarValue(mappingValue(entry, "disabled")) == "true" {
+		if entry == nil || entry.Kind != yaml.MappingNode || profileEntryDisabled(entry) {
 			return nil
 		}
 		if scalarValue(mappingValue(entry, "name")) == "@deepseek-ai/dsh-tool-subagent" {
 			id := scalarValue(mappingValue(entry, "id"))
 			config := mappingValue(entry, "config")
-			provider := strings.TrimSpace(scalarValue(mappingValue(config, "provider")))
+			provider := ""
+			if node := mappingValue(config, "provider"); node != nil {
+				providerValue, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): provider: %w", id, err)
+				}
+				providerString, ok := providerValue.(string)
+				if !ok {
+					return fmt.Errorf("tool-subagent(%s): provider must be a string", id)
+				}
+				provider = strings.TrimSpace(providerString)
+			}
 			if provider == "" {
 				return fmt.Errorf("tool-subagent(%s): provider is required", id)
 			}
-			mode := scalarValue(mappingValue(config, "backgroundMode"))
+			mode := ""
+			if node := mappingValue(config, "backgroundMode"); node != nil {
+				modeValue, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): backgroundMode: %w", id, err)
+				}
+				modeString, ok := modeValue.(string)
+				if !ok {
+					return fmt.Errorf("tool-subagent(%s): backgroundMode must be a string", id)
+				}
+				mode = modeString
+			}
 			if mode == "" {
 				mode = "one-shot"
 			}
@@ -1879,14 +2072,32 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 			if provider != "spawn" && provider != "fork" && mode != "one-shot" {
 				return fmt.Errorf("tool-subagent(%s): Go external providers support only backgroundMode one-shot", id)
 			}
-			toolName := strings.TrimSpace(scalarValue(mappingValue(config, "toolName")))
+			toolName := ""
+			if node := mappingValue(config, "toolName"); node != nil {
+				toolNameValue, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): toolName: %w", id, err)
+				}
+				toolNameString, ok := toolNameValue.(string)
+				if !ok {
+					return fmt.Errorf("tool-subagent(%s): toolName must be a string", id)
+				}
+				toolName = toolNameString
+			}
+			toolName = strings.TrimSpace(toolName)
 			if toolName == "" {
 				toolName = "subagent"
 			}
 			enabled := true
 			var enabledPtr *bool
 			if node := mappingValue(config, "enableRunInBackground"); node != nil {
-				if err := node.Decode(&enabled); err != nil {
+				value, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): enableRunInBackground: %w", id, err)
+				}
+				var ok bool
+				enabled, ok = value.(bool)
+				if !ok {
 					return fmt.Errorf("tool-subagent(%s): enableRunInBackground must be boolean", id)
 				}
 				enabledPtr = &enabled
@@ -1895,12 +2106,40 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 			if node := mappingValue(config, "maxDepth"); node == nil {
 				value := 3
 				maxDepth = &value
-			} else if scalarValue(node) != "provider-managed" {
-				var value int
-				if err := node.Decode(&value); err != nil || value < 0 {
-					return fmt.Errorf("tool-subagent(%s): maxDepth must be a non-negative integer or provider-managed", id)
+			} else {
+				value, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): maxDepth: %w", id, err)
 				}
-				maxDepth = &value
+				if mode, ok := value.(string); ok && mode == "provider-managed" {
+					// The provider owns recursion enforcement in this mode; keep the
+					// local request field unset instead of rejecting the sentinel.
+					value = nil
+				} else if value == nil {
+					// null is not a supported explicit value; only the
+					// provider-managed string disables the local max-depth fence.
+					return fmt.Errorf("tool-subagent(%s): maxDepth must be a non-negative integer or provider-managed", id)
+				} else {
+					var numeric int
+					switch number := value.(type) {
+					case int:
+						numeric = number
+					case int64:
+						numeric = int(number)
+					case float64:
+						maxInt := float64(^uint(0) >> 1)
+						if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number != math.Trunc(number) || number > maxInt {
+							return fmt.Errorf("tool-subagent(%s): maxDepth must be a non-negative integer or provider-managed", id)
+						}
+						numeric = int(number)
+					default:
+						return fmt.Errorf("tool-subagent(%s): maxDepth must be a non-negative integer or provider-managed", id)
+					}
+					if numeric < 0 {
+						return fmt.Errorf("tool-subagent(%s): maxDepth must be a non-negative integer or provider-managed", id)
+					}
+					maxDepth = &numeric
+				}
 			}
 			var agentOptions *harness.SubagentAgentOptions
 			if node := mappingValue(config, "agentOptions"); node != nil {
@@ -1910,7 +2149,18 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 				}
 				agentOptions = &value
 			}
-			persona := scalarValue(mappingValue(config, "persona"))
+			persona := ""
+			if node := mappingValue(config, "persona"); node != nil {
+				personaValue, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): persona: %w", id, err)
+				}
+				personaString, ok := personaValue.(string)
+				if !ok {
+					return fmt.Errorf("tool-subagent(%s): persona must be a string", id)
+				}
+				persona = personaString
+			}
 			var toolFilter *harness.SubagentToolFilter
 			if node := mappingValue(config, "toolFilter"); node != nil {
 				var value harness.SubagentToolFilter
@@ -1974,6 +2224,69 @@ func (composition *composition) resolveSubagentReportDelivery() (string, error) 
 	return delivery, err
 }
 
+func (composition *composition) resolveJobsConfig() (harness.JobsConfig, error) {
+	config := harness.DefaultConfig().Jobs
+	seen := false
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-tool-jobs" {
+			return nil
+		}
+		if seen {
+			return fmt.Errorf("tool-jobs is configured more than once")
+		}
+		seen = true
+		if err := rejectUnknownConfig(entry, "tool-jobs", "waitTimeoutMs", "maxWaitTimeoutMs", "completionDelivery", "maxConsecutiveWakes"); err != nil {
+			return err
+		}
+		if value, ok := composition.configInt(id, "waitTimeoutMs"); ok {
+			if value < 1 {
+				return fmt.Errorf("tool-jobs(%s): waitTimeoutMs must be a positive integer", id)
+			}
+			config.WaitTimeoutMs = time.Duration(value) * time.Millisecond
+		}
+		if value, ok := composition.configInt(id, "maxWaitTimeoutMs"); ok {
+			if value < 1 {
+				return fmt.Errorf("tool-jobs(%s): maxWaitTimeoutMs must be a positive integer", id)
+			}
+			config.MaxWaitTimeoutMs = time.Duration(value) * time.Millisecond
+		}
+		if value, ok := composition.configInt(id, "maxConsecutiveWakes"); ok {
+			if value < 1 {
+				return fmt.Errorf("tool-jobs(%s): maxConsecutiveWakes must be a positive integer", id)
+			}
+			config.MaxConsecutiveWakes = value
+		}
+		if value, ok := composition.configString(id, "completionDelivery"); ok {
+			if value != "quiet" && value != "wakeup" {
+				return fmt.Errorf("tool-jobs(%s): completionDelivery must be quiet or wakeup", id)
+			}
+			config.CompletionDelivery = value
+		}
+		return nil
+	})
+	return config, err
+}
+
+func rejectUnknownConfig(entry *yaml.Node, plugin string, allowed ...string) error {
+	config := mappingValue(entry, "config")
+	if config == nil {
+		return nil
+	}
+	if config.Kind != yaml.MappingNode {
+		return fmt.Errorf("%s config must be an object", plugin)
+	}
+	known := make(map[string]bool, len(allowed))
+	for _, key := range allowed {
+		known[key] = true
+	}
+	for index := 0; index+1 < len(config.Content); index += 2 {
+		if !known[config.Content[index].Value] {
+			return fmt.Errorf("%s: unknown key %q", plugin, config.Content[index].Value)
+		}
+	}
+	return nil
+}
+
 func profileSubagentCWD(configured *string) (string, error) {
 	if configured == nil {
 		return "", nil
@@ -1998,7 +2311,7 @@ func (composition *composition) resolveMCPConfigs() ([]harness.MCPConfig, error)
 	configs := make([]harness.MCPConfig, 0)
 	var walk func(*yaml.Node) error
 	walk = func(entry *yaml.Node) error {
-		if entry == nil || entry.Kind != yaml.MappingNode || scalarValue(mappingValue(entry, "disabled")) == "true" {
+		if entry == nil || entry.Kind != yaml.MappingNode || profileEntryDisabled(entry) {
 			return nil
 		}
 		if scalarValue(mappingValue(entry, "name")) == "@deepseek-ai/dsh-mcp-client" {
@@ -2070,7 +2383,7 @@ func (composition *composition) resolveLSPConfig() (map[string]harness.LSPStdioC
 	toolSeen := false
 	var walk func(*yaml.Node) error
 	walk = func(entry *yaml.Node) error {
-		if entry == nil || entry.Kind != yaml.MappingNode || scalarValue(mappingValue(entry, "disabled")) == "true" {
+		if entry == nil || entry.Kind != yaml.MappingNode || profileEntryDisabled(entry) {
 			return nil
 		}
 		name := scalarValue(mappingValue(entry, "name"))
@@ -2452,8 +2765,33 @@ func (composition *composition) enabled(id string) bool {
 	if !ok {
 		return false
 	}
-	disabled := mappingValue(entry.node, "disabled")
-	return disabled == nil || isJSExpr(disabled) || scalarValue(disabled) != "true"
+	return !profileEntryDisabled(entry.node)
+}
+
+// profileEntryDisabled evaluates the same disabled expression used by the
+// composed Loader. Validation reports malformed expressions separately; this
+// helper stays total for roster projections and falls back to literal true on
+// an unevaluable value so a broken row is never accidentally activated.
+func profileEntryDisabled(entry *yaml.Node) bool {
+	if entry == nil {
+		return false
+	}
+	node := mappingValue(entry, "disabled")
+	if node == nil {
+		return false
+	}
+	value, err := profileConfigValue(node)
+	if err != nil {
+		// An expression that cannot be evaluated is not an enabled plugin. The
+		// Loader will fail the corresponding fiber; keeping the projection
+		// disabled avoids accidentally activating a broken row meanwhile.
+		return true
+	}
+	flag, ok := value.(bool)
+	if !ok {
+		return true
+	}
+	return flag
 }
 
 func (composition *composition) configString(id, key string) (string, bool) {
@@ -2463,8 +2801,16 @@ func (composition *composition) configString(id, key string) (string, bool) {
 	}
 	config := mappingValue(entry.node, "config")
 	value := mappingValue(config, key)
-	if value == nil || value.Kind != yaml.ScalarNode || isJSExpr(value) {
+	if value == nil || value.Kind != yaml.ScalarNode {
 		return "", false
+	}
+	if isJSExpr(value) {
+		resolved, err := profileConfigValue(value)
+		if err != nil {
+			return "", false
+		}
+		result, ok := resolved.(string)
+		return result, ok && result != ""
 	}
 	return value.Value, value.Value != ""
 }
@@ -2476,7 +2822,25 @@ func (composition *composition) configInt(id, key string) (int, bool) {
 	}
 	config := mappingValue(entry.node, "config")
 	value := mappingValue(config, key)
-	if value == nil || value.Kind != yaml.ScalarNode || isJSExpr(value) {
+	if value == nil || value.Kind != yaml.ScalarNode {
+		return 0, false
+	}
+	if isJSExpr(value) {
+		resolved, err := profileConfigValue(value)
+		if err != nil {
+			return 0, false
+		}
+		switch number := resolved.(type) {
+		case int:
+			return number, true
+		case int64:
+			return int(number), true
+		case float64:
+			if number != math.Trunc(number) || number < float64(^uint(0)>>1)*-1-1 || number > float64(^uint(0)>>1) {
+				return 0, false
+			}
+			return int(number), true
+		}
 		return 0, false
 	}
 	var result int
@@ -2497,7 +2861,27 @@ func (composition *composition) configInts(id, key string) ([]int, bool) {
 	}
 	result := make([]int, len(value.Content))
 	for index, item := range value.Content {
-		if item.Decode(&result[index]) != nil {
+		if isJSExpr(item) {
+			resolved, err := profileConfigValue(item)
+			if err != nil {
+				return nil, false
+			}
+			var number float64
+			switch value := resolved.(type) {
+			case int:
+				number = float64(value)
+			case int64:
+				number = float64(value)
+			case float64:
+				number = value
+			default:
+				return nil, false
+			}
+			if number != math.Trunc(number) {
+				return nil, false
+			}
+			result[index] = int(number)
+		} else if item.Decode(&result[index]) != nil {
 			return nil, false
 		}
 	}
@@ -2515,10 +2899,21 @@ func (composition *composition) configStrings(id, key string) ([]string, bool) {
 	}
 	result := make([]string, len(value.Content))
 	for index, item := range value.Content {
-		if item.Kind != yaml.ScalarNode || isJSExpr(item) {
+		if item.Kind != yaml.ScalarNode {
 			return nil, false
 		}
-		result[index] = item.Value
+		if isJSExpr(item) {
+			resolved, err := profileConfigValue(item)
+			if err != nil {
+				return nil, false
+			}
+			result[index], _ = resolved.(string)
+			if result[index] == "" {
+				return nil, false
+			}
+		} else {
+			result[index] = item.Value
+		}
 	}
 	return result, true
 }

@@ -76,6 +76,40 @@ func TestSessionTitleAllPromptsRunsOnUnchangedRoute(t *testing.T) {
 	}
 }
 
+func TestApplyRuntimeConfigReconcilesSessionTitleProvider(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Persist = false
+	cfg.SessionTitleLLM.Enabled = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	if e.titleProvider != nil {
+		t.Fatal("title provider unexpectedly enabled")
+	}
+	next := cfg
+	next.SessionTitleLLM = defaultSessionTitleLLMConfig()
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	e.titleMu.Lock()
+	if e.titleProvider == nil {
+		e.titleMu.Unlock()
+		t.Fatal("title provider was not mounted")
+	}
+	e.titleMu.Unlock()
+	if err := e.ApplyRuntimeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	e.titleMu.Lock()
+	deferred := e.titleProvider
+	e.titleMu.Unlock()
+	if deferred != nil {
+		t.Fatal("disabled title provider survived runtime update")
+	}
+}
+
 func waitSessionTitle(t *testing.T, engine *Engine, id string, predicate func(SessionTitleSnapshot) bool) SessionTitleSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

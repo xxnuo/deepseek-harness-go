@@ -1108,6 +1108,9 @@ func renderLSPMarkedString(value any) (string, error) {
 }
 
 func (e *Engine) EnableLSPTool(config LSPToolConfig) error {
+	if !e.hostPluginActive("@deepseek-ai/dsh-tool-lsp") {
+		return nil
+	}
 	config.Enabled = true
 	if config.MaxLocations == 0 {
 		config.MaxLocations = defaultLSPMaxLocations

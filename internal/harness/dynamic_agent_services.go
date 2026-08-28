@@ -427,7 +427,18 @@ func (e *Engine) dynamicCordisAgentValue(run *dynamicCordisRun, session *Session
 		return e.dynamicCordisAgentMaintenance(run, session, task)
 	})
 	_ = agent.Set("cancel", func(call goja.FunctionCall) goja.Value {
+		cause := AgentCancelCause{Kind: "user"}
 		keepInbox := false
+		if value := call.Argument(0); value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+			if object, ok := value.(*goja.Object); ok {
+				if kind := object.Get("kind"); kind != nil && !goja.IsUndefined(kind) && !goja.IsNull(kind) {
+					cause.Kind = kind.String()
+					if reason := object.Get("reason"); reason != nil && !goja.IsUndefined(reason) && !goja.IsNull(reason) {
+						cause.Reason = reason.String()
+					}
+				}
+			}
+		}
 		if options := call.Argument(1); options != nil && !goja.IsUndefined(options) && !goja.IsNull(options) {
 			if object, ok := options.(*goja.Object); ok {
 				keepInbox = object.Get("keepInbox").ToBoolean()
@@ -442,7 +453,7 @@ func (e *Engine) dynamicCordisAgentValue(run *dynamicCordisRun, session *Session
 				}
 			}
 		}
-		if err := e.dynamicCordisCancelAgent(id, keepInbox); err != nil {
+		if err := e.CancelAgent(id, cause, CancelAgentOptions{KeepInbox: keepInbox}); err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return goja.Undefined()
@@ -466,59 +477,7 @@ func (e *Engine) dynamicCordisAgentSnapshot(run *dynamicCordisRun, id string) (*
 }
 
 func (e *Engine) dynamicCordisCancelAgent(id string, keepInbox bool) error {
-	if keepInbox {
-		return e.CancelSession(id)
-	}
-	session, err := e.getSession(id)
-	if err != nil {
-		return err
-	}
-	session.mu.Lock()
-	var events []Event
-	if len(session.pending) > 0 {
-		event, appendErr := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-turn", "start": 0, "removedCount": len(session.pending), "inserted": []any{}, "outcome": "canceled",
-		}, nil, nil, false)
-		if appendErr != nil {
-			session.mu.Unlock()
-			return appendErr
-		}
-		events = append(events, event)
-	}
-	if len(session.steering) > 0 {
-		event, appendErr := appendEventLocked(session, "agent/inbox/spliced", map[string]any{
-			"target": "next-step", "start": 0, "removedCount": len(session.steering), "inserted": []any{}, "outcome": "canceled",
-		}, nil, nil, false)
-		if appendErr != nil {
-			session.mu.Unlock()
-			return appendErr
-		}
-		events = append(events, event)
-	}
-	pending := append(append([]*queuedPrompt(nil), session.pending...), session.steering...)
-	session.pending = nil
-	session.steering = nil
-	cancel := session.Cancel
-	maintenanceCancel := session.maintenanceCancel
-	session.mu.Unlock()
-	for _, event := range events {
-		e.publishEvent(id, event)
-	}
-	if len(events) > 0 {
-		e.emitQueue(session)
-	}
-	for _, item := range pending {
-		if item.done != nil {
-			item.done <- promptOutcome{err: context.Canceled}
-		}
-	}
-	if cancel != nil {
-		cancel()
-	}
-	if maintenanceCancel != nil {
-		maintenanceCancel()
-	}
-	return nil
+	return e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{KeepInbox: keepInbox})
 }
 
 type dynamicCordisAgentMessage struct {

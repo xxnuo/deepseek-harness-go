@@ -24,6 +24,8 @@ const (
 	invariantPackageTimeContext     = "@deepseek-ai/dsh-time-context"
 	invariantPackagePermission      = "@deepseek-ai/dsh-permission-presets"
 	invariantPackageGoal            = "@deepseek-ai/dsh-goal"
+	invariantPackageSchedule        = "@deepseek-ai/dsh-schedule"
+	invariantPackageAgentTeam       = "@deepseek-ai/dsh-experimental-agent-team"
 	invariantPackageAgentLoop       = "@deepseek-ai/dsh-agent-loop"
 	invariantPackageSessionRef      = "@deepseek-ai/dsh-session-reference"
 	invariantPackageTmuxContext     = "@deepseek-ai/dsh-tmux-context"
@@ -413,6 +415,18 @@ func (e *Engine) installRuntimeInvariants() error {
 		{invariantPackageToolWeb, func(*InvariantScope, InvariantFailure) error { return nil }},
 		{invariantPackageWebFetchHTTP, func(*InvariantScope, InvariantFailure) error { return nil }},
 	}
+	if e.cfg.ScheduleEnabled {
+		registrations = append(registrations, struct {
+			packageName string
+			installer   InvariantInstaller
+		}{invariantPackageSchedule, installScheduleInvariant})
+	}
+	if e.cfg.AgentTeams != nil {
+		registrations = append(registrations, struct {
+			packageName string
+			installer   InvariantInstaller
+		}{invariantPackageAgentTeam, installTeamInvariant})
+	}
 	for _, registration := range registrations {
 		if _, err := e.invariants.Register(registration.packageName, registration.installer); err != nil {
 			return err
@@ -756,6 +770,20 @@ func installGoalInvariant(scope *InvariantScope, fail InvariantFailure) error {
 				seq = events[len(events)-1].Seq
 			}
 			return fail(fmt.Sprintf("session event %d violates the durable goal stream: %s", seq, err))
+		}
+		return nil
+	})
+	return nil
+}
+
+func installTeamInvariant(scope *InvariantScope, fail InvariantFailure) error {
+	scope.CheckSessions(func(header SessionHeader, events []Event) error {
+		if _, err := foldTeam(header.ID, events); err != nil {
+			seq := -1
+			if len(events) > 0 {
+				seq = events[len(events)-1].Seq
+			}
+			return fail(fmt.Sprintf("session event %d violates the Agent Teams stream: %s", seq, err))
 		}
 		return nil
 	})

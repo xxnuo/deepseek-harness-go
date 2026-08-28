@@ -39,6 +39,9 @@ func subagentReportTool(e *Engine) Tool {
 			if err := decodeToolArguments(call, &in); err != nil {
 				return ToolResult{}, err
 			}
+			if err := ctx.Err(); err != nil {
+				return ToolResult{}, err
+			}
 			messageID, err := e.ReportFromSubagent(ctx, call.SessionID, []ContentBlock{{Type: "text", Text: in.Output}}, "")
 			if err != nil {
 				return ToolResult{}, err
@@ -85,6 +88,9 @@ func (e *Engine) RegisterSubagentTool(config SubagentToolConfig) error {
 		return errors.New("tool-subagent: toolFilter must name allow or deny tools")
 	}
 	if config.Provider == "spawn" || config.Provider == "fork" {
+		if _, err := e.ensureInProcessSubagentProvider(config.Provider); err != nil {
+			return err
+		}
 		return e.RegisterTool(inProcessSubagentTool(e, config, config.Provider == "fork"))
 	}
 	if config.BackgroundMode != "one-shot" {
@@ -124,7 +130,8 @@ func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentT
 		properties["run_in_background"] = map[string]any{"type": "boolean", "description": "Whether to run as a background job and return its id. Defaults to false; collect with job_output or stop with job_kill."}
 	}
 	return Tool{
-		Schema: ToolSchema{Name: config.ToolName, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
+		Schema:            ToolSchema{Name: config.ToolName, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
+		IsConcurrencySafe: alwaysConcurrencySafe,
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
@@ -142,7 +149,7 @@ func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentT
 			}
 			request := SubagentStartRequest{
 				ParentSessionID: call.SessionID, CWD: call.Workspace,
-				Prompt:   []ContentBlock{{Type: "text", Text: in.Prompt}},
+				Label: in.Description, Prompt: []ContentBlock{{Type: "text", Text: in.Prompt}},
 				MaxDepth: config.MaxDepth, AgentOptions: config.AgentOptions,
 				Persona: config.Persona, ToolFilter: config.ToolFilter,
 			}

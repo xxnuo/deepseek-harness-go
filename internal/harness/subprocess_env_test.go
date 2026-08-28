@@ -1,6 +1,9 @@
 package harness
 
 import (
+	"context"
+	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -24,5 +27,58 @@ func TestScrubbedChildEnvDropsAmbientCredentialsAndAllowsExplicitValues(t *testi
 		if !strings.Contains(env, present) {
 			t.Fatalf("child environment missed %q:\n%s", present, env)
 		}
+	}
+}
+
+func TestBuiltinShellRejectsEmptyDescription(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Workspace = cfg.DataDir
+	cfg.Provider, cfg.Model = "echo", "echo"
+	cfg.SessionTitleLLM.Enabled = false
+	cfg.Persist = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	args, _ := json.Marshal(map[string]any{"command": "true", "description": "   "})
+	_, err = e.tools["bash"].Execute(context.Background(), ToolCall{Name: "bash", Workspace: cfg.Workspace, Arguments: args})
+	if err == nil || !strings.Contains(err.Error(), "invalid description") {
+		t.Fatalf("empty description error = %v", err)
+	}
+}
+
+func TestShellEnvironmentForSessionUsesTrustedIdentityAndJSONLLocation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.Workspace = cfg.DataDir
+	cfg.Provider, cfg.Model = "echo", "echo"
+	cfg.SessionTitleLLM.Enabled = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	id, err := e.CreateSession(context.Background(), cfg.Workspace, "env", "standard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	location, ok := e.sessionStore.Locate(session.Header)
+	if !ok || location.Kind != "jsonl" {
+		t.Fatalf("session location = %#v, %v", location, ok)
+	}
+	t.Setenv("DSH_SESSION_ID", "ambient-stale")
+	env := e.shellEnvironmentForSession(id)
+	if env["DSH_HOME"] != cfg.DataDir || env["DSH_SHELL"] != "1" || env["DSH_SESSION_ID"] != id || env["DSH_SESSION_JSONL"] != filepath.Clean(location.Path) {
+		t.Fatalf("trusted shell environment = %#v", env)
+	}
+	clean := strings.Join(scrubbedChildEnv(env), "\n")
+	if strings.Contains(clean, "DSH_SESSION_ID=ambient-stale") {
+		t.Fatal("ambient session identity leaked")
 	}
 }

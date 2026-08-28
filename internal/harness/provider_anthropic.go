@@ -40,6 +40,15 @@ func NewAnthropicProvider(id, baseURL, apiKey, model string) *AnthropicProvider 
 
 func (p *AnthropicProvider) ID() string   { return p.id }
 func (p *AnthropicProvider) Name() string { return p.id }
+func (p *AnthropicProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, err
+	}
+	if model != p.model {
+		return ModelInfo{}, fmt.Errorf("model %q is unavailable", model)
+	}
+	return ModelInfo{ID: model, Name: model, InputModalities: []string{"text", "image"}}, nil
+}
 func (p *AnthropicProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

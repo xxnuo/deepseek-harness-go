@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -464,7 +467,10 @@ func (c *MCPConnection) bridgeTool(session *mcp.ClientSession, publicName, rawNa
 			if err != nil {
 				return ToolResult{}, err
 			}
-			projected := projectMCPContent(ctx, c.engine, call, rawName, content)
+			projected, err := projectMCPContent(ctx, c.engine, call, rawName, content)
+			if err != nil {
+				return ToolResult{}, err
+			}
 			if result.IsError {
 				return ToolResult{}, errors.New(mcpContentText(projected))
 			}
@@ -490,8 +496,11 @@ func canonicalMCPResult(result *mcp.CallToolResult) (map[string]any, []any, erro
 	return value, content, nil
 }
 
-func projectMCPContent(ctx context.Context, engine *Engine, call ToolCall, toolName string, content []any) []ContentBlock {
-	images, imageErr := prepareMCPImages(ctx, engine, call, content)
+func projectMCPContent(ctx context.Context, engine *Engine, call ToolCall, toolName string, content []any) ([]ContentBlock, error) {
+	images, imageDiagnostics, err := prepareMCPImages(ctx, engine, call, content)
+	if err != nil {
+		return nil, err
+	}
 	blocks := make([]ContentBlock, 0, len(content))
 	text := make([]string, 0)
 	flush := func() {
@@ -514,12 +523,12 @@ func projectMCPContent(ctx context.Context, engine *Engine, call ToolCall, toolN
 			}
 		case "image":
 			flush()
-			if imageErr != nil {
+			if imageDiagnostic := imageDiagnostics[index]; imageDiagnostic != "" {
 				media, _ := block["mimeType"].(string)
 				if media == "" {
 					media = "unknown media type"
 				}
-				blocks = append(blocks, ContentBlock{Type: "text", Text: fmt.Sprintf("[image unavailable: %s; %s; raw image data remains available to programmatic callers]", media, imageErr)})
+				blocks = append(blocks, ContentBlock{Type: "text", Text: fmt.Sprintf("[image unavailable: %s; %s; raw image data remains available to programmatic callers]", media, imageDiagnostic)})
 			} else if image := images[index]; image != nil {
 				blocks = append(blocks, ContentBlock{Type: "image", Attachment: image})
 			}
@@ -545,46 +554,133 @@ func projectMCPContent(ctx context.Context, engine *Engine, call ToolCall, toolN
 	}
 	flush()
 	if len(blocks) == 0 {
-		return []ContentBlock{{Type: "text", Text: fmt.Sprintf("(%s returned no model-visible content)", toolName)}}
+		return []ContentBlock{{Type: "text", Text: fmt.Sprintf("(%s returned no model-visible content)", toolName)}}, nil
 	}
-	return blocks
+	return blocks, nil
 }
 
-func prepareMCPImages(ctx context.Context, engine *Engine, call ToolCall, content []any) (map[int]*ImageAttachmentRef, error) {
-	prepared := map[int]preparedImage{}
-	total := 0
+func prepareMCPImages(ctx context.Context, engine *Engine, call ToolCall, content []any) (map[int]*ImageAttachmentRef, map[int]string, error) {
+	decoded := make([]*decodedImageInput, len(content))
+	imageIndexes := make([]int, 0)
+	diagnostics := make(map[int]string)
 	for index, value := range content {
 		block, ok := value.(map[string]any)
 		if !ok || block["type"] != "image" {
 			continue
 		}
+		imageIndexes = append(imageIndexes, index)
 		media, _ := block["mimeType"].(string)
 		data, _ := block["data"].(string)
-		image, err := prepareImage(media, data, "")
-		if err != nil {
-			return nil, err
+		if imageExtension(media) == "" {
+			diagnostics[index] = "the declared media type is not PNG, JPEG, WebP, or GIF"
+			continue
 		}
-		prepared[index] = image
-		total += len(image.data)
+		decodedBytes, err := base64.StdEncoding.DecodeString(data)
+		if err != nil || base64.StdEncoding.EncodeToString(decodedBytes) != data {
+			diagnostics[index] = "the image data is not canonical base64"
+			continue
+		}
+		input := decodedImageInput{mediaType: media, data: decodedBytes}
+		decoded[index] = &input
 	}
-	if len(prepared) == 0 {
-		return nil, nil
+	if len(imageIndexes) == 0 {
+		return nil, diagnostics, nil
 	}
-	if err := imageModelSupportsInput(ctx, engine, call); err != nil {
-		return nil, err
+	if len(diagnostics) > 0 {
+		for _, index := range imageIndexes {
+			if diagnostics[index] == "" {
+				diagnostics[index] = "another image in the same result was invalid"
+			}
+		}
+		return nil, diagnostics, nil
 	}
-	if len(prepared) > maxImagesPerMessage || total > maxMessageImageBytes {
-		return nil, errors.New("image batch exceeds the configured limit")
+	selection, routeErr := imageModelSelection(engine, call)
+	if routeErr != nil {
+		reason := "the current model route could not be resolved"
+		for _, index := range imageIndexes {
+			diagnostics[index] = reason
+		}
+		return nil, diagnostics, nil
+	}
+	model, routeErr := resolveExactModelInfo(ctx, engine, selection)
+	if routeErr != nil {
+		if ctx.Err() != nil {
+			return nil, nil, context.Cause(ctx)
+		}
+		reason := "the current model route could not be verified"
+		if errors.Is(routeErr, errImageRouteUnresolved) {
+			reason = "the current model route could not be resolved"
+		}
+		for _, index := range imageIndexes {
+			diagnostics[index] = reason
+		}
+		return nil, diagnostics, nil
+	}
+	if !containsString(model.InputModalities, "image") {
+		for _, index := range imageIndexes {
+			diagnostics[index] = fmt.Sprintf("model %q does not declare image input", selection.Model)
+		}
+		return nil, diagnostics, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, context.Cause(ctx)
+	}
+	if err := validateDecodedImageBatch(decoded, maxImagesPerMessage, maxMessageImageBytes); err != nil {
+		for _, index := range imageIndexes {
+			diagnostics[index] = "image admission rejected the result: " + err.Error()
+		}
+		return nil, diagnostics, nil
+	}
+	prepared, err := engine.prepareDecodedImageBatch(ctx, decoded)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, context.Cause(ctx)
+		}
+		reason := "durable image storage rejected the result"
+		if isImageAdmissionFailure(err) {
+			reason = "image admission rejected the result: " + err.Error()
+		}
+		for _, index := range imageIndexes {
+			diagnostics[index] = reason
+		}
+		return nil, diagnostics, nil
 	}
 	refs := map[int]*ImageAttachmentRef{}
-	for index, image := range prepared {
-		if err := engine.storePreparedImage(image); err != nil {
-			return nil, err
+	for _, index := range imageIndexes {
+		image := prepared[index]
+		if image == nil {
+			continue
+		}
+		if err := engine.storePreparedImage(*image); err != nil {
+			for _, imageIndex := range imageIndexes {
+				diagnostics[imageIndex] = "durable image storage rejected the result"
+			}
+			return nil, diagnostics, nil
 		}
 		ref := image.ref
 		refs[index] = &ref
 	}
-	return refs, nil
+	if err := ctx.Err(); err != nil {
+		return nil, nil, context.Cause(ctx)
+	}
+	return refs, diagnostics, nil
+}
+
+func isImageAdmissionFailure(err error) bool {
+	var marked *imageAdmissionFailure
+	if errors.As(err, &marked) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"image batch exceeds", "unsupported image media type", "image is empty", "image exceeds",
+		"image data is malformed", "declared image media type", "image cannot be encoded",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func mcpContentText(content []ContentBlock) string {
@@ -655,4 +751,76 @@ func closeMCPConnections(engine *Engine) {
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+}
+
+func mcpConnectionsSnapshot(engine *Engine) map[string]*MCPConnection {
+	mcpConnections.Lock()
+	defer mcpConnections.Unlock()
+	result := map[string]*MCPConnection{}
+	for name, connection := range mcpConnections.byEngine[engine] {
+		result[name] = connection
+	}
+	return result
+}
+
+// reconcileMCPServers applies profile-owned MCP rows by stable serverName.
+// Existing equal connections keep their sessions and discovered tools; a
+// changed or removed row is closed before its replacement is connected.
+func (e *Engine) reconcileMCPServers(ctx context.Context, desired []MCPConfig) error {
+	want := make(map[string]MCPConfig, len(desired))
+	for _, raw := range desired {
+		config, _, err := normalizeMCPConfig(raw)
+		if err != nil {
+			return err
+		}
+		if _, exists := want[config.ServerName]; exists {
+			return fmt.Errorf("mcp-client: serverName %q is configured more than once", config.ServerName)
+		}
+		want[config.ServerName] = config
+	}
+	current := mcpConnectionsSnapshot(e)
+	closed := make(map[string]MCPConfig)
+	for name, connection := range current {
+		config, _, _ := normalizeMCPConfig(connection.config)
+		candidate, keep := want[name]
+		if keep && reflect.DeepEqual(config, candidate) {
+			delete(want, name)
+			continue
+		}
+		closed[name] = config
+		if err := connection.Close(); err != nil {
+			return err
+		}
+	}
+	added := make([]*MCPConnection, 0, len(want))
+	names := make([]string, 0, len(want))
+	for name := range want {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		config := want[name]
+		connection, err := e.ConnectMCP(ctx, config)
+		if err != nil {
+			rollbackErrs := []error{err}
+			for _, candidate := range added {
+				if closeErr := candidate.Close(); closeErr != nil {
+					rollbackErrs = append(rollbackErrs, closeErr)
+				}
+			}
+			closedNames := make([]string, 0, len(closed))
+			for previousName := range closed {
+				closedNames = append(closedNames, previousName)
+			}
+			sort.Strings(closedNames)
+			for _, previousName := range closedNames {
+				if _, restoreErr := e.ConnectMCP(context.Background(), closed[previousName]); restoreErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("restore MCP server %q: %w", previousName, restoreErr))
+				}
+			}
+			return errors.Join(rollbackErrs...)
+		}
+		added = append(added, connection)
+	}
+	return nil
 }

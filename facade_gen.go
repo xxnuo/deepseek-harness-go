@@ -300,6 +300,8 @@ type ACPSubagentProvider = core.ACPSubagentProvider
 
 type ActiveFileReferenceToken = core.ActiveFileReferenceToken
 
+type AgentCancelCause = core.AgentCancelCause
+
 type AgentPresetConflictError = core.AgentPresetConflictError
 
 type AgentRequestInvariant = core.AgentRequestInvariant
@@ -348,6 +350,8 @@ type BootEntry = core.BootEntry
 
 type BootGraph = core.BootGraph
 
+type CancelAgentOptions = core.CancelAgentOptions
+
 type ChatContentPart = core.ChatContentPart
 
 type ChatImage = core.ChatImage
@@ -379,6 +383,8 @@ type Completion = core.Completion
 type Config = core.Config
 
 type ContentBlock = core.ContentBlock
+
+type ContinuableSubagentSetup = core.ContinuableSubagentSetup
 
 type CordisInspectMethodManifest = core.CordisInspectMethodManifest
 
@@ -435,6 +441,8 @@ type DeepSeekFilesError = core.DeepSeekFilesError
 type DeepSeekUploadIndex = core.DeepSeekUploadIndex
 
 type DeepSeekUploadRecord = core.DeepSeekUploadRecord
+
+type DeepSeekWebSearchConfig = core.DeepSeekWebSearchConfig
 
 type Delta = core.Delta
 
@@ -548,6 +556,8 @@ type ExaSearchProvider = core.ExaSearchProvider
 
 type ExaSearchProviderOptions = core.ExaSearchProviderOptions
 
+type ExactModelInfoResolver = core.ExactModelInfoResolver
+
 type FileReferenceCandidate = core.FileReferenceCandidate
 
 type FileReferenceConfig = core.FileReferenceConfig
@@ -616,6 +626,8 @@ type JSONStorageBackend = core.JSONStorageBackend
 
 type JSONStorageConfig = core.JSONStorageConfig
 
+type JobsConfig = core.JobsConfig
+
 type KVFacet = core.KVFacet
 
 type KVSnapshot = core.KVSnapshot
@@ -677,6 +689,8 @@ type ParsedSessionReferenceText = core.ParsedSessionReferenceText
 type PerplexitySearchProvider = core.PerplexitySearchProvider
 
 type PerplexitySearchProviderOptions = core.PerplexitySearchProviderOptions
+
+type PluginInventoryEntry = core.PluginInventoryEntry
 
 type PreparedSessionReferenceMessage = core.PreparedSessionReferenceMessage
 
@@ -770,6 +784,8 @@ type SessionInvariant = core.SessionInvariant
 
 type SessionLocation = core.SessionLocation
 
+type SessionPersistenceFlusher = core.SessionPersistenceFlusher
+
 type SessionPersistenceRevision = core.SessionPersistenceRevision
 
 type SessionPersistenceSnapshot = core.SessionPersistenceSnapshot
@@ -860,6 +876,8 @@ type SubagentAgentOptions = core.SubagentAgentOptions
 
 type SubagentCapabilities = core.SubagentCapabilities
 
+type SubagentDescriptorData = core.SubagentDescriptorData
+
 type SubagentProvider = core.SubagentProvider
 
 type SubagentProviderInfo = core.SubagentProviderInfo
@@ -867,6 +885,8 @@ type SubagentProviderInfo = core.SubagentProviderInfo
 type SubagentResult = core.SubagentResult
 
 type SubagentRun = core.SubagentRun
+
+type SubagentServiceError = core.SubagentServiceError
 
 type SubagentStartRequest = core.SubagentStartRequest
 
@@ -944,13 +964,25 @@ type ToolCallDelta = core.ToolCallDelta
 
 type ToolConstrainedSampling = core.ToolConstrainedSampling
 
+type ToolContentFinalizer = core.ToolContentFinalizer
+
+type ToolContext = core.ToolContext
+
 type ToolError = core.ToolError
 
 type ToolExecutor = core.ToolExecutor
 
+type ToolOutputRenderer = core.ToolOutputRenderer
+
+type ToolPresentationMeta = core.ToolPresentationMeta
+
 type ToolResult = core.ToolResult
 
 type ToolResultPruneConfig = core.ToolResultPruneConfig
+
+type ToolRunContext = core.ToolRunContext
+
+type ToolRuntimeExecutor = core.ToolRuntimeExecutor
 
 type ToolSchema = core.ToolSchema
 
@@ -1036,6 +1068,10 @@ func FoldSessionTitle(events []Event) (SessionTitleSnapshot, bool) {
 	return core.FoldSessionTitle(events)
 }
 
+func FoldSubagentDescriptor(events []Event) (*SubagentDescriptorData, error) {
+	return core.FoldSubagentDescriptor(events)
+}
+
 func FoldTeam(rootID string, events []Event) (TeamFold, error) {
 	return core.FoldTeam(rootID, events)
 }
@@ -1078,6 +1114,10 @@ func IsSessionReferenceError(err error, code SessionReferenceErrorCode) bool {
 
 func IsStorageError(err error, code StorageErrorCode) bool {
 	return core.IsStorageError(err, code)
+}
+
+func IsSubagentServiceError(err error, code string) bool {
+	return core.IsSubagentServiceError(err, code)
 }
 
 func JSONDomainParser[T any](validate func(T) error) DomainValueParser {
@@ -1302,6 +1342,10 @@ func SearchWorkspaceFileReferences(ctx context.Context, root, rawQuery string, c
 
 func SessionProjectKey(cwd string) string {
 	return core.SessionProjectKey(cwd)
+}
+
+func SnapshotSubagentDescriptor(input SubagentDescriptorData) (SubagentDescriptorData, error) {
+	return core.SnapshotSubagentDescriptor(input)
 }
 
 func SummarizeHookStderr(stderr string, maxChars int) string {
