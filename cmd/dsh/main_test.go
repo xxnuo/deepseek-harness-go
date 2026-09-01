@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -283,6 +284,131 @@ func TestCompositionPluginInventoryUsesLoaderOrderAndEffectiveDisablement(t *tes
 	}
 }
 
+func TestCompositionPluginInventoryCarriesPackageProvenance(t *testing.T) {
+	profileDir := t.TempDir()
+	packageDir := filepath.Join(profileDir, "node_modules", "@example", "active")
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(`{"name":"@example/active","version":"1.2.3"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	relativeDir := filepath.Join(profileDir, "relative")
+	if err := os.MkdirAll(relativeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(relativeDir, "package.json"), []byte(`{"name":"profile-relative","version":"4.5.6"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(relativeDir, "plugin.js"), []byte("module.exports = {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(`
+- id: active
+  name: '@example/active/plugin'
+- id: relative
+  name: './relative/plugin.js'
+- id: builtin
+  name: '@deepseek-ai/dsh-builtin/subpath'
+- id: disabled
+  name: '@example/active/plugin'
+  disabled: true
+`), &document); err != nil {
+		t.Fatal(err)
+	}
+	composed := &composition{
+		entries: document.Content[0].Content, profileDir: profileDir,
+		packageIdentities: map[string]profilePackageIdentity{
+			"@deepseek-ai/dsh-builtin": {name: "@deepseek-ai/dsh-builtin", version: "0.1.2-alpha.1"},
+		},
+	}
+	entries := composed.pluginInventoryEntries()
+	if len(entries) != 4 {
+		t.Fatalf("inventory = %#v", entries)
+	}
+	want := []struct {
+		name, version string
+	}{
+		{"@example/active", "1.2.3"},
+		{"profile-relative", "4.5.6"},
+		{"@deepseek-ai/dsh-builtin", "0.1.2-alpha.1"},
+		{"@example/active", "1.2.3"},
+	}
+	for index, expected := range want {
+		if entries[index].PackageName != expected.name || entries[index].PackageVersion != expected.version {
+			t.Fatalf("inventory[%d] provenance = %#v, want %q@%q", index, entries[index], expected.name, expected.version)
+		}
+	}
+	if entries[0].FiberPhase == nil || entries[1].FiberPhase == nil || entries[2].FiberPhase == nil || entries[3].FiberPhase != nil || entries[3].Enabled {
+		t.Fatalf("inventory lifecycle = %#v", entries)
+	}
+}
+
+func TestScanPackageIdentitiesUsesWorkspaceAndVendorPackages(t *testing.T) {
+	upstream := t.TempDir()
+	writeManifest := func(relative, name, version string) {
+		t.Helper()
+		dir := filepath.Join(upstream, "packages", filepath.FromSlash(relative))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(map[string]any{"name": name, "version": version})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "package.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeManifest("tool/bash", "@deepseek-ai/dsh-tool-bash", "0.1.2-alpha.1")
+	writeManifest("node_modules/shadow", "shadow", "9.9.9")
+	vendorDir := filepath.Join(upstream, "vendor", "timer")
+	if err := os.MkdirAll(vendorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vendorDir, "package.json"), []byte(`{"name":"@deepseek-ai/cordis-plugin-timer","version":"1.1.3"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	identities, err := scanPackageIdentities(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := identities["@deepseek-ai/dsh-tool-bash"]; got != (profilePackageIdentity{name: "@deepseek-ai/dsh-tool-bash", version: "0.1.2-alpha.1"}) {
+		t.Fatalf("workspace identity = %#v", got)
+	}
+	if _, ok := identities["shadow"]; ok {
+		t.Fatalf("node_modules identity leaked into provenance: %#v", identities)
+	}
+	if got := identities["@deepseek-ai/cordis-plugin-timer"]; got != (profilePackageIdentity{name: "@deepseek-ai/cordis-plugin-timer", version: "1.1.3"}) {
+		t.Fatalf("vendor identity = %#v", got)
+	}
+}
+
+func TestShippedProfilesCarryActivePluginPackageProvenance(t *testing.T) {
+	loader, err := newProfileLoader(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name := range profileTemplates {
+		t.Run(name, func(t *testing.T) {
+			composed, err := loader.compose(name, nil, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range composed.pluginInventoryEntries() {
+				if !entry.Enabled || entry.FiberPhase == nil || strings.HasPrefix(entry.ModuleName, "cordis:") {
+					continue
+				}
+				if entry.PackageName == "" || entry.PackageVersion == "" {
+					t.Errorf("active plugin %q (%s) has no package provenance", entry.EntryID, entry.ModuleName)
+				}
+			}
+		})
+	}
+}
+
 func TestCompositionDisabledJSExpressionControlsActiveRoster(t *testing.T) {
 	var document yaml.Node
 	if err := yaml.Unmarshal([]byte(`
@@ -450,7 +576,7 @@ func TestCompositionRejectsInvalidRuntimeConfig(t *testing.T) {
 }
 
 func TestCompositionConfigHelpersEvaluateIndependentJSValues(t *testing.T) {
-	t.Setenv("DSH_TEST_TOOLS_MODE", "code")
+	t.Setenv("DSH_TEST_TOOLS_MODE", "ptc")
 	var document yaml.Node
 	if err := yaml.Unmarshal([]byte(`
 - id: tools
@@ -468,7 +594,7 @@ func TestCompositionConfigHelpersEvaluateIndependentJSValues(t *testing.T) {
 	for index, entry := range composed.entries {
 		composed.buildIndex(entry, index)
 	}
-	if mode, ok := composed.configString("tools", "mode"); !ok || mode != "code" {
+	if mode, ok := composed.configString("tools", "mode"); !ok || mode != "ptc" {
 		t.Fatalf("JS config string = %q, %v", mode, ok)
 	}
 	if values, ok := composed.configInts("limits", "values"); !ok || !reflect.DeepEqual(values, []int{3, 4}) {
@@ -902,8 +1028,75 @@ func TestStandaloneBinaryServesEmbeddedRuntime(t *testing.T) {
 	if err := json.Unmarshal(html[start:start+end], &graph); err != nil {
 		t.Fatalf("decode standalone boot graph: %v", err)
 	}
-	if len(graph.Entries) != 42 {
-		t.Fatalf("standalone boot graph has %d entries, want 42", len(graph.Entries))
+	wantClientRoster := []string{
+		"@deepseek-ai/dsh-api-gateway",
+		"@deepseek-ai/dsh-api-remotes",
+		"@deepseek-ai/dsh-api-session-controller",
+		"@deepseek-ai/dsh-api-workspace-controller",
+		"@deepseek-ai/dsh-client-connection",
+		"@deepseek-ai/dsh-client-hmr",
+		"@deepseek-ai/dsh-client-locale",
+		"@deepseek-ai/dsh-client-modules",
+		"@deepseek-ai/dsh-client-ui-agent-preset",
+		"@deepseek-ai/dsh-client-ui-approval",
+		"@deepseek-ai/dsh-client-ui-attachment",
+		"@deepseek-ai/dsh-client-ui-brand-official",
+		"@deepseek-ai/dsh-client-ui-chat",
+		"@deepseek-ai/dsh-client-ui-commands",
+		"@deepseek-ai/dsh-client-ui-conversation",
+		"@deepseek-ai/dsh-client-ui-cordis",
+		"@deepseek-ai/dsh-client-ui-deliverables",
+		"@deepseek-ai/dsh-client-ui-directory-picker-native",
+		"@deepseek-ai/dsh-client-ui-goal",
+		"@deepseek-ai/dsh-client-ui-input-trigger",
+		"@deepseek-ai/dsh-client-ui-jobs",
+		"@deepseek-ai/dsh-client-ui-layout",
+		"@deepseek-ai/dsh-client-ui-message-feedback",
+		"@deepseek-ai/dsh-client-ui-model-selection",
+		"@deepseek-ai/dsh-client-ui-permission-presets",
+		"@deepseek-ai/dsh-client-ui-plan",
+		"@deepseek-ai/dsh-client-ui-reference",
+		"@deepseek-ai/dsh-client-ui-renderer",
+		"@deepseek-ai/dsh-client-ui-session",
+		"@deepseek-ai/dsh-client-ui-settings",
+		"@deepseek-ai/dsh-client-ui-settings-general",
+		"@deepseek-ai/dsh-client-ui-settings-models",
+		"@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+		"@deepseek-ai/dsh-client-ui-settings-plugins",
+		"@deepseek-ai/dsh-client-ui-sidebar",
+		"@deepseek-ai/dsh-client-ui-skill",
+		"@deepseek-ai/dsh-client-ui-subagent",
+		"@deepseek-ai/dsh-client-ui-theme",
+		"@deepseek-ai/dsh-client-ui-tool",
+		"@deepseek-ai/dsh-client-ui-trajectory",
+		"@deepseek-ai/dsh-client-ui-user-questions",
+		"@deepseek-ai/dsh-client-ui-workflow-run",
+		"@deepseek-ai/dsh-client-ui-workspace",
+		"@deepseek-ai/dsh-cordis-client-runner",
+		"@deepseek-ai/dsh-session-log-export",
+		"@deepseek-ai/dsh-typert-registry",
+	}
+	gotClientRoster := make([]string, len(graph.Entries))
+	for index, entry := range graph.Entries {
+		gotClientRoster[index] = entry.ID
+	}
+	sort.Strings(gotClientRoster)
+	if !reflect.DeepEqual(gotClientRoster, wantClientRoster) {
+		t.Fatalf("standalone boot roster differs\n got: %q\nwant: %q", gotClientRoster, wantClientRoster)
+	}
+	roster := make(map[string]bool, len(gotClientRoster))
+	for _, id := range gotClientRoster {
+		roster[id] = true
+	}
+	for _, id := range []string{"@deepseek-ai/dsh-experimental-client-ui-agent-team", "@deepseek-ai/dsh-experimental-inspector"} {
+		if roster[id] {
+			t.Fatalf("standalone boot roster unexpectedly contains %s", id)
+		}
+	}
+	for _, id := range []string{"@deepseek-ai/dsh-session-log-export", "@deepseek-ai/dsh-client-ui-directory-picker-native"} {
+		if !roster[id] {
+			t.Fatalf("standalone boot roster misses %s", id)
+		}
 	}
 	plugin, err := http.Get(endpoint + graph.Entries[0].URL)
 	if err != nil {

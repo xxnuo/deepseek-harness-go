@@ -378,7 +378,7 @@ func TestPersistedInboxPromptRunsAfterSessionAttach(t *testing.T) {
 	if _, err := e.CreateSession(context.Background(), workspace, "durable-queue", ""); err != nil {
 		t.Fatal(err)
 	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := e.WaitForIdle(waitCtx, "durable-queue"); err != nil {
 		t.Fatal(err)

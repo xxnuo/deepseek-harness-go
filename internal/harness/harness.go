@@ -42,26 +42,32 @@ type Config struct {
 	// deliberately separate from ClientPlugins: the web boot graph is a
 	// client-module roster, while pluginInventory/list projects Host Loader
 	// entries and their live Fiber state.
-	PluginInventory       []PluginInventoryEntry
-	ClientHMRPollInterval time.Duration
-	PresetDir             string
-	SkillDir              string
-	BundledBadgeSkill     bool
-	AgentsHome            string
-	Host                  string
-	Port                  int
-	TrustedHosts          []string
-	Version               string
-	Provider              string
-	Model                 string
-	BaseURL               string
-	APIKey                string
-	LaunchEnvironment     *LaunchEnvironmentSnapshot
-	WebSearchProvider     string
-	WebFetchProvider      string
-	WebTools              *WebToolConfig
-	HTTPWebFetch          HTTPWebFetchConfig
-	ToolPresentation      string
+	PluginInventory []PluginInventoryEntry
+	// DeepSeekSessionLogEnabled controls the opt-in dsh_session_log request
+	// contribution. Nil is normalized to false.
+	DeepSeekSessionLogEnabled *bool
+	// DeepSeekPluginInventoryEnabled controls the default-on
+	// dsh_plugin_packages request contribution. Nil is normalized to true.
+	DeepSeekPluginInventoryEnabled *bool
+	ClientHMRPollInterval          time.Duration
+	PresetDir                      string
+	SkillDir                       string
+	BundledBadgeSkill              bool
+	AgentsHome                     string
+	Host                           string
+	Port                           int
+	TrustedHosts                   []string
+	Version                        string
+	Provider                       string
+	Model                          string
+	BaseURL                        string
+	APIKey                         string
+	LaunchEnvironment              *LaunchEnvironmentSnapshot
+	WebSearchProvider              string
+	WebFetchProvider               string
+	WebTools                       *WebToolConfig
+	HTTPWebFetch                   HTTPWebFetchConfig
+	ToolPresentation               string
 	// ToolTimeoutPolicyEnabled controls the optional timeout-policy plugin.
 	// A nil value is normalized to enabled for library callers that do not
 	// provide a profile composition.
@@ -131,11 +137,20 @@ type JobsConfig struct {
 // pluginInventory/list remote. A nil FiberPhase represents a disposed or
 // disabled entry, matching the upstream null phase.
 type PluginInventoryEntry struct {
-	EntryID    string
-	ModuleName string
-	Enabled    bool
-	FiberPhase *string
-	Group      bool
+	EntryID        string
+	ModuleName     string
+	PackageName    string
+	PackageVersion string
+	// ModuleBase is the Loader tree base used to resolve relative/file module
+	// specifiers for package provenance. It is runtime metadata and is omitted
+	// from the pluginInventory/list wire projection.
+	ModuleBase string
+	// BarePackageBase optionally overrides ModuleBase for bare package names,
+	// matching a mounted preset's host-owned package resolution base.
+	BarePackageBase string
+	Enabled         bool
+	FiberPhase      *string
+	Group           bool
 }
 
 func clonePluginInventory(entries []PluginInventoryEntry) []PluginInventoryEntry {
@@ -250,6 +265,8 @@ func DefaultConfig() Config {
 	}
 	timeoutPolicyEnabled := true
 	todoAllowParallel := true
+	deepSeekSessionLogEnabled := false
+	deepSeekPluginInventoryEnabled := true
 	return Config{
 		DataDir: data, Workspace: cwd, AgentsHome: agentsHome, Host: "127.0.0.1", Port: 3080,
 		ClientHMRPollInterval: 500 * time.Millisecond,
@@ -258,10 +275,12 @@ func DefaultConfig() Config {
 		WebSearchProvider: webSearchProvider, WebFetchProvider: webFetchProvider,
 		WebTools: webTools, HTTPWebFetch: defaultHTTPWebFetchConfig(),
 		ToolPresentation: toolPresentation, Persona: defaultCodingPersona,
-		ToolTimeoutPolicyEnabled:    &timeoutPolicyEnabled,
-		TodoAllowParallelInProgress: &todoAllowParallel,
-		InstructionMaxBytes:         defaultInstructionMaxBytes,
-		SessionTitle:                defaultSessionTitleConfig(), SessionTitleLLM: defaultSessionTitleLLMConfig(),
+		ToolTimeoutPolicyEnabled:       &timeoutPolicyEnabled,
+		TodoAllowParallelInProgress:    &todoAllowParallel,
+		DeepSeekSessionLogEnabled:      &deepSeekSessionLogEnabled,
+		DeepSeekPluginInventoryEnabled: &deepSeekPluginInventoryEnabled,
+		InstructionMaxBytes:            defaultInstructionMaxBytes,
+		SessionTitle:                   defaultSessionTitleConfig(), SessionTitleLLM: defaultSessionTitleLLMConfig(),
 		Compaction: defaultCompactionConfig(), ToolResultPruner: defaultToolResultPruneConfig(),
 		Spill: defaultSpillConfig(), RepeatToolReminder: defaultRepeatToolReminderConfig(),
 		Jobs:                        JobsConfig{WaitTimeoutMs: 30 * time.Second, MaxWaitTimeoutMs: 10 * time.Minute, CompletionDelivery: "wakeup", MaxConsecutiveWakes: 3},
@@ -277,6 +296,20 @@ func DefaultConfig() Config {
 
 func normalizeConfig(c Config) Config {
 	d := DefaultConfig()
+	if c.DeepSeekSessionLogEnabled == nil {
+		value := boolConfigValue(d.DeepSeekSessionLogEnabled, false)
+		c.DeepSeekSessionLogEnabled = &value
+	} else {
+		value := *c.DeepSeekSessionLogEnabled
+		c.DeepSeekSessionLogEnabled = &value
+	}
+	if c.DeepSeekPluginInventoryEnabled == nil {
+		value := boolConfigValue(d.DeepSeekPluginInventoryEnabled, true)
+		c.DeepSeekPluginInventoryEnabled = &value
+	} else {
+		value := *c.DeepSeekPluginInventoryEnabled
+		c.DeepSeekPluginInventoryEnabled = &value
+	}
 	if c.ToolTimeoutPolicyEnabled == nil {
 		value := true
 		if d.ToolTimeoutPolicyEnabled != nil {
@@ -530,6 +563,12 @@ type PromptRequest struct {
 	RPCID           string                  `json:"-"`
 	Source          map[string]any          `json:"-"`
 	preparedContent []ContentBlock
+	attachmentGuard *sessionAttachmentGuard
+}
+
+type sessionAttachmentGuard struct {
+	session    *Session
+	generation uint64
 }
 
 type ModelSelection struct {
@@ -541,12 +580,24 @@ type ModelSelection struct {
 }
 
 type ModelInfo struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	Description     string   `json:"description,omitempty"`
-	InputModalities []string `json:"inputModalities,omitempty"`
-	ContextWindow   int      `json:"contextWindow,omitempty"`
-	MaxTokens       int      `json:"maxTokens,omitempty"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	Description     string              `json:"description,omitempty"`
+	InputModalities []string            `json:"inputModalities,omitempty"`
+	ContextWindow   int                 `json:"contextWindow,omitempty"`
+	MaxTokens       int                 `json:"maxTokens,omitempty"`
+	Reasoning       *ModelReasoningInfo `json:"reasoning,omitempty"`
+}
+
+type ModelReasoningInfo struct {
+	Efforts       []ReasoningEffortInfo `json:"efforts,omitempty"`
+	DefaultEffort string                `json:"defaultEffort,omitempty"`
+}
+
+type ReasoningEffortInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 type ChatMessage struct {
@@ -582,6 +633,7 @@ type ChatContentPart struct {
 
 type ChatRequest struct {
 	SessionID            string
+	Purpose              string
 	Model                string
 	System               string
 	Messages             []ChatMessage
@@ -685,6 +737,13 @@ type ToolContentFinalizer func(ToolCall, ToolResult) ([]ContentBlock, error)
 type Tool struct {
 	Schema  ToolSchema
 	Timeout time.Duration
+	// subagentModelSelectionCapable identifies the delegation definitions that
+	// own child route selection. Schema shape is not a capability boundary:
+	// unrelated custom tools may legitimately use the same field names.
+	subagentModelSelectionCapable bool
+	// subagentModelSelectionList marks the session-scoped discovery helper so
+	// it can be removed when its owning selectable definitions disappear.
+	subagentModelSelectionList bool
 	// TimeoutPolicyEnabled is normally populated by Engine registration from
 	// Config.ToolTimeoutPolicyEnabled. A nil value keeps direct library tools
 	// compatible with the historical default (policy enabled).
@@ -780,36 +839,67 @@ type Session struct {
 	// attached distinguishes a live in-process agent from a cold persisted log.
 	// It is intentionally private: callers use the host/session APIs rather than
 	// mutating lifecycle state behind the Engine registry.
-	attached          bool
-	published         bool
-	draining          bool
-	firstLiveSeq      int
-	Running           bool
-	Cancel            context.CancelFunc
-	activity          *sessionActivity
-	claimed           *queuedPrompt
-	activePrompt      *queuedPrompt
-	parked            bool
-	maintenance       bool
-	maintenanceWake   bool
-	maintenanceCancel context.CancelFunc
-	turnCounter       int
-	pending           []*queuedPrompt
-	steering          []*queuedPrompt
+	attached bool
+	// attachmentGeneration identifies one live agent attachment. It changes on
+	// every attach/detach transition so owners can reject a stale handle after
+	// an external reload replaces the live agent for the same session id.
+	attachmentGeneration uint64
+	published            bool
+	draining             bool
+	firstLiveSeq         int
+	Running              bool
+	Cancel               context.CancelFunc
+	activity             *sessionActivity
+	claimed              *queuedPrompt
+	activePrompt         *queuedPrompt
+	parked               bool
+	maintenance          bool
+	maintenanceWake      bool
+	maintenanceCancel    context.CancelFunc
+	turnCounter          int
+	pending              []*queuedPrompt
+	steering             []*queuedPrompt
 	// requestHeaderLogged belongs to the live agent attachment. A cold session
 	// logs one resume snapshot before its first provider request.
-	requestHeaderLogged       bool
-	repeatToolKey             string
-	repeatToolCount           int
-	personaOverride           string
-	toolRestriction           *sessionToolRestriction
-	presetRuntime             *presetRuntimeGeneration
-	initialSubagentDescriptor *SubagentDescriptorData
-	planIntent                *planModeIntent
-	scheduleMu                sync.Mutex
-	mu                        sync.Mutex
-	store                     SessionStore
-	invariants                *InvariantRegistry
+	requestHeaderLogged            bool
+	repeatToolKey                  string
+	repeatToolCount                int
+	personaOverride                string
+	toolRestriction                *sessionToolRestriction
+	presetRuntime                  *presetRuntimeGeneration
+	initialSubagentDescriptor      *SubagentDescriptorData
+	subagentModelSelectionEligible bool
+	subagentModelSelectionSampled  bool
+	// subagentModelSelectionSnapshot is captured when a model-selectable tool
+	// reaches this session's publication/installation boundary. A non-nil
+	// snapshot is meaningful even when Enabled is false: it prevents a later
+	// settings update from changing an already-published tool definition.
+	subagentModelSelectionSnapshot *SubagentModelSelectionSettings
+	planIntent                     *planModeIntent
+	scheduleMu                     sync.Mutex
+	mu                             sync.Mutex
+	store                          SessionStore
+	invariants                     *InvariantRegistry
+}
+
+func attachSessionLocked(s *Session) {
+	if s == nil {
+		return
+	}
+	if !s.attached {
+		s.attachmentGeneration++
+	}
+	s.attached = true
+}
+
+func detachSessionLocked(s *Session) {
+	if s == nil {
+		return
+	}
+	if s.attached {
+		s.attachmentGeneration++
+	}
+	s.attached = false
 }
 
 type AgentCancelCause struct {
@@ -884,79 +974,88 @@ func (e *AgentPresetConflictError) Error() string {
 }
 
 type Engine struct {
-	cfg                       Config
-	mu                        sync.RWMutex
-	pluginInventoryMu         sync.RWMutex
-	pluginInventory           []PluginInventoryEntry
-	presetRuntimeMu           sync.Mutex
-	presetRuntimes            map[string]*presetRuntimeGeneration
-	sessions                  map[string]*Session
-	providers                 map[string]Provider
-	subagentProviders         map[string]SubagentProvider
-	subagentProviderOrder     []string
-	subagentProviderTokens    map[string]uint64
-	nextSubagentProviderToken uint64
-	piAIProviders             map[string]*managedPiAIProvider
-	retryPolicies             map[string]RetryPolicy
-	webSearchProviders        map[string]WebSearchProvider
-	webSearchProviderOrder    []string
-	webSearchProviderTokens   map[string]*byte
-	webFetchProviders         map[string]WebFetchProvider
-	webFetchProviderOrder     []string
-	webFetchProviderTokens    map[string]*byte
-	hostWebSearchDisposers    map[string]func()
-	hostWebFetchDisposers     map[string]func()
-	tools                     map[string]Tool
-	toolOwners                map[string]string
-	hostToolModules           map[string]string
-	scopedTools               map[string]map[string]Tool
-	structuredOutputs         map[string]*structuredOutputRuntime
-	workspaces                map[string]*Workspace
-	workspaceOrder            []string
-	archived                  map[string]bool
-	goals                     map[string]goalState
-	settings                  map[string]map[string]any
-	settingsRev               map[string]int
-	credentials               map[string]string
-	credentialRecords         map[CredentialKey]CredentialRecord
-	credentialRecordOrder     []CredentialKey
-	credentialService         *CredentialService
-	authorizationService      *AuthorizationService
-	subs                      map[string]map[chan Event]struct{}
-	hostSubs                  map[chan map[string]any]struct{}
-	muxSubs                   map[chan map[string]any]struct{}
-	pendingMu                 sync.Mutex
-	pending                   map[string]*pendingInteraction
-	scheduleRuntimeMu         sync.Mutex
-	scheduleRuntimes          map[string]*scheduleRuntime
-	dynamicCordis             *dynamicCordisState
-	fsState                   *fsObservationState
-	fileReferenceMu           sync.Mutex
-	fileReferenceSearches     map[string]*WorkspaceFileSearch
-	attachmentRequestMu       sync.Mutex
-	attachmentRequestInflight map[string]*sharedRequestImage
-	imageCompression          chan struct{}
-	jobs                      *jobRegistry
-	shellEnv                  *shellEnvironmentRegistry
-	shells                    *persistentShellRegistry
-	terminals                 *terminalRegistry
-	e2b                       *E2BRuntime
-	lsp                       *lspRegistry
-	telemetry                 *sessionTelemetryCoordinator
-	agentTeams                *TeamService
-	modelSubagentMu           sync.Mutex
-	modelSubagentActivations  map[string]*modelSubagentActivation
-	modelSubagentLocks        sync.Map
-	jobWakeMu                 sync.Mutex
-	jobWakes                  map[string]int
-	subagentActivationSetups  *subagentActivationSetupRegistry
-	sessionStore              SessionStore
-	sessionProjections        *SessionProjectionRegistry
-	projectionCache           *sessionProjectionCache
-	storage                   *StorageHub
-	storageBackends           []StorageBackend
-	storageDisposers          []func()
-	storageDomain             *DomainFacility
+	cfg                          Config
+	mu                           sync.RWMutex
+	deepSeekExtensionsMu         sync.RWMutex
+	deepSeekExtensions           *deepSeekLlmAPIExtensionRegistry
+	pluginInventoryMu            sync.RWMutex
+	pluginInventory              []PluginInventoryEntry
+	deepSeekPackageIdentityMu    sync.Mutex
+	deepSeekPackageIdentityCache map[string]deepSeekPackageIdentityCacheResult
+	bootMu                       sync.Mutex
+	bootSnapshot                 *bootSnapshot
+	bootInitialRevisionNonce     string
+	bootNextInitialRevision      uint64
+	presetRuntimeMu              sync.Mutex
+	presetRuntimes               map[string]*presetRuntimeGeneration
+	sessions                     map[string]*Session
+	providers                    map[string]Provider
+	providerOrder                []string
+	subagentProviders            map[string]SubagentProvider
+	subagentProviderOrder        []string
+	subagentProviderTokens       map[string]uint64
+	nextSubagentProviderToken    uint64
+	piAIProviders                map[string]*managedPiAIProvider
+	retryPolicies                map[string]RetryPolicy
+	webSearchProviders           map[string]WebSearchProvider
+	webSearchProviderOrder       []string
+	webSearchProviderTokens      map[string]*byte
+	webFetchProviders            map[string]WebFetchProvider
+	webFetchProviderOrder        []string
+	webFetchProviderTokens       map[string]*byte
+	hostWebSearchDisposers       map[string]func()
+	hostWebFetchDisposers        map[string]func()
+	tools                        map[string]Tool
+	toolOwners                   map[string]string
+	hostToolModules              map[string]string
+	scopedTools                  map[string]map[string]Tool
+	structuredOutputs            map[string]*structuredOutputRuntime
+	workspaces                   map[string]*Workspace
+	workspaceOrder               []string
+	archived                     map[string]bool
+	goals                        map[string]goalState
+	settings                     map[string]map[string]any
+	settingsRev                  map[string]int
+	credentials                  map[string]string
+	credentialRecords            map[CredentialKey]CredentialRecord
+	credentialRecordOrder        []CredentialKey
+	credentialService            *CredentialService
+	authorizationService         *AuthorizationService
+	subs                         map[string]map[chan Event]struct{}
+	hostSubs                     map[chan map[string]any]struct{}
+	muxSubs                      map[chan map[string]any]struct{}
+	pendingMu                    sync.Mutex
+	pending                      map[string]*pendingInteraction
+	scheduleRuntimeMu            sync.Mutex
+	scheduleRuntimes             map[string]*scheduleRuntime
+	dynamicCordis                *dynamicCordisState
+	fsState                      *fsObservationState
+	fileReferenceMu              sync.Mutex
+	fileReferenceSearches        map[string]*WorkspaceFileSearch
+	attachmentRequestMu          sync.Mutex
+	attachmentRequestInflight    map[string]*sharedRequestImage
+	imageCompression             chan struct{}
+	jobs                         *jobRegistry
+	shellEnv                     *shellEnvironmentRegistry
+	shells                       *persistentShellRegistry
+	terminals                    *terminalRegistry
+	e2b                          *E2BRuntime
+	lsp                          *lspRegistry
+	telemetry                    *sessionTelemetryCoordinator
+	agentTeams                   *TeamService
+	modelSubagentMu              sync.Mutex
+	modelSubagentActivations     map[string]*modelSubagentActivation
+	modelSubagentLocks           sync.Map
+	jobWakeMu                    sync.Mutex
+	jobWakes                     map[string]int
+	subagentActivationSetups     *subagentActivationSetupRegistry
+	sessionStore                 SessionStore
+	sessionProjections           *SessionProjectionRegistry
+	projectionCache              *sessionProjectionCache
+	storage                      *StorageHub
+	storageBackends              []StorageBackend
+	storageDisposers             []func()
+	storageDomain                *DomainFacility
 	// DeepSeek Files uploads are shared by every provider snapshot in this
 	// process. The provider endpoint/key remain request-scoped; only the
 	// owner-private index and in-flight upload coordination are shared.
@@ -974,7 +1073,13 @@ type Engine struct {
 	titleWork         map[string]*sessionTitleWorkState
 	titleCtx          context.Context
 	titleCancel       context.CancelFunc
-	closed            bool
+	// sdkSubagentListeners receives terminal payloads from actual subagent
+	// providers. It is intentionally independent from the dynamic Cordis event
+	// bus, whose user/plugin events are not authoritative lifecycle producers.
+	sdkSubagentMu        sync.Mutex
+	sdkSubagentListeners map[uint64]func(sdkSubagentEnd)
+	nextSDKSubagentToken uint64
+	closed               bool
 }
 
 func New(opts ...Option) (*Engine, error) {
@@ -1034,8 +1139,8 @@ func New(opts ...Option) (*Engine, error) {
 	if err := validateTerminalToolConfig(cfg.TerminalTool); err != nil {
 		return nil, err
 	}
-	if cfg.ToolPresentation != "native" && cfg.ToolPresentation != "code" && cfg.ToolPresentation != "both" {
-		return nil, fmt.Errorf("tools: mode must be native, code, or both, got %q", cfg.ToolPresentation)
+	if cfg.ToolPresentation != "native" && cfg.ToolPresentation != "ptc" && cfg.ToolPresentation != "both" {
+		return nil, fmt.Errorf("tools: mode must be native, ptc, or both, got %q", cfg.ToolPresentation)
 	}
 	if cfg.SubagentReportDelivery != "quiet" && cfg.SubagentReportDelivery != "next-step" {
 		return nil, fmt.Errorf("tool-subagent-report: reportDelivery must be quiet or next-step, got %q", cfg.SubagentReportDelivery)
@@ -1081,7 +1186,7 @@ func New(opts ...Option) (*Engine, error) {
 		return nil, err
 	}
 	titleCtx, titleCancel := context.WithCancel(context.Background())
-	e := &Engine{cfg: cfg, pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, modelSubagentActivations: map[string]*modelSubagentActivation{}, subagentActivationSetups: newSubagentActivationSetupRegistry(), storage: NewStorageHub(), jobWakes: map[string]int{}}
+	e := &Engine{cfg: cfg, deepSeekExtensions: newDeepSeekLlmAPIExtensionRegistry(), pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, modelSubagentActivations: map[string]*modelSubagentActivation{}, subagentActivationSetups: newSubagentActivationSetupRegistry(), storage: NewStorageHub(), jobWakes: map[string]int{}}
 	sessionProjections.setRuntimeExecutor(func(job func()) error {
 		if !e.dynamicCordis.loop.call(job) {
 			return errors.New("dynamic Cordis runtime is closed")
@@ -1137,6 +1242,9 @@ func New(opts ...Option) (*Engine, error) {
 		if _, err := e.RegisterTerminalBackend(backend); err != nil {
 			return nil, err
 		}
+	}
+	if err := e.registerBuiltinDeepSeekExtensions(); err != nil {
+		return nil, err
 	}
 	e.RegisterProvider(NewEchoProvider("echo", "Echo"))
 	for _, provider := range cfg.SubagentProviders {
@@ -1683,13 +1791,29 @@ func (e *Engine) EmitSessionTelemetry(ctx context.Context, record SessionTelemet
 func (e *Engine) RegisterProvider(p Provider) {
 	if p != nil {
 		e.mu.Lock()
-		if current := e.piAIProviders[p.ID()]; current != nil && p != current {
-			delete(e.piAIProviders, p.ID())
+		id := p.ID()
+		if current := e.piAIProviders[id]; current != nil && p != current {
+			delete(e.piAIProviders, id)
 		}
-		e.providers[p.ID()] = p
+		if e.providers == nil {
+			e.providers = map[string]Provider{}
+		}
+		if _, exists := e.providers[id]; !exists {
+			e.providerOrder = append(e.providerOrder, id)
+		}
+		e.providers[id] = p
 		e.mu.Unlock()
 		e.emitRemoteEvent("llm/adapters-updated")
 	}
+}
+
+func removeProviderID(order []string, id string) []string {
+	for index, candidate := range order {
+		if candidate == id {
+			return append(order[:index], order[index+1:]...)
+		}
+	}
+	return order
 }
 
 // SetProviderRetryPolicy installs a route policy for providers that do not
@@ -1741,6 +1865,7 @@ func (e *Engine) registerToolFrom(origin *dynamicCordisRun, tool Tool, ownerSess
 		e.mu.RUnlock()
 		tool.TimeoutPolicyEnabled = &enabled
 	}
+	var modelSelectionCaptures []subagentModelSelectionSnapshotCapture
 	e.mu.Lock()
 	if _, exists := e.tools[tool.Schema.Name]; exists {
 		e.mu.Unlock()
@@ -1753,11 +1878,31 @@ func (e *Engine) registerToolFrom(origin *dynamicCordisRun, tool Tool, ownerSess
 	if ownerSessionID != "" {
 		e.toolOwners[tool.Schema.Name] = ownerSessionID
 	}
+	if subagentModelSelectionToolEnabled(tool) {
+		// A late plugin/tool installation is the publication boundary for
+		// sessions that already exist. Capture their setting while the registry
+		// lock is held so a concurrent settings update cannot change the value
+		// selected for this installation.
+		modelSelectionCaptures = e.captureSubagentModelSelectionSnapshotsLocked()
+	}
+	commits, recordErr := e.recordSubagentModelSelectionSnapshotCapturesLocked(modelSelectionCaptures)
+	if recordErr != nil {
+		delete(e.tools, tool.Schema.Name)
+		delete(e.toolOwners, tool.Schema.Name)
+		delete(e.hostToolModules, tool.Schema.Name)
+		e.rollbackSubagentModelSelectionSnapshotCapturesLocked(modelSelectionCaptures, false)
+		e.mu.Unlock()
+		e.publishSubagentModelSelectionPolicyCommits(origin, commits)
+		return recordErr
+	}
 	e.mu.Unlock()
+	e.publishSubagentModelSelectionPolicyCommits(origin, commits)
 	if err := e.emitDynamicCordisEventFrom(origin, "tools/change"); err != nil {
 		e.mu.Lock()
 		delete(e.tools, tool.Schema.Name)
 		delete(e.toolOwners, tool.Schema.Name)
+		delete(e.hostToolModules, tool.Schema.Name)
+		e.rollbackSubagentModelSelectionSnapshotCapturesLocked(modelSelectionCaptures, true)
 		e.mu.Unlock()
 		return err
 	}
@@ -1813,6 +1958,9 @@ func (e *Engine) unregisterToolFrom(origin *dynamicCordisRun, name string) (bool
 	delete(e.tools, name)
 	delete(e.toolOwners, name)
 	delete(e.hostToolModules, name)
+	if !e.hasSubagentModelSelectionToolLocked() {
+		e.removeSubagentModelSelectionListToolsLocked()
+	}
 	e.mu.Unlock()
 	return true, e.emitDynamicCordisEventFrom(origin, "tools/change")
 }
@@ -1908,6 +2056,10 @@ var hostToolModuleByName = map[string]string{
 }
 
 func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
+	modelSelectionEnabled, err := e.ensureSubagentModelSelectionTools(s)
+	if err != nil {
+		return nil, err
+	}
 	runtimeConfig, err := e.runtimeForSession(s)
 	if err != nil {
 		return nil, err
@@ -1943,6 +2095,9 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 	owners := make(map[string]string, len(e.tools))
 	scoped := make(map[string]bool, len(e.scopedTools[sessionID]))
 	for name, tool := range e.tools {
+		if subagentModelSelectionToolEnabled(tool) {
+			tool = subagentModelSelectionSchemaEnabled(tool, modelSelectionEnabled)
+		}
 		combined[name] = tool
 		owners[name] = e.toolOwners[name]
 	}
@@ -1953,7 +2108,7 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 	e.mu.RUnlock()
 	visible := make(map[string]Tool, len(combined))
 	for name, tool := range combined {
-		if runtimeConfig.toolPresentation == "code" {
+		if runtimeConfig.toolPresentation == "ptc" {
 			if name == "run_code" && allowed(name, owners[name], scoped[name]) {
 				visible[name] = tool
 			}
@@ -2091,6 +2246,9 @@ func (e *Engine) agentTeamToolMode(s *Session, runtimeConfig agentRuntime, name 
 }
 
 func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
+	if _, err := e.ensureSubagentModelSelectionTools(s); err != nil {
+		return false, err
+	}
 	runtimeConfig, err := e.runtimeForSession(s)
 	if err != nil {
 		return false, err
@@ -2115,7 +2273,7 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 			return false, nil
 		}
 	}
-	if runtimeConfig.toolPresentation == "code" {
+	if runtimeConfig.toolPresentation == "ptc" {
 		if name != "run_code" {
 			return false, nil
 		}
@@ -2476,7 +2634,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	cwd, id, preset := meta.CWD, meta.ID, meta.AgentPreset
+	cwd, id, preset := meta.CWD, meta.ID, canonicalPresetID(strings.TrimSpace(meta.AgentPreset))
 	if cwd == "" {
 		cwd = e.cfg.Workspace
 	}
@@ -2509,7 +2667,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 			existing.mu.Unlock()
 			return "", &SessionConflictError{SessionID: id, RequestedCWD: cwd, ExistingCWD: existingCWD}
 		}
-		if !adoptExistingPreset && preset != "" && preset != existingPreset {
+		if !adoptExistingPreset && preset != "" && canonicalPresetID(preset) != canonicalPresetID(existingPreset) {
 			existing.mu.Unlock()
 			return "", &AgentPresetConflictError{SessionID: id, RequestedPreset: preset, ExistingPreset: existingPreset}
 		}
@@ -2522,7 +2680,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 			return "", fmt.Errorf("session-conflict: session %q metadata does not match", id)
 		}
 		wasAttached := existing.attached
-		existing.attached = true
+		attachSessionLocked(existing)
 		existing.published = true
 		startWorker := !existing.Running && (len(existing.pending) > 0 || len(existing.steering) > 0)
 		if startWorker {
@@ -2561,11 +2719,27 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	}
 	now := time.Now().UnixMilli()
 	meta.Version, meta.CreatedAt = SessionFormatVersion, now
-	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, attached: true, published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants}
+	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants, subagentModelSelectionEligible: meta.Origin != "subagent" && meta.ParentSession == ""}
+	var modelSelectionEvent Event
+	modelSelectionRecorded := false
+	if e.hasSubagentModelSelectionToolLocked() {
+		s.mu.Lock()
+		e.captureSubagentModelSelectionSnapshotLocked(s)
+		s.mu.Unlock()
+	}
+	attachSessionLocked(s)
 	if s.store != nil {
 		if err := s.store.Create(ctx, meta); err != nil {
 			return "", err
 		}
+	}
+	s.mu.Lock()
+	var recordErr error
+	modelSelectionEvent, modelSelectionRecorded, recordErr = e.recordSubagentModelSelectionPolicyLocked(s)
+	s.mu.Unlock()
+	if recordErr != nil {
+		rollbackSessionStoreCreate(s.store, id)
+		return "", recordErr
 	}
 	if pinPermission {
 		name := e.permissionDefaultPresetLocked()
@@ -2592,6 +2766,9 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	s.mu.Unlock()
 	e.sessions[id] = s
 	e.mu.Unlock()
+	if modelSelectionRecorded {
+		e.publishEvent(id, modelSelectionEvent)
+	}
 	if !deferPublish {
 		e.emitHost(map[string]any{"type": "host/session-added", "sessionId": id, "blank": true, "cwd": cwd, "agentPreset": preset})
 		e.emitDynamicCordisScopedContained(id, "session/created", dynamicSessionView(s))
@@ -2609,7 +2786,7 @@ func (e *Engine) publishDeferredSession(s *Session) {
 		return
 	}
 	s.mu.Lock()
-	s.attached = true
+	attachSessionLocked(s)
 	s.published = true
 	s.firstLiveSeq = len(s.Events)
 	s.mu.Unlock()
@@ -2906,6 +3083,13 @@ func sessionListMetadata(events []Event) (blank bool, lastPromptAt int64) {
 // history. The header is the creation-time value; later blank-session switches
 // are durable log events and take precedence.
 func sessionAgentPreset(header SessionHeader, events []Event) string {
+	return canonicalPresetID(sessionAgentPresetRaw(header, events))
+}
+
+// sessionAgentPresetRaw preserves the on-disk spelling for compatibility
+// inspection. Runtime callers use sessionAgentPreset, which canonicalizes the
+// historical `code` alias without rewriting the durable event.
+func sessionAgentPresetRaw(header SessionHeader, events []Event) string {
 	for index := len(events) - 1; index >= 0; index-- {
 		if events[index].Type != "agent-preset/selected" {
 			continue
@@ -3269,6 +3453,35 @@ func (e *Engine) Close() error {
 		websocketPools = append(websocketPools, provider.websockets)
 	}
 	e.mu.Unlock()
+	e.workerMu.Lock()
+	e.workersClosing = true
+	e.workerMu.Unlock()
+	e.bootMu.Lock()
+	e.bootSnapshot = nil
+	e.bootInitialRevisionNonce = ""
+	e.bootNextInitialRevision = 0
+	e.bootMu.Unlock()
+	for _, s := range sessions {
+		s.mu.Lock()
+		activity := s.activity
+		cancel := s.Cancel
+		maintenanceCancel := s.maintenanceCancel
+		s.mu.Unlock()
+		if activity != nil {
+			activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
+		} else if cancel != nil {
+			cancel()
+		}
+		if maintenanceCancel != nil {
+			maintenanceCancel()
+		}
+	}
+	e.workerWG.Wait()
+	e.deepSeekExtensionsMu.Lock()
+	deepSeekExtensions := e.deepSeekExtensions
+	e.deepSeekExtensions = nil
+	e.deepSeekExtensionsMu.Unlock()
+	deepSeekExtensionsErr := deepSeekExtensions.close()
 	var teamErr error
 	if e.agentTeams != nil {
 		teamErr = e.agentTeams.close()
@@ -3277,32 +3490,20 @@ func (e *Engine) Close() error {
 	e.closeFileReferenceSearches()
 	e.authorizationService.close()
 	e.credentialService.close()
-	e.closeDynamicCordis()
-	e.sessionProjections.setRuntimeExecutor(nil)
 	closeMCPConnections(e)
 	e.closeSessionTitles()
 	e.closeScheduleRuntimes()
 	e.closeAttachmentRequests()
-	for _, s := range sessions {
-		s.mu.Lock()
-		activity := s.activity
-		cancel := s.Cancel
-		s.mu.Unlock()
-		if activity != nil {
-			activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
-		} else if cancel != nil {
-			cancel()
-		}
-	}
-	e.workerMu.Lock()
-	e.workersClosing = true
-	e.workerMu.Unlock()
-	e.workerWG.Wait()
+	e.closeHooks()
 	var projectionCacheErr error
 	if e.projectionCache != nil {
+		// Dynamic projection definitions and their JavaScript executor must stay
+		// alive until the final checkpoint has folded every shutdown event.
 		projectionCacheErr = e.projectionCache.close(sessions)
 	}
-	e.closeHooks()
+	e.disposeDynamicCordisRuns()
+	e.sessionProjections.setRuntimeExecutor(nil)
+	e.closeDynamicCordisLoop()
 	e.telemetry.close(sessions)
 	for _, pool := range websocketPools {
 		pool.Close()
@@ -3333,5 +3534,5 @@ func (e *Engine) Close() error {
 	for _, ch := range eventSubs {
 		close(ch)
 	}
-	return errors.Join(teamErr, activationErr, terminalErr, lspErr, projectionCacheErr, sessionStoreErr, e2bErr, invariantErr, storageErr)
+	return errors.Join(deepSeekExtensionsErr, teamErr, activationErr, terminalErr, lspErr, projectionCacheErr, sessionStoreErr, e2bErr, invariantErr, storageErr)
 }

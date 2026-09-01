@@ -64,11 +64,15 @@ func (p *EchoProvider) Complete(ctx context.Context, req ChatRequest, onDelta fu
 }
 
 type OpenAIProvider struct {
-	id, baseURL, apiKey, model            string
-	client                                *http.Client
+	id, baseURL, apiKey, model string
+	client                     *http.Client
+	// deepSeekExtensions is set only on the managed official DeepSeek
+	// provider snapshot. Other OpenAI-compatible routes remain extension-free.
+	deepSeekExtensions                    *Engine
 	headers                               map[string]string
 	modelSpec                             piAIModel
 	cacheRetention                        string
+	thinkingBudgets                       map[string]int
 	streamIdleTimeout                     time.Duration
 	deepSeekFiles                         *DeepSeekFileStore
 	deepSeekFileConnection                DeepSeekFileConnection
@@ -507,11 +511,14 @@ type openAICompletionsCompat struct {
 	maxTokensField                   string
 	sessionAffinityFormat            string
 	chatTemplateKwargs               map[string]any
+	chatTemplateArgs                 map[string]any
 	supportsDeveloperRole            bool
 	supportsReasoningEffort          bool
 	supportsLongCacheRetention       bool
 	supportsStore                    bool
 	supportsUsageInStreaming         bool
+	supportsFinishReason             bool
+	supportsThinkingTokenBudget      bool
 	supportsStrictMode               bool
 	requiresToolResultName           bool
 	requiresAssistantAfterToolResult bool
@@ -561,6 +568,7 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 		supportsReasoningEffort:    !isGrok && !isZAI && !isMoonshot && !isTogether && !isCloudflare && !isNVIDIA && !isAntLing,
 		supportsLongCacheRetention: !isTogether && provider != "cloudflare-workers-ai" && !isCloudflare && !isNVIDIA && !isAntLing,
 		supportsStore:              !isNonStandard, supportsUsageInStreaming: true,
+		supportsFinishReason:     true,
 		supportsStrictMode:       !isMoonshot && !isTogether && !isCloudflare && !isNVIDIA,
 		requiresReasoningContent: isDeepSeek && model.Reasoning,
 	}
@@ -610,6 +618,12 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	if value := model.Compat.SupportsUsageInStreaming; value != nil {
 		compat.supportsUsageInStreaming = *value
 	}
+	if value := model.Compat.SupportsFinishReason; value != nil {
+		compat.supportsFinishReason = *value
+	}
+	if value := model.Compat.SupportsThinkingTokenBudget; value != nil {
+		compat.supportsThinkingTokenBudget = *value
+	}
 	if value := model.Compat.SupportsDeveloperRole; value != nil {
 		compat.supportsDeveloperRole = *value
 	}
@@ -629,6 +643,7 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 		compat.requiresReasoningContent = *value && model.Reasoning
 	}
 	compat.chatTemplateKwargs = cloneSettingsValue(model.Compat.ChatTemplateKwargs)
+	compat.chatTemplateArgs = cloneSettingsValue(model.Compat.ChatTemplateArgs)
 	if value := model.Compat.SendSessionAffinityHeaders; value != nil {
 		compat.sendSessionAffinityHeaders = *value
 	}
@@ -703,6 +718,17 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 	case "chat-template":
 		if kwargs := openAIChatTemplateKwargs(model, req.ReasoningEffort, compat.chatTemplateKwargs); len(kwargs) > 0 {
 			body["chat_template_kwargs"] = kwargs
+		}
+	case "baseten":
+		if args := openAIChatTemplateKwargs(model, req.ReasoningEffort, compat.chatTemplateArgs); len(args) > 0 {
+			body["chat_template_args"] = args
+		}
+		if enabled && compat.supportsReasoningEffort && hasWire {
+			body["reasoning_effort"] = wire
+		} else if !enabled && compat.supportsReasoningEffort {
+			if off, exists := model.ThinkingLevelMap["off"]; exists && off != nil {
+				body["reasoning_effort"] = *off
+			}
 		}
 	case "deepseek":
 		if enabled {
@@ -790,6 +816,21 @@ func openAIChatTemplateKwargs(model piAIModel, effort string, configured map[str
 		}
 	}
 	return result
+}
+
+func openAIThinkingTokenBudget(effort string, configured map[string]int, ceiling int) (int, bool) {
+	if effort == "" || effort == "off" || ceiling <= 0 {
+		return 0, false
+	}
+	if effort == "xhigh" || effort == "max" {
+		effort = "high"
+	}
+	budgets := map[string]int{"minimal": 1024, "low": 2048, "medium": 8192, "high": 16384}
+	for level, budget := range configured {
+		budgets[level] = budget
+	}
+	budget := min(budgets[effort], max(0, ceiling-1024))
+	return budget, budget > 0
 }
 
 func openAICompletionsCacheControl(compat openAICompletionsCompat, retention string) map[string]any {
@@ -1061,6 +1102,29 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 		body["prompt_cache_retention"] = "24h"
 	}
 	applyOpenAICompletionsReasoning(body, p.modelSpec, compat, req)
+	if compat.supportsThinkingTokenBudget && p.modelSpec.Reasoning {
+		ceiling := p.modelSpec.MaxTokens
+		if req.MaxTokens > 0 {
+			ceiling = req.MaxTokens
+		}
+		if budget, ok := openAIThinkingTokenBudget(req.ReasoningEffort, p.thinkingBudgets, ceiling); ok {
+			body["thinking_token_budget"] = budget
+		}
+	}
+	var preparedExtensions *PreparedDeepSeekLlmAPIExtensions
+	if p.deepSeekExtensions != nil {
+		var prepareErr error
+		preparedExtensions, prepareErr = p.deepSeekExtensions.prepareDeepSeekLlmAPIExtensions(ctx, body, req)
+		if prepareErr != nil {
+			return Completion{}, &ProviderError{Code: "REQUEST_EXTENSION", Message: "DeepSeek request extension preparation failed", Err: prepareErr}
+		}
+		for field := range preparedExtensions.Fields {
+			if _, exists := body[field]; exists {
+				return Completion{}, &ProviderError{Code: "REQUEST_EXTENSION", Message: fmt.Sprintf("DeepSeek request extension field %q collides with the base request", field)}
+			}
+			body[field] = preparedExtensions.Fields[field]
+		}
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return Completion{}, err
@@ -1071,8 +1135,11 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	}
 	applyOpenAICompletionsSessionHeaders(hreq.Header, req.SessionID, compat, cacheRetention)
 	p.applyHeaders(hreq)
+	if p.deepSeekExtensions != nil && req.Purpose == "compaction" {
+		hreq.Header.Set("X-DeepSeek-Harness-Compact", "1")
+	}
 	if p.id == "deepseek" || p.id == "deepseek-official" || strings.Contains(p.baseURL, "deepseek.com") {
-		hreq.Header.Set("User-Agent", deepSeekHarnessUserAgent)
+		hreq.Header.Set("User-Agent", deepSeekHarnessUserAgent())
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	if p.apiKey != "" {
@@ -1089,6 +1156,11 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		return Completion{}, providerHTTPFailure(resp, string(b))
+	}
+	if preparedExtensions != nil {
+		if acceptErr := preparedExtensions.Accept(); acceptErr != nil {
+			return Completion{}, &ProviderError{Code: "REQUEST_EXTENSION", Message: "DeepSeek request extension acceptance failed", Err: acceptErr}
+		}
 	}
 	var text, reasoning, finish string
 	callParts := map[int]*ToolCall{}
@@ -1179,7 +1251,14 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 		return Completion{}, &ProviderError{Code: "PROVIDER", Message: fmt.Sprintf("model stopped: %s", finish)}
 	}
 	if finish == "" {
-		finish = "stop"
+		if compat.supportsFinishReason {
+			return Completion{}, &ProviderError{Code: "TRANSPORT", Message: "Stream ended without finish_reason"}
+		}
+		if len(callOrder) > 0 {
+			finish = "tool_calls"
+		} else {
+			finish = "stop"
+		}
 	}
 	calls := make([]ToolCall, 0, len(callOrder))
 	for _, index := range callOrder {

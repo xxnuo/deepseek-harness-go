@@ -11,14 +11,15 @@ import (
 // SubagentToolConfig exposes one registered provider as a model-facing
 // one-shot delegation tool.
 type SubagentToolConfig struct {
-	Provider              string
-	ToolName              string
-	BackgroundMode        string
-	EnableRunInBackground *bool
-	AgentOptions          *SubagentAgentOptions
-	Persona               string
-	ToolFilter            *SubagentToolFilter
-	MaxDepth              *int
+	Provider               string
+	ToolName               string
+	ModelSelectionSettings bool
+	BackgroundMode         string
+	EnableRunInBackground  *bool
+	AgentOptions           *SubagentAgentOptions
+	Persona                string
+	ToolFilter             *SubagentToolFilter
+	MaxDepth               *int
 }
 
 func subagentReportTool(e *Engine) Tool {
@@ -88,7 +89,15 @@ func (e *Engine) RegisterSubagentTool(config SubagentToolConfig) error {
 		return errors.New("tool-subagent: toolFilter must name allow or deny tools")
 	}
 	if config.Provider == "spawn" || config.Provider == "fork" {
-		if _, err := e.ensureInProcessSubagentProvider(config.Provider); err != nil {
+		provider, err := e.ensureInProcessSubagentProvider(config.Provider)
+		if err != nil {
+			return err
+		}
+		request := SubagentStartRequest{MaxDepth: config.MaxDepth, AgentOptions: config.AgentOptions, Persona: config.Persona, ToolFilter: config.ToolFilter}
+		if config.ModelSelectionSettings && !provider.Capabilities().AgentOptions {
+			return fmt.Errorf("tool-subagent: provider %q does not support child model selection", config.Provider)
+		}
+		if err := validateSubagentCapabilities(provider, request); err != nil {
 			return err
 		}
 		return e.RegisterTool(inProcessSubagentTool(e, config, config.Provider == "fork"))
@@ -102,6 +111,9 @@ func (e *Engine) RegisterSubagentTool(config SubagentToolConfig) error {
 	if provider == nil {
 		return fmt.Errorf("tool-subagent: provider %q is not registered", config.Provider)
 	}
+	if config.ModelSelectionSettings && !provider.Capabilities().AgentOptions {
+		return fmt.Errorf("tool-subagent: provider %q does not support child model selection", config.Provider)
+	}
 	request := SubagentStartRequest{
 		MaxDepth: config.MaxDepth, AgentOptions: config.AgentOptions,
 		Persona: config.Persona, ToolFilter: config.ToolFilter,
@@ -114,9 +126,12 @@ func (e *Engine) RegisterSubagentTool(config SubagentToolConfig) error {
 
 func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentToolConfig) Tool {
 	type input struct {
-		Description     string `json:"description"`
-		Prompt          string `json:"prompt"`
-		RunInBackground bool   `json:"run_in_background"`
+		Description     string  `json:"description"`
+		Prompt          string  `json:"prompt"`
+		RunInBackground bool    `json:"run_in_background"`
+		Provider        *string `json:"provider"`
+		Model           *string `json:"model"`
+		ReasoningEffort *string `json:"reasoning_effort"`
 	}
 	backgroundEnabled := config.EnableRunInBackground == nil || *config.EnableRunInBackground
 	wording, promptDescription := subagentProviderWording(provider.InheritsParentContext())
@@ -125,13 +140,20 @@ func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentT
 		"description": map[string]any{"type": "string", "description": "A short (3-5 word) description of the delegated task, for display."},
 		"prompt":      map[string]any{"type": "string", "description": promptDescription},
 	}
+	if config.ModelSelectionSettings {
+		properties["provider"] = map[string]any{"type": "string", "description": "LLM provider route for the child. Supply together with model; omit both to use configured child defaults or provider defaults."}
+		properties["model"] = map[string]any{"type": "string", "description": "Model id interpreted by provider. Supply together with provider; omit both to use configured child defaults or provider defaults."}
+		properties["reasoning_effort"] = map[string]any{"type": "string", "description": "Adapter-owned reasoning effort for the effective child route."}
+		description += " Child LLM selection is optional; use list_subagent_models to inspect allowed routes and efforts."
+	}
 	if backgroundEnabled {
 		description += " Set run_in_background to true to return a job id; collect with job_output and stop with job_kill."
 		properties["run_in_background"] = map[string]any{"type": "boolean", "description": "Whether to run as a background job and return its id. Defaults to false; collect with job_output or stop with job_kill."}
 	}
 	return Tool{
-		Schema:            ToolSchema{Name: config.ToolName, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
-		IsConcurrencySafe: alwaysConcurrencySafe,
+		Schema:                        ToolSchema{Name: config.ToolName, Description: description, Parameters: objectSchema(properties, "description", "prompt"), Output: subagentToolOutputSchema()},
+		subagentModelSelectionCapable: config.ModelSelectionSettings,
+		IsConcurrencySafe:             alwaysConcurrencySafe,
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
@@ -147,14 +169,90 @@ func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentT
 			if call.SessionID == "" {
 				return ToolResult{}, errors.New("subagent tool requires a calling agent session")
 			}
+			parent, err := e.getSession(call.SessionID)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			var routes []AllowedModelRoute
+			modelSelectionEnabled := false
+			if config.ModelSelectionSettings {
+				routes, modelSelectionEnabled, err = e.sampleSubagentModelSelection(parent)
+				if err != nil {
+					return ToolResult{}, err
+				}
+			}
+			modelRequest := subagentModelRequest{Provider: in.Provider, Model: in.Model, ReasoningEffort: in.ReasoningEffort}
+			parentSelection := parentModelSelectionForDelegation(parent)
+			requiresRoutePreflight := hasSubagentModelRequest(modelRequest) || hasConfiguredSubagentLlm(config.AgentOptions)
+			configuredAgentOptions := config.AgentOptions
+			inheritParentReasoningEffort := true
+			var providerBinding *subagentProviderBinding
+			if requiresRoutePreflight {
+				binding, err := e.snapshotSubagentProvider(config.Provider)
+				if err != nil {
+					return ToolResult{}, err
+				}
+				providerBinding = &binding
+				activeProvider := binding.provider
+				if defaultsProvider, ok := activeProvider.(SubagentAgentRouteDefaultsProvider); ok {
+					merged := defaultsProvider.AgentRouteDefaults()
+					if config.AgentOptions != nil {
+						if config.AgentOptions.Provider != "" {
+							merged.Provider = config.AgentOptions.Provider
+						}
+						if config.AgentOptions.Model != "" {
+							merged.Model = config.AgentOptions.Model
+						}
+						if config.AgentOptions.ReasoningEffort != "" {
+							merged.ReasoningEffort = config.AgentOptions.ReasoningEffort
+						}
+						if config.AgentOptions.MaxTokens != 0 {
+							merged.MaxTokens = config.AgentOptions.MaxTokens
+						}
+					}
+					configuredAgentOptions = &merged
+					inheritParentReasoningEffort = false
+				}
+				agentOptions, err := requestedSubagentAgentOptions(parentSelection, configuredAgentOptions, modelRequest, config.ModelSelectionSettings && modelSelectionEnabled)
+				if err != nil {
+					return ToolResult{}, err
+				}
+				if hasSubagentModelRequest(modelRequest) {
+					providerID, modelID := parentSelection.Provider, parentSelection.Model
+					if agentOptions != nil {
+						if agentOptions.Provider != "" {
+							providerID = agentOptions.Provider
+						}
+						if agentOptions.Model != "" {
+							modelID = agentOptions.Model
+						}
+					}
+					if providerID == "" || modelID == "" {
+						return ToolResult{}, errors.New("cannot select child LLM values without an effective provider and model")
+					}
+					if !allowedSubagentRoute(routes, providerID, modelID) {
+						return ToolResult{}, fmt.Errorf("child LLM route %q/%q is not allowed for this Session", providerID, modelID)
+					}
+				}
+				if err := e.preflightSubagentLlm(ctx, parentSelection, agentOptions, inheritParentReasoningEffort); err != nil {
+					return ToolResult{}, err
+				}
+				configuredAgentOptions = agentOptions
+			} else {
+				var err error
+				configuredAgentOptions, err = requestedSubagentAgentOptions(parentSelection, config.AgentOptions, modelRequest, config.ModelSelectionSettings && modelSelectionEnabled)
+				if err != nil {
+					return ToolResult{}, err
+				}
+			}
 			request := SubagentStartRequest{
 				ParentSessionID: call.SessionID, CWD: call.Workspace,
 				Label: in.Description, Prompt: []ContentBlock{{Type: "text", Text: in.Prompt}},
-				MaxDepth: config.MaxDepth, AgentOptions: config.AgentOptions,
+				MaxDepth: config.MaxDepth, AgentOptions: configuredAgentOptions,
 				Persona: config.Persona, ToolFilter: config.ToolFilter,
 			}
 			if in.RunInBackground {
-				jobID, err := startBackgroundSubagent(e, call.SessionID, in.Description, config.Provider, request)
+				jobID, err := startBackgroundSubagent(e, call.SessionID, in.Description, config.Provider, providerBinding, request)
 				if err != nil {
 					return ToolResult{}, err
 				}
@@ -162,7 +260,12 @@ func subagentProviderTool(e *Engine, provider SubagentProvider, config SubagentT
 				result.Value = map[string]any{"kind": "background", "jobId": jobID}
 				return result, nil
 			}
-			run, err := e.StartSubagent(ctx, config.Provider, request)
+			var run *SubagentRun
+			if providerBinding != nil {
+				run, err = e.startSubagentWithBinding(ctx, *providerBinding, request)
+			} else {
+				run, err = e.StartSubagent(ctx, config.Provider, request)
+			}
 			if err != nil {
 				return ToolResult{}, err
 			}
@@ -234,13 +337,19 @@ type backgroundSubagentStart struct {
 	finished bool
 }
 
-func startBackgroundSubagent(e *Engine, owner, label, provider string, request SubagentStartRequest) (string, error) {
+func startBackgroundSubagent(e *Engine, owner, label, provider string, binding *subagentProviderBinding, request SubagentStartRequest) (string, error) {
 	return e.jobs.startManaged(owner, "subagent", label, 0, func() (*managedJobHandle, error) {
 		startCtx, cancel := context.WithCancelCause(context.Background())
 		state := &backgroundSubagentStart{cancel: cancel}
 		done := make(chan managedJobResult, 1)
 		go func() {
-			run, err := e.StartSubagent(startCtx, provider, request)
+			var run *SubagentRun
+			var err error
+			if binding != nil {
+				run, err = e.startSubagentWithBinding(startCtx, *binding, request)
+			} else {
+				run, err = e.StartSubagent(startCtx, provider, request)
+			}
 			if err != nil {
 				status := jobFailed
 				if startCtx.Err() != nil && subagentStartupWasCancelled(err) {

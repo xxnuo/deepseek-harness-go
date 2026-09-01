@@ -26,9 +26,9 @@ const testAssetDestination = "testdata/upstream"
 const clientBuildVerificationProgram = `import { officialClientBuildEnvironment, readClientBuildRecord } from './scripts/client-build-environment.ts'; const root = process.cwd(); readClientBuildRecord(root, officialClientBuildEnvironment(root));`
 
 var testAssetPaths = []string{
-	"examples/jsonrpc-agent/tests/snapshots/text-turn/session.jsonl",
-	"examples/jsonrpc-agent/tests/snapshots/bash-tool/session.jsonl",
-	"examples/headless-agent/tests/snapshots/compaction-recovery/session.jsonl",
+	"snapshots/sdk/text-turn/session.jsonl",
+	"snapshots/sdk/bash-tool/session.jsonl",
+	"snapshots/session/compaction-recovery/session.jsonl",
 }
 
 func main() {
@@ -186,7 +186,7 @@ func collectRuntimeAssets(upstream string) ([]asset, error) {
 	}
 	for _, tree := range []string{
 		"apps/web/dist",
-		"apps/cli/config/agent-presets",
+		"packages/preset/agent-presets/presets",
 		"packages/code-runtime/code-runtime-python/py",
 		"packages/skill/skill-badge/assets",
 	} {
@@ -199,6 +199,7 @@ func collectRuntimeAssets(upstream string) ([]asset, error) {
 		"packages/*/*/lib/client.js",
 		"packages/*/*/lib/client.js.map",
 		"packages/*/*/cordis.patch.yml",
+		"vendor/*/package.json",
 	} {
 		matches, err := filepath.Glob(filepath.Join(upstream, filepath.FromSlash(pattern)))
 		if err != nil {

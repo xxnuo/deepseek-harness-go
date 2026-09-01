@@ -1,10 +1,37 @@
 package harness
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+type projectionCacheCloseBlockingProvider struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (p *projectionCacheCloseBlockingProvider) ID() string   { return "projection-cache-close" }
+func (p *projectionCacheCloseBlockingProvider) Name() string { return "Projection Cache Close" }
+func (p *projectionCacheCloseBlockingProvider) Models(context.Context) ([]ModelInfo, error) {
+	return []ModelInfo{{ID: p.ID(), Name: p.Name()}}, nil
+}
+func (p *projectionCacheCloseBlockingProvider) Complete(ctx context.Context, _ ChatRequest, _ func(Delta) error) (Completion, error) {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case p.canceled <- struct{}{}:
+	default:
+	}
+	return Completion{}, ctx.Err()
+}
 
 func projectionCacheTestConfig(t *testing.T) Config {
 	t.Helper()
@@ -145,5 +172,115 @@ func TestSessionProjectionCacheRequiresValidPersistentConfig(t *testing.T) {
 	config.SessionProjectionCache.WriteEveryEvents = 0
 	if _, err := New(WithConfig(config)); err == nil {
 		t.Fatal("invalid projection cache threshold was accepted")
+	}
+}
+
+func TestEngineCloseCheckpointsDynamicProjectionAfterWorkerCancellation(t *testing.T) {
+	config := projectionCacheTestConfig(t)
+	config.Terminal.Disabled = true
+	engine, err := New(WithConfig(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = engine.Close()
+		}
+	})
+
+	provider := &projectionCacheCloseBlockingProvider{
+		started:  make(chan struct{}, 1),
+		canceled: make(chan struct{}, 1),
+	}
+	engine.RegisterProvider(provider)
+	id, err := engine.CreateSession(t.Context(), config.Workspace, "projection-cache-close-order", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	runDynamicBuiltinPlugin(t, engine, id, "cpc", `
+return {
+  inject: ['sessionProjections'],
+  apply(ctx) {
+    ctx.sessionProjections.register({
+      key: 'dynamic/close-count',
+      stateVersion: 1,
+      init: () => ({ count: 0 }),
+      apply: (state, event) => event.type === 'turn/end'
+        ? { count: state.count + 1 }
+        : state,
+      wire: { view: state => state },
+    })
+  },
+}`)
+	composition := engine.sessionProjections.Signature()
+	if !strings.Contains(composition, "dynamic/close-count") {
+		t.Fatalf("dynamic projection missing from composition %q", composition)
+	}
+	session, err := engine.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	medium := engine.projectionCache.medium
+
+	if _, err := engine.Prompt(t.Context(), id, PromptRequest{
+		Mode: "queue", Content: []PromptContentPart{{Type: "text", Text: "wait"}}, Literal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogWriter)
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- engine.Close() }()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+		closed = true
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Close did not finish")
+	}
+	select {
+	case <-provider.canceled:
+	default:
+		t.Fatal("provider did not observe shutdown cancellation")
+	}
+	if output := logs.String(); strings.Contains(output, "dynamic Cordis runtime is closed") || strings.Contains(output, "session projection cache close write") {
+		t.Fatalf("shutdown logged a projection/runtime failure:\n%s", output)
+	}
+
+	session.mu.Lock()
+	lastSeq := len(session.Events) - 1
+	session.mu.Unlock()
+	medium.mu.RLock()
+	record, ok := medium.records[id]
+	medium.mu.RUnlock()
+	if !ok {
+		t.Fatal("final projection cache record is missing")
+	}
+	if record.Seq != lastSeq {
+		t.Fatalf("final projection cache seq = %d, want %d", record.Seq, lastSeq)
+	}
+	if record.Composition != composition {
+		t.Fatalf("final projection cache composition = %q, want %q", record.Composition, composition)
+	}
+	want := map[string]any{"count": float64(1)}
+	if got := record.Values["dynamic/close-count"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("final dynamic projection = %#v, want %#v", got, want)
+	}
+	if after := engine.sessionProjections.Signature(); strings.Contains(after, "dynamic/close-count") {
+		t.Fatalf("dynamic projection survived run disposal: %q", after)
 	}
 }

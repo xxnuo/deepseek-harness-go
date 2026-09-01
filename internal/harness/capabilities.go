@@ -54,7 +54,7 @@ func (e *Engine) presetRoots() [][2]string {
 	// Locate the fixed checkout when the library is used from this repository.
 	if _, file, _, ok := runtime.Caller(0); ok {
 		root := filepath.Dir(file)
-		add(filepath.Join(root, "deepseek-harness", "apps", "cli", "config", "agent-presets"), "system")
+		add(filepath.Join(root, "deepseek-harness", "packages", "preset", "agent-presets", "presets"), "system")
 	}
 	return roots
 }
@@ -167,7 +167,27 @@ func (e *Engine) findPreset(id string) (presetRecord, bool) {
 			return row, true
 		}
 	}
+	// dsh-v0.1.2-alpha.1 renamed the shipped Code Mode preset to `ptc`.
+	// Keep the old id as a read/runtime alias for persisted Go sessions and
+	// callers, while the discovered roster exposes only the canonical id.
+	if id == "code" {
+		for _, row := range scanPresets(e) {
+			if row.id == "ptc" {
+				return row, true
+			}
+		}
+	}
 	return presetRecord{}, false
+}
+
+// canonicalPresetID is the runtime compatibility boundary for the alpha.1
+// rename of the shipped Code Mode preset. New headers and selection events
+// must use `ptc`; only old persisted values may still arrive as `code`.
+func canonicalPresetID(id string) string {
+	if id == "code" {
+		return "ptc"
+	}
+	return id
 }
 
 func (e *Engine) presetEntries() []map[string]any { return e.presetRows() }
@@ -188,6 +208,7 @@ func (e *Engine) resolvePreset(id string) (string, *RPCError) {
 			}
 		}
 	}
+	id = canonicalPresetID(id)
 	row, ok := e.findPreset(id)
 	if !ok {
 		return "", rpcError("agent-preset-not-found", "preset not found", map[string]any{"agentPreset": id})
@@ -610,6 +631,10 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 	cwd := parent.Header.CWD
 	depth := parent.Header.DelegationDepth
 	model := parent.Model
+	parentEvents := append([]Event(nil), parent.Events...)
+	if latest, ok := latestLoggedModel(parent.Events); ok {
+		model = latest
+	}
 	available := parent.attached && !parent.draining
 	parent.mu.Unlock()
 	if !available {
@@ -618,17 +643,29 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 	if int64(depth) >= maxJSONSafeInteger {
 		return "", errors.New("subagent child depth exceeds the safe-integer range")
 	}
-	child, err := e.createSession(ctx, SessionHeader{
+	child, err := e.createSessionWithPresetAdoption(ctx, SessionHeader{
 		ID: id, CWD: cwd, ParentSession: parentID, Origin: "subagent",
 		DelegationDepth: depth + 1, AgentPreset: preset, Mode: "continuable",
-	}, shouldPinPermissionSnapshot(preset))
+	}, shouldPinPermissionSnapshot(preset), false, false)
 	if err != nil {
 		return "", err
 	}
 	s, _ := e.getSession(child)
+	committed := false
+	defer func() {
+		if !committed {
+			e.rollbackUnpublishedModelSubagent(child, s)
+		}
+	}()
 	s.mu.Lock()
 	s.Model = model
 	s.mu.Unlock()
+	// Durable child policy must be established while the deferred session is
+	// still unpublished. This preserves the parent's decision even when the
+	// Host setting changes between parent creation and child composition.
+	if err := e.inheritSubagentModelSelection(s, parentEvents); err != nil {
+		return "", err
+	}
 	descriptor, err := SnapshotSubagentDescriptor(SubagentDescriptorData{
 		Mode: "continuable", Provider: "library", Label: descriptorString(child),
 		AgentProvider: descriptorString(model.Provider), AgentModel: descriptorString(model.Model),
@@ -640,7 +677,12 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 		return "", err
 	}
 	e.mu.Lock()
-	_ = e.saveStateLocked()
+	if err := e.saveStateLocked(); err != nil {
+		e.mu.Unlock()
+		return "", err
+	}
 	e.mu.Unlock()
+	committed = true
+	e.publishDeferredSession(s)
 	return child, nil
 }

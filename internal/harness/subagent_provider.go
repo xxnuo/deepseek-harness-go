@@ -40,6 +40,7 @@ type SubagentCapabilities struct {
 	DepthLimit   bool `json:"depthLimit"`
 	ToolFilter   bool `json:"toolFilter"`
 	Persona      bool `json:"persona"`
+	AgentOptions bool `json:"agentOptions"`
 }
 
 // SubagentServiceError carries the stable error codes exposed by the upstream
@@ -92,9 +93,10 @@ type SubagentStartRequest struct {
 // SubagentAgentOptions selects child model defaults for providers that expose
 // the corresponding start capability.
 type SubagentAgentOptions struct {
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	MaxTokens int    `json:"maxTokens,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	MaxTokens       int    `json:"maxTokens,omitempty"`
 }
 
 // SubagentToolFilter limits the child tool catalog for capable providers.
@@ -123,11 +125,26 @@ type SubagentProvider interface {
 	Start(context.Context, SubagentStartRequest) (*SubagentRun, error)
 }
 
+// SubagentAgentRouteDefaultsProvider exposes provider-owned route defaults for
+// callers that must validate a partial per-run AgentOptions override.
+type SubagentAgentRouteDefaultsProvider interface {
+	AgentRouteDefaults() SubagentAgentOptions
+}
+
 // SubagentProviderInfo is the stable library-facing provider descriptor.
 type SubagentProviderInfo struct {
 	Name                  string               `json:"name"`
 	Capabilities          SubagentCapabilities `json:"capabilities"`
 	InheritsParentContext bool                 `json:"inheritsParentContext"`
+}
+
+// subagentProviderBinding is the provider instance and registration generation
+// observed during admission. A name-only lookup after an asynchronous
+// preflight could accidentally hand the request to a replacement provider.
+type subagentProviderBinding struct {
+	name     string
+	provider SubagentProvider
+	token    uint64
 }
 
 // SubagentRun is one published asynchronous external child.
@@ -334,21 +351,65 @@ func removeSubagentProviderName(order []string, name string) []string {
 	return order
 }
 
-// StartSubagent starts a registered one-shot provider. The returned run is
-// caller-owned and must be disposed.
-func (e *Engine) StartSubagent(ctx context.Context, providerName string, request SubagentStartRequest) (*SubagentRun, error) {
+func (e *Engine) snapshotSubagentProvider(providerName string) (subagentProviderBinding, error) {
+	name := strings.TrimSpace(providerName)
+	e.mu.RLock()
+	closed := e.closed
+	provider := e.subagentProviders[name]
+	token := e.subagentProviderTokens[name]
+	e.mu.RUnlock()
+	if closed {
+		return subagentProviderBinding{}, errors.New("engine is closed")
+	}
+	if provider == nil {
+		return subagentProviderBinding{}, subagentServiceError("NO_PROVIDER", fmt.Sprintf("no subagent provider registered for %q", providerName), nil)
+	}
+	return subagentProviderBinding{name: name, provider: provider, token: token}, nil
+}
+
+// startSubagentWithBinding starts the exact provider admitted by a caller.
+// The provider is checked while holding the registry read lock, then invoked
+// through the captured interface value after the lock is released. A later
+// unregister/re-register therefore cannot redirect this request to a new
+// provider, while an earlier replacement fails closed.
+func (e *Engine) startSubagentWithBinding(ctx context.Context, binding subagentProviderBinding, request SubagentStartRequest) (*SubagentRun, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := e.validateSubagentProviderBinding(binding); err != nil {
+		return nil, err
+	}
+	return e.startSubagentOnProvider(ctx, binding.name, binding.provider, request)
+}
+
+func (e *Engine) validateSubagentProviderBinding(binding subagentProviderBinding) error {
 	e.mu.RLock()
 	closed := e.closed
-	provider := e.subagentProviders[strings.TrimSpace(providerName)]
+	provider := e.subagentProviders[binding.name]
+	token := e.subagentProviderTokens[binding.name]
 	e.mu.RUnlock()
 	if closed {
-		return nil, errors.New("engine is closed")
+		return errors.New("engine is closed")
 	}
-	if provider == nil {
-		return nil, subagentServiceError("NO_PROVIDER", fmt.Sprintf("no subagent provider registered for %q", providerName), nil)
+	if provider == nil || token != binding.token {
+		return fmt.Errorf("subagent provider %q changed while resolving the child LLM route; retry the delegation", binding.name)
+	}
+	return nil
+}
+
+// StartSubagent starts a registered one-shot provider. The returned run is
+// caller-owned and must be disposed.
+func (e *Engine) StartSubagent(ctx context.Context, providerName string, request SubagentStartRequest) (*SubagentRun, error) {
+	binding, err := e.snapshotSubagentProvider(providerName)
+	if err != nil {
+		return nil, err
+	}
+	return e.startSubagentWithBinding(ctx, binding, request)
+}
+
+func (e *Engine) startSubagentOnProvider(ctx context.Context, providerName string, provider SubagentProvider, request SubagentStartRequest) (*SubagentRun, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := validateSubagentCapabilities(provider, request); err != nil {
 		return nil, err
@@ -361,7 +422,7 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 			return nil, err
 		}
 	}
-	descriptor := SubagentDescriptorData{Mode: "one-shot", Provider: strings.TrimSpace(provider.Name())}
+	descriptor := SubagentDescriptorData{Mode: "one-shot", Provider: strings.TrimSpace(providerName)}
 	if request.Label != "" {
 		descriptor.Label = descriptorString(request.Label)
 	}
@@ -401,6 +462,7 @@ func (e *Engine) StartSubagent(ctx context.Context, providerName string, request
 		if len(result.Output) > 0 {
 			terminal["lastAssistantMessage"] = result.Output
 		}
+		e.notifySDKSubagentEnd(request.ParentSessionID, terminal)
 		e.emitDynamicCordisScopedContained(request.ParentSessionID, "subagent/end", terminal)
 	}()
 	return run, nil
@@ -419,6 +481,9 @@ func validateSubagentCapabilities(provider SubagentProvider, request SubagentSta
 	}
 	if request.Persona != "" && !capabilities.Persona {
 		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "persona"), nil)
+	}
+	if request.AgentOptions != nil && !capabilities.AgentOptions {
+		return subagentServiceError("UNSUPPORTED_CAPABILITY", fmt.Sprintf("subagent provider %q does not support the %q capability", provider.Name(), "agentOptions"), nil)
 	}
 	return nil
 }

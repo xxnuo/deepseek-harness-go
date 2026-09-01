@@ -224,6 +224,11 @@ type codexPendingDiagnostic struct {
 	reason   string
 }
 
+const (
+	codexDiagnosticPriorityStderr   = 1
+	codexDiagnosticPriorityProtocol = 2
+)
+
 type codexStderrSignature struct {
 	text     string
 	request  string
@@ -252,6 +257,7 @@ type codexSubagentWire struct {
 	hasUnphasedAnswer  bool
 	diagnostic         string
 	diagnosticOrder    int
+	diagnosticPriority int
 	observationOrder   int
 	pendingDiagnostic  *codexPendingDiagnostic
 	failure            *codexFailureFacts
@@ -659,14 +665,19 @@ func (w *codexSubagentWire) recordDiagnostic(request, decision, reason string, o
 }
 
 func (w *codexSubagentWire) recordDiagnosticLocked(request, decision, reason string, order int) {
+	w.recordDiagnosticWithPriorityLocked(request, decision, reason, order, codexDiagnosticPriorityProtocol)
+}
+
+func (w *codexSubagentWire) recordDiagnosticWithPriorityLocked(request, decision, reason string, order, priority int) {
 	if order == 0 {
 		w.observationOrder++
 		order = w.observationOrder
 	}
-	if order < w.diagnosticOrder {
+	if priority < w.diagnosticPriority || priority == w.diagnosticPriority && order < w.diagnosticOrder {
 		return
 	}
 	w.diagnosticOrder = order
+	w.diagnosticPriority = priority
 	w.diagnostic = fmt.Sprintf("Codex unattended decision (mode: %s; request: %s; decision: %s): %s", w.permissionMode, request, decision, reason)
 }
 
@@ -705,7 +716,7 @@ func (w *codexSubagentWire) observeStderr(chunk string) {
 		}
 	}
 	if latest != nil {
-		w.recordDiagnosticLocked(latest.request, latest.decision, latest.reason, 0)
+		w.recordDiagnosticWithPriorityLocked(latest.request, latest.decision, latest.reason, 0, codexDiagnosticPriorityStderr)
 	}
 	w.stderrTail = codexStderrSignatureTail(observed)
 	w.mu.Unlock()

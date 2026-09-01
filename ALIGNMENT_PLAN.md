@@ -1,6 +1,6 @@
 # DeepSeek Harness Go 语义对齐记录
 
-基线：上游 `deepseek-harness` commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`（`dsh-v0.1.1-rc.2`）。本记录按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
+当前基线：上游 `deepseek-harness` commit `cd5ef8148158c3a752a658978873241fdf8e2bbc`（`dsh-v0.1.2-alpha.1`）。此前 rc.2 的完成记录保留为迁移历史；本轮继续按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
 
 ## 对齐顺序
 
@@ -26,6 +26,20 @@
 - [x] web capability、HTTP fetch policy 和 search providers 语义。
 - [ ] 其余 capability 逐项对齐。
 - [ ] 全量验证和收口。
+
+上面两项是跨版本的长期对齐清单；本节的 alpha.1 专项已单独完成并按下述边界收口。
+
+## dsh-v0.1.2-alpha.1 跟进计划与逐步记录
+
+验收总门禁：`make verify-upstream test vet race smoke-standalone smoke-clean-archive`。所有 runtime 测试均通过 `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- ...` 使用当前 pinned 上游资产；静态编译、清单计数和镜像/资产生成不能代替真实 CLI、RPC、provider request 与持久化行为验证。
+
+1. [已完成] 固定并审计 alpha.1 基线：已确认 `upstream.lock`、上游 `HEAD` 与 tag 精确对应 `cd5ef8148158c3a752a658978873241fdf8e2bbc` / `dsh-v0.1.2-alpha.1`，且上游工作树干净；已按 package API、调用链、状态与事件语义完成本轮差异核对。未验证的完整 npm/Cordis 生态和真实外部 provider 不计入已完成项。
+2. [已完成] PTC canonical 与历史兼容：工具展示配置只接受 `native|ptc|both`；新 header、selection event、fork/subagent 继承写 `ptc`；旧磁盘 header/event 中的 `code` 只在运行时解析为 `ptc`，冷加载不改写原 JSONL；保留 `tool/code-dispatch*`、`tools-code-mode` 与 `run_code.code` 持久契约。验证：`go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -count=1 -run '^TestPTCCompatibility' ./internal/harness`。
+3. [已完成] `modelSelectionSettings`：实现 `subagent-model-selection` 设置、顶层 session 在 publication/late tool installation 边界冻结设置、子 session 从父 durable policy 或冻结快照继承、恢复 seed 不重采样、route preflight、subagent tool route 参数和 `list_subagent_models`。验证：`go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -run '^TestSubagentModelSelection' -count=1 ./internal/harness`；`go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -race -run '^TestSubagentModelSelection' -count=1 ./internal/harness`。
+4. [已完成] DeepSeek request extensions、session log、plugin package inventory 与 pi-ai 0.84.2：已补齐 registry/acceptance、增量投递、基于 Loader tree base 的 immutable package provenance、Baseten wire、thinking budget 与 finish reason；SDK JSON-RPC 仅对字符串/数字 id dispatch，notification 和非法 id 丢弃。每项均保留定向测试证据；httptest wire 仅证明协议时序，不等价真实外部 provider/credential 验证。
+5. [已完成] alpha.1 workspace inventory：按 pinned tree 重新生成 264-root 正式清单，分类 `frontend=41`、`hybrid=9`、`ported=178`、`replaced=23`、`support=13`，无 `missing`/`partial`；`packages/sdk/client` 仅有 Go SDK server/runtime surface，故标为 `hybrid`，不声明公开 TypeScript SDK client 对等；webhook 两包仅标为可选 support，不声明已移植 ingress/rule runtime。
+6. [已完成] 同步 runtime assets、public facade 和生成物后，已运行专项测试、CLI/RPC/provider wire 验收及完整 Makefile 门禁；命令与退出结果记录在本节末尾。httptest wire 仅覆盖确定性协议边界，不替代真实外部 provider/credential 验证。
+7. [已完成] 已复核 diff、dirty worktree 保留边界、未实现分类和验证证据；本轮只保留用户既有及 alpha.1 对齐改动，未回退无关修改。完整 npm/Cordis 生态、平台 ripgrep 打包和低频插件配置继续作为明确 deferred scope。
 
 ## 已完成：普通 Agent tool scheduler
 
@@ -437,7 +451,7 @@ Go 入口：`internal/harness/shell_env.go`、`subprocess_env.go`、`tools.go`�
 
 行为验证：`TestProfileRuntimeUsesLoaderDefaultExportUnwrapSemantics`、`TestProfileRuntimeValidatesAndNormalizesPluginConfig`、`TestProfileRuntimeConstructsClassPluginsAndRunsInit`、`TestProfileRuntimeSupportsCordisServiceImports`、`TestProfileRuntimeCollectsPluginApplyDisposer`、`TestProfileRuntimeReconcileRollsBackFailedUpdate`、`TestProfileRuntimeMountCleansPartialStartup`、`TestResolveProfilePluginPathUsesNodeExportsSemantics`、`TestProfileEntryInjectAcceptsObjectDependencyMap`、`TestDynamicCordisEffectAwaitsAsyncSetupAndCleanup`、`TestDynamicCordisEffectConsumesSyncAndAsyncIterables`，以及 profile runtime/动态生命周期专项套件。
 
-仍待继续核对：fs-search 使用 Go 发行环境的 `rg`/`DSH_RIPGREP_PATH`，尚未像 npm upstream 一样随包携带平台 ripgrep；以及尚未接入 profile 映射的低频插件配置。
+本轮明确保留的后续范围：fs-search 仍使用 Go 发行环境的 `rg`/`DSH_RIPGREP_PATH`，尚未像 npm upstream 一样随包携带平台 ripgrep；若干低频插件配置尚未接入 profile 映射。以上不影响本轮已覆盖的 pinned runtime 行为，不能据此宣称完整 npm 包交付等价。
 
 本轮 skill-filesystem 语义补齐：skill root 顺序调整为 project-dsh/project-agents、preset/custom、user、bundled，重复名称保留高优先级首个定义；发现目录同时跟随目录型和扁平 Markdown 型符号链接；保留不存在 root 以匹配上游后续 watcher 创建感知。`ReadDir` 的非缺失错误现在标记为 incomplete，skill catalog 不会因一次权限/I/O 故障发布缩水结果，保留 last-good catalog。
 
@@ -451,7 +465,7 @@ Go 入口：`internal/harness/shell_env.go`、`subprocess_env.go`、`tools.go`�
 
 本轮最小修复：`cmd/dsh/web_runtime.go` 与 `profile_runtime.go` 复用现有 Engine，外部插件按 entry id 执行新增、`DynamicCordisRun(..., "update")` 和 `DynamicCordisUndefine`；`internal/harness/harness.go` 增加 `ApplyRuntimeConfig`，原地更新配置投影、subagent provider roster 和 Host plugin inventory。非法 patch 仍不提交候选配置，保留 last-good 状态。
 
-行为验证：`TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine` 验证同一 Engine、已有 session、model/provider 更新、失败回滚；`TestStandaloneCustomProfileMJSArgsHelpAndHMR` 验证自定义 profile 的插件更新与退出；两项 `-race` 均通过。仍需继续覆盖：更新阶段运行中 plugin 的失败回滚、删除后旧 fiber disposal 顺序，以及 LSP/MCP/telemetry 等非插件配置项的原地重配置边界。
+行为验证：`TestProfilePatchWatchReloadsWebAndKeepsLastGoodEngine` 验证同一 Engine、已有 session、model/provider 更新、失败回滚；`TestStandaloneCustomProfileMJSArgsHelpAndHMR` 验证自定义 profile 的插件更新与退出；两项 `-race` 均通过。后续范围仍包括：更新阶段运行中 plugin 的故障注入回滚、删除后旧 fiber disposal 顺序，以及 LSP/MCP/telemetry 等非插件配置项的更深原地重配置覆盖。
 
 本轮插件生态核对补充：Host inventory gating 只适用于 Host composition 所拥有的实现（shell、fs、jobs、web、schedule、LSP 等）；`tool-ask-user`、`tool-cordis`、persistent shell、preset 内的 terminal/tool rows 属于 Agent composition，Go 继续全局注册后由 `runtimeForSession` 的 preset tool roster 过滤，不能误用 Host inventory 将其整体删掉。shell executor 另按 `runtime.GOOS` 只接受对应的 `tool-bash` 或 `tool-pwsh`，避免非原生 dialect 暴露。新增 `TestHostPluginInventoryGatesModelPluginRegistration` 覆盖 Host 禁用与平台 shell 语义。
 
@@ -463,7 +477,7 @@ Go 入口：`internal/harness/shell_env.go`、`subprocess_env.go`、`tools.go`�
 
 插件 inventory 语义补齐：上游 `packages/host/plugin-inventory/src/index.ts` 的 `list()` 明确跳过 `entry.options.group`，只返回非 group Loader entry；Go `composition.pluginInventoryEntries()` 现在保持 group 参与祖先禁用传播和子 ID 构造，但不再发布 group 行本身，避免客户端观察到原版不存在的 group 条目。`TestCompositionPluginInventoryUsesLoaderOrderAndEffectiveDisablement` 已按该行为验证。
 
-Runtime reload 回滚强化：`ApplyRuntimeConfig` 保存上一代 subagent provider roster/order，并在 provider 注册失败时恢复原顺序；回滚阶段的 MCP、telemetry、title、Host registry 和 provider restore 错误使用 `errors.Join` 保留，不再静默丢弃。当前仍缺故障注入覆盖，后续需验证各阶段失败时旧 fiber/工具/连接的可观察状态。
+Runtime reload 回滚强化：`ApplyRuntimeConfig` 保存上一代 subagent provider roster/order，并在 provider 注册失败时恢复原顺序；回滚阶段的 MCP、telemetry、title、Host registry 和 provider restore 错误使用 `errors.Join` 保留，不再静默丢弃。各阶段完整故障注入和旧 fiber/工具/连接可观察状态验证列为后续范围，不作为本轮 alpha.1 已验证证据。
 
 本轮继续对齐并验证：
 
@@ -484,3 +498,37 @@ Runtime reload 回滚强化：`ApplyRuntimeConfig` 保存上一代 subagent prov
 外部 profile runtime 生命周期补齐：上游 Loader 的 `EntryTree.entries()` 对嵌套 group 使用深度优先顺序，inventory 与 profile plugin 卸载均需保持该顺序；Go inventory 已改为递归深度优先且跳过 group 行，`profileRuntimeMount` 保存 plugin order 后按旧顺序删除。候选 profile plugin 在 define/start 任一阶段失败时会清理已登记的失败项、已启动兄弟项和 bootstrap，避免 reload 后残留 `state=failed` 的 dynamic plugin。新增 `TestProfileRuntimeMountCleansPartialStartup`。
 
 telemetry sink 比较增加不可比较动态值保护：接口 concrete type 不是 `Comparable` 时按 changed 处理，避免 runtime reload 在接口相等比较处 panic。MCP profile reconcile 增加 desired server 名称排序，并在新增连接失败时汇总新增连接关闭与旧连接恢复错误；测试覆盖 unchanged identity 保留、changed replacement、删除撤销工具及失败后的 last-good 恢复。相关测试：`TestEquivalentTelemetryConfigHandlesNonComparableSink`、`TestMCPReconcilePreservesIdentityReplacesAndRollsBack`。
+
+## 已完成：dsh-v0.1.2-alpha.1 workspace inventory
+
+上游基线：tag `dsh-v0.1.2-alpha.1`，commit `cd5ef8148158c3a752a658978873241fdf8e2bbc`，检查时上游工作树干净。
+
+执行记录：
+
+1. 按 alpha.1 的 `pnpm-workspace.yaml` 展开全部 workspace root，并以 pinned commit 的 `git ls-tree` blob identity 重新计算每个非 frontend root 的文件数和 path+blob SHA-256；旧 rc.2 清单不能用增量刷新，因为 alpha.1 新增 root 不存在于旧 rows。
+2. 用完整 264-root 结果替换 `upstream_inventory.tsv`，保留五列 TSV、frontend 的 `-` 占位和每个 runtime row 的 Go surface 校验。
+3. 将 `deepseek-llm-api-extensions`、`plugin-package-inventory-deepseek`、`session-log-deepseek` 标记为 `ported`：Go 已实现 extension registry、并发 prepare、冲突检测、JSON snapshot、取消、幂等 acceptance、内建 `dsh_session_log`/`dsh_plugin_packages` 注册，以及 DeepSeek HTTP 2xx 后、SSE 消费前的 acceptance；专项测试覆盖 registry lifecycle、取消和增量 session-log acceptance。
+4. 将 `webhook` 与 `webhook-github` 标记为 `support`：两者是 alpha.1 新增的可选 CLI example/profile 集成，未进入 base、web、headless、acp、sdk 或 sdk-minimal shipped bundle；该分类不声明 Go 已移植 webhook rule runtime 或 GitHub ingress adapter，Go surface 保持 `-`。
+5. `packages/sdk/client` 调整为 `hybrid`：Go 对应面是 `internal/harness/sdk.go` 提供的 server/runtime，不等价于上游公开 TypeScript client，因此不再将该包整体声称为 `ported`。最终分类为 `frontend=41`、`hybrid=9`、`ported=178`、`replaced=23`、`support=13`，共 264 root；verified baseline 中无 `missing` 或 `partial`。
+
+行为验证：
+
+- `go test ./internal/harness -run '^TestUpstreamContractWorkspaceInventory$' -count=1`
+- `make verify-upstream-inventory`
+- `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test ./internal/harness -run '^TestDeepSeek(ExtensionRegistryLifecycle|ExtensionRegistryCancellationStopsWaiting|SessionLogIncrementalAcceptance)' -count=1`
+
+## alpha.1 最终收口与边界
+
+最终验证记录（2026-08-29）：
+
+1. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-target go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -run '^TestDeepSeekPluginPackageInventory' -count=1 ./internal/harness`：PASS。
+2. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-sdk-test go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -count=1 -run '^TestJSONRPCSDK' ./internal/harness`：PASS；对应 `-race`：PASS。
+3. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-target go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -count=1 -run 'Test(DeepSeek|UpstreamInventory)' ./internal/harness`：PASS；其中 SDK client overclaim 断言确认 `hybrid=9`、`ported=178`。
+4. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-final-test make test`：PASS。
+5. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-final-vet make vet`：PASS；`GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-final-standalone make smoke-standalone`：PASS。
+6. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-final-race make race`：PASS（harness 及脚本包全部通过）。
+7. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-final-verify make verify-upstream`：PASS，包含 pinned checkout、runtime assets、pi-ai catalog、dynamic inspect catalog、workspace inventory、public facade 和 upstream contract。
+8. `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha1-clean-archive make smoke-clean-archive`：PASS；归档在仓外临时目录中完成全套测试和三类命令构建。
+9. `go run ./scripts/gen_public_facade -check` 与 `git diff --check`：PASS；上游 `deepseek-harness` 工作树仍干净并固定在 `cd5ef8148158c3a752a658978873241fdf8e2bbc`。
+
+收口边界：`packages/sdk/client` 仅以 `hybrid` 记录 Go 的 SDK server/runtime，对应的公开 TypeScript client 尚未移植；SDK notification 已按上游 transport 只接受字符串/数字 id。httptest provider wire 只证明请求扩展、SSE 时序和错误边界，不证明真实外部 provider 或 credential 可用。完整 npm/Cordis `ToolRuntime`/registry、对象 intercept 合并、平台 ripgrep 随包交付、低频插件 profile 配置、webhook ingress/rule runtime，以及更深的 reload 故障注入覆盖均保留为后续范围。现有 Go bash 成功文本格式和纯 Go WebP 编码差异已在对应章节明确，不伪称与上游字节级一致。

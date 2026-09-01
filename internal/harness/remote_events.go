@@ -5,6 +5,12 @@ package harness
 // Keeping it here makes new host event producers auditable in one place.
 var forwardedRemoteEvents = map[string]struct{}{
 	"agent-preset/selected":         {},
+	"approval/request":              {},
+	"api-session/activity":          {},
+	"api-session/added":             {},
+	"api-session/error":             {},
+	"api-session/removed":           {},
+	"api-session/status":            {},
 	"commands/change":               {},
 	"credentials/reference-updated": {},
 	"cordis/request-run":            {},
@@ -15,6 +21,7 @@ var forwardedRemoteEvents = map[string]struct{}{
 	"cordis/inspect-query-resolved": {},
 	"llm/adapters-updated":          {},
 	"settings/document-updated":     {},
+	"user-questions/request":        {},
 }
 
 func (e *Engine) emitRemoteEvent(event string, args ...any) {

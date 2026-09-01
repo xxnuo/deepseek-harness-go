@@ -1395,7 +1395,7 @@ func (e *Engine) codeModePrompt(session *Session, runtimeConfig agentRuntime) st
 	}
 	sort.Strings(names)
 	var sdk strings.Builder
-	sdk.WriteString("`run_code` is the only tool you can call directly. Reach every other tool through the SDK below.\n\n## Writing code for run_code\n\nCall tools as `await tools.name(args)`. Failed calls reject with ToolCallError. Emit only curated output with console.log and/or return.\n\n```ts\ntype JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };\ndeclare class ToolCallError extends Error { readonly toolName: string; }\ndeclare const tools: {\n")
+	sdk.WriteString("## Writing code for run_code\n\n`run_code` takes two required arguments: `code`, the body of an async TypeScript function, and `description`, a short summary of what the program does. The declarations below are SDK bindings for this program. A declaration does not make its name a directly callable tool; only names supplied as separate tool schemas may be called directly.\n\nInside the program, call tools as `await tools.name(args)`. Failed calls reject with ToolCallError. Emit only curated output with console.log and/or return.\n\nProgram-only SDK bindings:\n\n```ts\ntype JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };\ndeclare class ToolCallError extends Error { readonly toolName: string; }\ndeclare const tools: {\n")
 	for _, name := range names {
 		tool := tools[name]
 		if description := strings.TrimSpace(tool.Schema.Description); description != "" {

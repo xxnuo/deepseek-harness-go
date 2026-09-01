@@ -28,11 +28,100 @@ func (p *subagentToolTestProvider) Start(ctx context.Context, request SubagentSt
 	return p.start(ctx, request)
 }
 
+type subagentBindingTestProvider struct {
+	name                string
+	capabilitiesStarted chan struct{}
+	releaseCapabilities chan struct{}
+	starts              atomic.Int32
+	startErr            error
+}
+
+func (p *subagentBindingTestProvider) Name() string { return p.name }
+func (p *subagentBindingTestProvider) Capabilities() SubagentCapabilities {
+	if p.capabilitiesStarted != nil {
+		p.capabilitiesStarted <- struct{}{}
+		<-p.releaseCapabilities
+	}
+	return NoSubagentStartCapabilities()
+}
+func (*subagentBindingTestProvider) InheritsParentContext() bool { return false }
+func (p *subagentBindingTestProvider) Start(context.Context, SubagentStartRequest) (*SubagentRun, error) {
+	p.starts.Add(1)
+	return nil, p.startErr
+}
+
 func settledSubagentToolRun(id string, result SubagentResult, dispose func() error) *SubagentRun {
 	_, cancel := context.WithCancel(context.Background())
 	run := newSubagentRun(id, cancel, dispose)
 	run.settle(result)
 	return run
+}
+
+func TestSubagentProviderBindingDoesNotRedirectAfterAdmission(t *testing.T) {
+	oldStartErr := errors.New("old provider start reached")
+	oldProvider := &subagentBindingTestProvider{
+		name:                "binding",
+		capabilitiesStarted: make(chan struct{}, 1),
+		releaseCapabilities: make(chan struct{}),
+		startErr:            oldStartErr,
+	}
+	newProvider := &subagentBindingTestProvider{name: "binding", startErr: errors.New("new provider must not start")}
+	engine := &Engine{
+		subagentProviders:      map[string]SubagentProvider{"binding": oldProvider},
+		subagentProviderTokens: map[string]uint64{"binding": 1},
+	}
+	binding := subagentProviderBinding{name: "binding", provider: oldProvider, token: 1}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := engine.startSubagentWithBinding(t.Context(), binding, SubagentStartRequest{})
+		errCh <- err
+	}()
+	select {
+	case <-oldProvider.capabilitiesStarted:
+	case <-time.After(time.Second):
+		t.Fatal("captured provider did not reach the post-admission capability check")
+	}
+	engine.mu.Lock()
+	engine.subagentProviders["binding"] = newProvider
+	engine.subagentProviderTokens["binding"] = 2
+	engine.mu.Unlock()
+	close(oldProvider.releaseCapabilities)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, oldStartErr) {
+			t.Fatalf("start error = %v, want captured provider error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("captured provider start did not settle")
+	}
+	if oldProvider.starts.Load() != 1 || newProvider.starts.Load() != 0 {
+		t.Fatalf("provider starts old=%d new=%d", oldProvider.starts.Load(), newProvider.starts.Load())
+	}
+}
+
+func TestBackgroundSubagentRejectsStaleProviderBinding(t *testing.T) {
+	oldProvider := &subagentBindingTestProvider{name: "binding", startErr: errors.New("old provider must not start")}
+	newProvider := &subagentBindingTestProvider{name: "binding", startErr: errors.New("new provider must not start")}
+	engine := &Engine{
+		subagentProviders:      map[string]SubagentProvider{"binding": newProvider},
+		subagentProviderTokens: map[string]uint64{"binding": 2},
+		jobs:                   newJobRegistry(),
+	}
+	binding := subagentProviderBinding{name: "binding", provider: oldProvider, token: 1}
+	jobID, err := startBackgroundSubagent(engine, "", "stale binding", "binding", &binding, SubagentStartRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := engine.jobs.waitFor(t.Context(), "", jobID, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Status != jobFailed || !strings.Contains(snapshot.Detail, `provider "binding" changed`) {
+		t.Fatalf("background snapshot = %#v", snapshot)
+	}
+	if oldProvider.starts.Load() != 0 || newProvider.starts.Load() != 0 {
+		t.Fatalf("provider starts old=%d new=%d", oldProvider.starts.Load(), newProvider.starts.Load())
+	}
 }
 
 func TestSubagentDiagnosticFormattingAndUTF8Limit(t *testing.T) {

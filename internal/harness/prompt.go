@@ -93,11 +93,12 @@ type agentRuntime struct {
 }
 
 type presetRuntimeGeneration struct {
-	presetID string
-	path     string
-	mtimeMs  int64
-	size     int64
-	runtime  agentRuntime
+	presetID        string
+	path            string
+	mtimeMs         int64
+	size            int64
+	runtime         agentRuntime
+	pluginInventory []PluginInventoryEntry
 }
 
 func defaultAgentRuntime(config Config) agentRuntime {
@@ -220,6 +221,9 @@ func (e *Engine) presetRuntimeForCreation(preset, parentID string, child *Sessio
 func (e *Engine) ensurePresetRuntime(preset string) (*presetRuntimeGeneration, error) {
 	e.presetRuntimeMu.Lock()
 	defer e.presetRuntimeMu.Unlock()
+	if e.presetRuntimes == nil {
+		e.presetRuntimes = make(map[string]*presetRuntimeGeneration)
+	}
 	row, ok := e.findPreset(preset)
 	if !ok {
 		return nil, fmt.Errorf("agent-preset-not-found: %s", preset)
@@ -245,9 +249,64 @@ func (e *Engine) ensurePresetRuntime(preset string) (*presetRuntimeGeneration, e
 	if err != nil {
 		return nil, err
 	}
-	generation := &presetRuntimeGeneration{presetID: preset, path: path, mtimeMs: mtimeMs, size: size, runtime: runtimeConfig}
+	pluginInventory, err := compilePresetPluginInventory(row.content, filepath.Dir(path), e.deepSeekPluginBarePackageBase())
+	if err != nil {
+		return nil, err
+	}
+	generation := &presetRuntimeGeneration{
+		presetID: preset, path: path, mtimeMs: mtimeMs, size: size,
+		runtime: runtimeConfig, pluginInventory: pluginInventory,
+	}
 	e.presetRuntimes[preset] = generation
 	return generation, nil
+}
+
+func compilePresetPluginInventory(content, moduleBase, barePackageBase string) ([]PluginInventoryEntry, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &document); err != nil {
+		return nil, fmt.Errorf("agent-preset-invalid: %w", err)
+	}
+	if len(document.Content) != 1 || document.Content[0].Kind != yaml.SequenceNode {
+		return nil, errors.New("agent-preset-invalid: composition must be a YAML array")
+	}
+	entries := make([]PluginInventoryEntry, 0)
+	var walk func(*yaml.Node, bool, string)
+	walk = func(node *yaml.Node, inheritedDisabled bool, parentID string) {
+		if node == nil || node.Kind != yaml.MappingNode {
+			return
+		}
+		id := yamlScalar(yamlMapValue(node, "id"))
+		entryID := id
+		if parentID != "" && id != "" {
+			entryID = parentID + ":" + id
+		}
+		name := yamlScalar(yamlMapValue(node, "name"))
+		group := yamlNodeBool(yamlMapValue(node, "group"), false)
+		disabled := inheritedDisabled || presetRowDisabled(yamlMapValue(node, "disabled"))
+		if name != "" && !group {
+			var phase *string
+			if !disabled {
+				active := "active"
+				phase = &active
+			}
+			entries = append(entries, PluginInventoryEntry{
+				EntryID: entryID, ModuleName: name, ModuleBase: moduleBase,
+				BarePackageBase: barePackageBase, Enabled: !disabled, FiberPhase: phase,
+			})
+		}
+		if group {
+			children := yamlMapValue(node, "config")
+			if children != nil && children.Kind == yaml.SequenceNode {
+				for _, child := range children.Content {
+					walk(child, disabled, entryID)
+				}
+			}
+		}
+	}
+	for _, node := range document.Content[0].Content {
+		walk(node, false, "")
+	}
+	return entries, nil
 }
 
 func (e *Engine) compilePresetRuntime(row presetRecord) (agentRuntime, error) {
@@ -471,8 +530,8 @@ func (e *Engine) compilePresetRuntime(row presetRecord) (agentRuntime, error) {
 				return err
 			}
 			mode := yamlScalar(yamlMapValue(config, "mode"))
-			if mode != "native" && mode != "code" && mode != "both" {
-				return errors.New("agent-preset-invalid: agent-tool-presentation mode must be native, code, or both")
+			if mode != "native" && mode != "ptc" && mode != "both" {
+				return errors.New("agent-preset-invalid: agent-tool-presentation mode must be native, ptc, or both")
 			}
 			runtimeConfig.toolPresentation = mode
 		case "@deepseek-ai/dsh-plan-mode":
@@ -1275,8 +1334,11 @@ func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelecti
 	if agent.toolNames == nil || agent.toolNames["terminal_open"] {
 		add("tool:terminal", 130, "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited.")
 	}
-	if agent.toolPresentation == "code" || agent.toolPresentation == "both" {
-		add("tools:code-mode", 200, e.codeModePrompt(s, agent))
+	if agent.toolPresentation == "ptc" {
+		add("tools:ptc-only", 800, "`run_code` is the only tool you can call directly. A tool call naming any other tool fails. Reach every tool the SDK declares below from inside the program.")
+	}
+	if agent.toolPresentation == "ptc" || agent.toolPresentation == "both" {
+		add("tools:sdk", 5000, e.codeModePrompt(s, agent))
 	}
 	dynamic, err := e.dynamicPromptSections(sessionID, caller, assemblyContext)
 	if err != nil {

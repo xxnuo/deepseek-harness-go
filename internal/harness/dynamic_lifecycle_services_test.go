@@ -256,6 +256,29 @@ type rollbackTrackingSessionStore struct {
 	deleted   []string
 }
 
+type policyAppendFailOnceSessionStore struct {
+	SessionStore
+	fail    bool
+	deleted []string
+}
+
+func (s *policyAppendFailOnceSessionStore) Append(ctx context.Context, id string, events []Event) error {
+	if s.fail {
+		for _, event := range events {
+			if event.Type == subagentModelSelectionPolicyEvent {
+				s.fail = false
+				return errors.New("forced model-selection policy append failure")
+			}
+		}
+	}
+	return s.SessionStore.Append(ctx, id, events)
+}
+
+func (s *policyAppendFailOnceSessionStore) Delete(ctx context.Context, id string) error {
+	s.deleted = append(s.deleted, id)
+	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+}
+
 func (s *rollbackTrackingSessionStore) Append(context.Context, string, []Event) error {
 	return s.appendErr
 }
@@ -305,6 +328,83 @@ return {
 	if err := backend.Create(t.Context(), SessionHeader{Version: SessionFormatVersion, ID: "rollback-child", CreatedAt: 1}); err != nil {
 		t.Fatalf("persistence registration remained: %v", err)
 	}
+}
+
+func TestDynamicCordisEnterRollsBackFailedModelSelectionPolicy(t *testing.T) {
+	backend, err := NewJSONLSessionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &policyAppendFailOnceSessionStore{SessionStore: backend}
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace, cfg.Provider, cfg.Model = t.TempDir(), t.TempDir(), "echo", "echo"
+	cfg.SessionTitleLLM.Enabled = false
+	e, err := New(WithConfig(cfg), WithSessionStore(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	owner, err := e.CreateSession(t.Context(), cfg.Workspace, "policy-rollback-owner", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSubagentModelSelectionForTest(t, e, true)
+	registerSelectableSubagentToolForTest(t, e)
+	pluginID, _ := runDynamicBuiltinPlugin(t, e, owner, "prbk", `return { apply() {} }`)
+	e.dynamicCordis.RLock()
+	plugin := e.dynamicCordis.plugins[pluginID]
+	e.dynamicCordis.RUnlock()
+	if plugin == nil || plugin.run == nil {
+		t.Fatal("dynamic plugin run was not registered")
+	}
+	run := plugin.run
+	const childID = "policy-rollback-child"
+	prepared, err := e.dynamicCordisPrepareSession(run, childID, run.runtime.ToValue(map[string]any{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.session.mu.Lock()
+	beforeStore := prepared.session.store
+	beforeAttached := prepared.session.attached
+	beforeGeneration := prepared.session.attachmentGeneration
+	beforeSnapshot := prepared.session.subagentModelSelectionSnapshot
+	beforeSampled := prepared.session.subagentModelSelectionSampled
+	prepared.session.mu.Unlock()
+	store.fail = true
+	if err := e.dynamicCordisEnterPrepared(run, prepared); err == nil || !strings.Contains(err.Error(), "forced model-selection policy append failure") {
+		t.Fatalf("enter error = %v", err)
+	}
+	if _, err := e.getSession(childID); err == nil {
+		t.Fatal("failed enter left session in engine registry")
+	}
+	prepared.session.mu.Lock()
+	afterStore := prepared.session.store
+	afterAttached := prepared.session.attached
+	afterGeneration := prepared.session.attachmentGeneration
+	afterSnapshot := prepared.session.subagentModelSelectionSnapshot
+	afterSampled := prepared.session.subagentModelSelectionSampled
+	prepared.session.mu.Unlock()
+	if afterStore != beforeStore || afterAttached != beforeAttached || afterGeneration != beforeGeneration || afterSnapshot != beforeSnapshot || afterSampled != beforeSampled {
+		t.Fatalf("failed enter did not restore session state: store=%v/%v attached=%v/%v generation=%d/%d snapshot=%p/%p sampled=%v/%v", afterStore, beforeStore, afterAttached, beforeAttached, afterGeneration, beforeGeneration, afterSnapshot, beforeSnapshot, afterSampled, beforeSampled)
+	}
+	if !reflect.DeepEqual(store.deleted, []string{childID}) {
+		t.Fatalf("rolled back ids = %#v", store.deleted)
+	}
+	if err := e.dynamicCordisEnterPrepared(run, prepared); err != nil {
+		t.Fatalf("retry enter: %v", err)
+	}
+	current, err := e.getSession(childID)
+	if err != nil || current != prepared.session {
+		t.Fatalf("retry registry session = %p/%p, err=%v", current, prepared.session, err)
+	}
+	prepared.session.mu.Lock()
+	attached := prepared.session.attached
+	enteredStore := prepared.session.store
+	prepared.session.mu.Unlock()
+	if !attached || enteredStore != store || !prepared.entered {
+		t.Fatalf("retry enter state: attached=%v store=%v entered=%v", attached, enteredStore, prepared.entered)
+	}
+	e.dynamicCordisDetachPrepared(run, prepared)
 }
 
 func TestDynamicCordisPersistenceRestoreReusesArtifactAndQueues(t *testing.T) {

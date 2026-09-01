@@ -54,12 +54,14 @@ verify-upstream: check-upstream-clean
 	@test -d "$(UPSTREAM_DIR)/.git"
 	@test -f "$(UPSTREAM_DIR)/packages/core/agent-loop/src/agent.ts"
 	@test -f "$(UPSTREAM_DIR)/packages/core/session/src/types.ts"
-	@test -f "$(UPSTREAM_DIR)/packages/host/apiproxy/src/api/rpc-map.ts"
+	@test -f "$(UPSTREAM_DIR)/packages/client/connection/src/rpc.ts"
+	@test -f "$(UPSTREAM_DIR)/packages/api/gateway/src/stream-protocol.ts"
+	@test -f "$(UPSTREAM_DIR)/packages/api/session-controller/lib/typert.host.js"
 	@test -f "$(UPSTREAM_DIR)/apps/cli/src/args.ts"
 	@test -f "$(UPSTREAM_DIR)/apps/web/dist/index.html"
-	@test -f "$(UPSTREAM_DIR)/packages/client/runtime/lib/client.js"
+	@test -f "$(UPSTREAM_DIR)/packages/client/connection/lib/client.js"
 	@test -f "$(UPSTREAM_DIR)/packages/bundle/base/cordis.patch.yml"
-	@test -f "$(UPSTREAM_DIR)/apps/cli/config/agent-presets/standard/agent.cordis.yml"
+	@test -f "$(UPSTREAM_DIR)/packages/preset/agent-presets/presets/standard/agent.cordis.yml"
 	@$(MAKE) verify-runtime-assets
 	@$(MAKE) verify-pi-ai-catalog
 	@$(MAKE) verify-dynamic-inspect-catalog
@@ -137,8 +139,13 @@ smoke-standalone: prepare-runtime-assets
 	$(ASSET_GO) test -count=1 -run TestStandaloneBinaryServesEmbeddedRuntime ./cmd/dsh
 
 smoke-clean-archive: prepare-runtime-assets
-	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-		git archive --format=tar "$$(git write-tree)" | tar -xf - -C "$$tmp"; \
-		cd "$$tmp"; \
+	@set -e; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		index="$$tmp/index"; \
+		GIT_INDEX_FILE="$$index" git read-tree HEAD; \
+		GIT_INDEX_FILE="$$index" git add -A -- .; \
+		tree=$$(GIT_INDEX_FILE="$$index" git write-tree); \
+		mkdir "$$tmp/source"; \
+		git archive --format=tar "$$tree" | tar -xf - -C "$$tmp/source"; \
+		cd "$$tmp/source"; \
 		DEEPSEEK_HARNESS_UPSTREAM="$(abspath $(UPSTREAM_DIR))" $(GO) run ./scripts/with_runtime_assets --upstream "$(abspath $(UPSTREAM_DIR))" -- test -count=1 ./...; \
 		DEEPSEEK_HARNESS_UPSTREAM="$(abspath $(UPSTREAM_DIR))" $(GO) run ./scripts/with_runtime_assets --upstream "$(abspath $(UPSTREAM_DIR))" -- build ./cmd/dsh ./cmd/dsh-sdk ./cmd/dsh-landlock-run

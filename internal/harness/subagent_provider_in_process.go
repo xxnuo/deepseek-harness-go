@@ -15,7 +15,7 @@ type inProcessSubagentProvider struct {
 func (provider *inProcessSubagentProvider) Name() string { return provider.name }
 
 func (*inProcessSubagentProvider) Capabilities() SubagentCapabilities {
-	return SubagentCapabilities{OutputSchema: true, DepthLimit: true, ToolFilter: true, Persona: true}
+	return SubagentCapabilities{OutputSchema: true, DepthLimit: true, ToolFilter: true, Persona: true, AgentOptions: true}
 }
 
 func (provider *inProcessSubagentProvider) InheritsParentContext() bool { return provider.fork }

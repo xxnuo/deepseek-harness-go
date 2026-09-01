@@ -14,6 +14,7 @@ type IndexInjectionKind string
 const (
 	IndexInjectionGlobal    IndexInjectionKind = "global"
 	IndexInjectionScript    IndexInjectionKind = "script"
+	IndexInjectionPreload   IndexInjectionKind = "script-preload"
 	IndexInjectionScriptSrc IndexInjectionKind = "script-src"
 	IndexInjectionStyle     IndexInjectionKind = "style"
 	IndexInjectionHTML      IndexInjectionKind = "html"
@@ -57,6 +58,8 @@ var (
 	indexBodyTag = regexp.MustCompile(`(?i)<body(?:\s[^>]*)?>`)
 )
 
+const indexReadyMarkup = `<script>(globalThis.__DSH_BOOT_READY__ ??= Promise.withResolvers()).resolve()</script>`
+
 func indexJSON(value any) (string, error) {
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
@@ -88,6 +91,8 @@ func renderIndexInjection(row IndexInjection) (IndexInjectionPlacement, string, 
 			return "", "", fmt.Errorf("invalid index injection placement %q", row.Placement)
 		}
 		return row.Placement, `<script>` + row.Text + `</script>`, nil
+	case IndexInjectionPreload:
+		return IndexInjectionHead, `<link rel="preload" as="script" href="` + indexAttribute(row.Src) + `">`, nil
 	case IndexInjectionScriptSrc:
 		if row.Placement != IndexInjectionHead && row.Placement != IndexInjectionBody {
 			return "", "", fmt.Errorf("invalid index injection placement %q", row.Placement)
@@ -119,6 +124,7 @@ func RenderIndexInjections(html string, rows []IndexInjection) (string, error) {
 			body.WriteString(markup)
 		}
 	}
+	body.WriteString(indexReadyMarkup)
 	if head.Len() > 0 {
 		match := indexHeadTag.FindStringIndex(html)
 		if match == nil {
@@ -127,13 +133,11 @@ func RenderIndexInjections(html string, rows []IndexInjection) (string, error) {
 			html = html[:match[1]] + head.String() + html[match[1]:]
 		}
 	}
-	if body.Len() > 0 {
-		match := indexBodyTag.FindStringIndex(html)
-		if match == nil {
-			html += body.String()
-		} else {
-			html = html[:match[1]] + body.String() + html[match[1]:]
-		}
+	match := indexBodyTag.FindStringIndex(html)
+	if match == nil {
+		html += body.String()
+	} else {
+		html = html[:match[1]] + body.String() + html[match[1]:]
 	}
 	return html, nil
 }
@@ -216,7 +220,6 @@ func (e *Engine) baseIndexInjections() ([]IndexInjection, error) {
 	if err != nil {
 		return nil, err
 	}
-	const modulesID = "@deepseek-ai/dsh-client-modules"
 	queue := `(()=>{
 const pendingQueue=[]
 window.__ModuleLoader__={
@@ -225,27 +228,29 @@ window.__ModuleLoader__={
   load(registration){pendingQueue.push(registration)},
   create(options){
     if(this.mode!=="queue")throw new Error("client-modules: window.__ModuleLoader__.create called after module-system boot")
-    const index=pendingQueue.findIndex(registration=>registration.id===` + fmt.Sprintf("%q", modulesID) + `)
+    const index=pendingQueue.findIndex(registration=>registration.id===` + fmt.Sprintf("%q", clientModulesID) + `)
     const registration=pendingQueue[index]
-    if(registration===undefined)throw new Error("client-modules: HTML did not preload ` + modulesID + `/client.js")
+    if(registration===undefined)throw new Error("client-modules: HTML did not preload ` + clientModulesID + `/client.js")
     pendingQueue.splice(index,1)
     const exports=registration.factory(specifier=>{
-      throw new Error('client-modules: ` + modulesID + `/client.js requested external "'+specifier+'" before the module system existed')
+      throw new Error('client-modules: ` + clientModulesID + `/client.js requested external "'+specifier+'" before the module system existed')
     })
     if(typeof exports!=="object"||exports===null||typeof exports.createClientModuleSystem!=="function"||typeof exports.apply!=="function"){
-      throw new Error("client-modules: ` + modulesID + `/client.js did not export the bootstrap module face")
+      throw new Error("client-modules: ` + clientModulesID + `/client.js did not export the bootstrap module face")
     }
     return exports.createClientModuleSystem(this,{id:registration.id,exports},options)
   }
 }
 })()`
 	rows := []IndexInjection{{Kind: IndexInjectionScript, Placement: IndexInjectionHead, Text: queue}}
-	for _, id := range []string{modulesID, "@deepseek-ai/dsh-client-runtime"} {
-		for _, entry := range graph.Entries {
-			if entry.ID == id {
-				rows = append(rows, IndexInjection{Kind: IndexInjectionScriptSrc, Placement: IndexInjectionHead, Src: entry.URL})
-				break
-			}
+	for _, batch := range graph.Batches {
+		if batch.Phase == BootBatchApplication {
+			rows = append(rows, IndexInjection{Kind: IndexInjectionPreload, Src: batch.URL})
+		}
+	}
+	for _, batch := range graph.Batches {
+		if batch.Phase == BootBatchBootstrap {
+			rows = append(rows, IndexInjection{Kind: IndexInjectionScriptSrc, Placement: IndexInjectionHead, Src: batch.URL})
 		}
 	}
 	rows = append(rows, IndexInjection{Kind: IndexInjectionGlobal, Name: "__DSH_BOOT__", Value: graph})

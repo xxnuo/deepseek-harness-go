@@ -8,6 +8,7 @@ import (
 func TestRenderIndexInjectionsOrderEscapingAndFragments(t *testing.T) {
 	rows := []IndexInjection{
 		{Kind: IndexInjectionScript, Placement: IndexInjectionHead, Text: "window.__Q__=1"},
+		{Kind: IndexInjectionPreload, Src: `/plugins/??a/client.js&rev="preload"`},
 		{Kind: IndexInjectionScriptSrc, Placement: IndexInjectionHead, Src: `/plugins/a.js?rev="1"&x=<y>`},
 		{Kind: IndexInjectionGlobal, Name: "__DSH_BOOT__", Value: map[string]any{"rev": "</script><b>"}},
 		{Kind: IndexInjectionStyle, Text: "body{margin:0}"},
@@ -21,12 +22,14 @@ func TestRenderIndexInjectionsOrderEscapingAndFragments(t *testing.T) {
 	parts := []string{
 		"<head>",
 		"<script>window.__Q__=1</script>",
+		`<link rel="preload" as="script" href="/plugins/??a/client.js&amp;rev=&quot;preload&quot;">`,
 		`<script src="/plugins/a.js?rev=&quot;1&quot;&amp;x=&lt;y&gt;"></script>`,
 		`globalThis["__DSH_BOOT__"] = {"rev":"\u003c/script>\u003cb>"}`,
 		"<style>body{margin:0}</style>",
 		`<meta name="probe">`,
 		"<body>",
 		`<script>window.__P__="dark"</script>`,
+		indexReadyMarkup,
 		"shell",
 	}
 	previous := -1
@@ -41,8 +44,12 @@ func TestRenderIndexInjectionsOrderEscapingAndFragments(t *testing.T) {
 		{Kind: IndexInjectionScript, Placement: IndexInjectionHead, Text: "H"},
 		{Kind: IndexInjectionScript, Placement: IndexInjectionBody, Text: "B"},
 	})
-	if err != nil || fragment != "<script>H</script><main>x</main><script>B</script>" {
+	if err != nil || fragment != "<script>H</script><main>x</main><script>B</script>"+indexReadyMarkup {
 		t.Fatalf("fragment = %q, %v", fragment, err)
+	}
+	empty, err := RenderIndexInjections("<html><body>shell</body></html>", nil)
+	if err != nil || empty != "<html><body>"+indexReadyMarkup+"shell</body></html>" {
+		t.Fatalf("empty rows = %q, %v", empty, err)
 	}
 }
 

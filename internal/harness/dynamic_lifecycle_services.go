@@ -281,10 +281,22 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	if err := validateSessionHeader(meta); err != nil {
 		return nil, err
 	}
+	var parentEvents []Event
+	if meta.Origin == "subagent" && meta.ParentSession != "" {
+		if parent, parentErr := e.getSession(meta.ParentSession); parentErr == nil {
+			parent.mu.Lock()
+			parentEvents = append([]Event(nil), parent.Events...)
+			parent.mu.Unlock()
+		}
+	}
 	session := &Session{
 		Header: meta,
 		Model:  ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model},
 		store:  nil, invariants: e.invariants,
+		// A dynamically prepared session becomes eligible only when it is a
+		// fresh root publication. Seeded and persistence-backed sessions must
+		// never resample host settings.
+		subagentModelSelectionEligible: !seedProvided && input.SeedSource != "persistence" && meta.Origin != "subagent" && meta.ParentSession == "",
 	}
 	session.mu.Lock()
 	for index, raw := range input.Seed {
@@ -320,6 +332,15 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	}
 	session.pending, session.steering = pending, steering
 	session.mu.Unlock()
+	// Dynamic agent/session creation can identify a delegated child directly in
+	// its metadata. Copy the parent's durable route policy before entering the
+	// store or exposing the prepared session, so setup and publication observe
+	// one immutable decision.
+	if meta.Origin == "subagent" && meta.ParentSession != "" {
+		if err := e.inheritSubagentModelSelection(session, parentEvents); err != nil {
+			return nil, err
+		}
+	}
 	prepared := &dynamicCordisPreparedSession{session: session, restored: input.SeedSource == "persistence"}
 	run.preparedSessions[id] = prepared
 	return prepared, nil
@@ -337,6 +358,11 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 	header := session.Header
 	events := append([]Event(nil), session.Events...)
 	firstLiveSeq := session.firstLiveSeq
+	priorStore := session.store
+	priorAttached := session.attached
+	priorAttachmentGeneration := session.attachmentGeneration
+	priorModelSelectionSnapshot := session.subagentModelSelectionSnapshot
+	priorModelSelectionSampled := session.subagentModelSelectionSampled
 	session.mu.Unlock()
 	e.mu.RLock()
 	if existing := e.sessions[header.ID]; existing != nil && existing != session {
@@ -371,11 +397,42 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 	}
 	session.mu.Lock()
 	session.store = store
-	session.attached = true
+	attachSessionLocked(session)
 	session.mu.Unlock()
 	e.mu.Lock()
 	e.sessions[header.ID] = session
+	var modelSelectionEvent Event
+	modelSelectionRecorded := false
+	if !prepared.restored && e.hasSubagentModelSelectionToolLocked() {
+		session.mu.Lock()
+		e.captureSubagentModelSelectionSnapshotLocked(session)
+		var recordErr error
+		modelSelectionEvent, modelSelectionRecorded, recordErr = e.recordSubagentModelSelectionPolicyLocked(session)
+		session.mu.Unlock()
+		if recordErr != nil {
+			delete(e.sessions, header.ID)
+			// Enter has not completed: restore the prepared session to the exact
+			// pre-enter state so callers may discard or retry it without leaving a
+			// detached registry entry or a stale store/snapshot handle behind.
+			session.mu.Lock()
+			session.store = priorStore
+			session.attached = priorAttached
+			session.attachmentGeneration = priorAttachmentGeneration
+			session.subagentModelSelectionSnapshot = priorModelSelectionSnapshot
+			session.subagentModelSelectionSampled = priorModelSelectionSampled
+			session.mu.Unlock()
+			prepared.entered = false
+			e.mu.Unlock()
+			if !prepared.restored {
+				rollbackSessionStoreCreate(store, header.ID)
+			}
+			return recordErr
+		}
+	}
 	e.mu.Unlock()
+	if modelSelectionRecorded {
+		e.publishEvent(header.ID, modelSelectionEvent)
+	}
 	prepared.entered = true
 	return nil
 }
@@ -392,7 +449,7 @@ func (e *Engine) dynamicCordisDetachPrepared(run *dynamicCordisRun, prepared *dy
 		session := prepared.session
 		session.mu.Lock()
 		id := session.Header.ID
-		session.attached = false
+		detachSessionLocked(session)
 		activity := session.activity
 		cancel := session.Cancel
 		session.Cancel = nil

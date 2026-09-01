@@ -44,7 +44,38 @@ func TestRootMaterializeAssetsInvalidatesLegacyCommitOnlyCache(t *testing.T) {
 		t.Fatal("legacy commit-only cache was reused")
 	}
 	if _, err := os.Stat(filepath.Join(materialized.PluginDir, "client", "ui-brand-official", "lib", "client.js")); err != nil {
-		t.Fatalf("current rc.2 client assets were not materialized: %v", err)
+		t.Fatalf("current client assets were not materialized: %v", err)
+	}
+}
+
+func TestRootMaterializeAssetsRepairsMissingConnectionProbe(t *testing.T) {
+	dataDir := t.TempDir()
+	materialized, err := MaterializeAssets(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(materialized.PluginDir, "client", "connection", "lib", "client.js")
+	want, err := os.ReadFile(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+
+	repaired, err := MaterializeAssets(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.UpstreamDir != materialized.UpstreamDir {
+		t.Fatalf("repair changed content-addressed cache root: %q != %q", repaired.UpstreamDir, materialized.UpstreamDir)
+	}
+	got, err := os.ReadFile(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("missing client/connection cache probe was not restored from the embedded bundle")
 	}
 }
 

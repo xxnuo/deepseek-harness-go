@@ -544,7 +544,7 @@ func TestInProcessStructuredOutputCommitsSuccessfulRunCodeCapture(t *testing.T) 
 			ID: "outer", Name: "run_code", Arguments: json.RawMessage(`{"code":"return await tools.structured_output({answer: 12})","description":"capture result"}`),
 		}}}
 	}}
-	engine, parentID := newInProcessProviderEngine(t, provider, func(config *Config) { config.ToolPresentation = "code" })
+	engine, parentID := newInProcessProviderEngine(t, provider, func(config *Config) { config.ToolPresentation = "ptc" })
 	run, err := engine.StartSubagent(t.Context(), "spawn", SubagentStartRequest{
 		ParentSessionID: parentID, Prompt: []ContentBlock{{Type: "text", Text: "answer"}}, OutputSchema: structuredSchema("answer"),
 	})
@@ -572,7 +572,7 @@ func TestInProcessStructuredOutputWaitsForRunCodeResult(t *testing.T) {
 		}
 		return Completion{Text: "outer failed", Finish: "stop"}
 	}}
-	engine, parentID := newInProcessProviderEngine(t, provider, func(config *Config) { config.ToolPresentation = "code" })
+	engine, parentID := newInProcessProviderEngine(t, provider, func(config *Config) { config.ToolPresentation = "ptc" })
 	run, err := engine.StartSubagent(t.Context(), "spawn", SubagentStartRequest{
 		ParentSessionID: parentID, Prompt: []ContentBlock{{Type: "text", Text: "answer"}}, OutputSchema: structuredSchema("answer"),
 	})

@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -17,7 +18,7 @@ import (
 )
 
 func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
-	if piAICatalogPackageVersion != "0.82.1" || piAICatalogManifestHash != "1a3c7cf59ada71c94abe4540976960524ee933034491c75d6418e2abc1b42535" {
+	if piAICatalogPackageVersion != "0.84.2" || piAICatalogManifestHash != "012f19b2e2c92706bc700f4c9dd80a21f1f43d68959bc90c78d2cdb51374d5cc" {
 		t.Fatalf("catalog gate = %s %s", piAICatalogPackageVersion, piAICatalogManifestHash)
 	}
 	models := 0
@@ -28,7 +29,7 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 			byAPI[model.API]++
 		}
 	}
-	if len(piAICatalog) != 38 || models != 1109 {
+	if len(piAICatalog) != 40 || models != 1267 {
 		t.Fatalf("catalog size = %d providers, %d models", len(piAICatalog), models)
 	}
 	wantUnsupported := []string{}
@@ -36,9 +37,9 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 		t.Fatalf("unsupported protocols = %#v", piAIUnsupportedCatalogProtocols)
 	}
 	wantByAPI := map[string]int{
-		"anthropic-messages": 276, "azure-openai-responses": 38, "bedrock-converse-stream": 114,
-		"google-generative-ai": 29, "google-vertex": 12, "mistral-conversations": 30,
-		"openai-codex-responses": 7, "openai-completions": 512, "openai-responses": 91,
+		"anthropic-messages": 280, "azure-openai-responses": 38, "bedrock-converse-stream": 114,
+		"google-generative-ai": 28, "google-vertex": 13, "mistral-conversations": 31,
+		"openai-codex-responses": 7, "openai-completions": 644, "openai-responses": 112,
 	}
 	if !reflect.DeepEqual(byAPI, wantByAPI) {
 		t.Fatalf("catalog APIs = %#v", byAPI)
@@ -80,6 +81,17 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 	if fireworks.Models[index].Compat.SendSessionAffinityHeaders == nil || !*fireworks.Models[index].Compat.SendSessionAffinityHeaders || fireworks.Models[index].Compat.SupportsCacheControlOnTools == nil || *fireworks.Models[index].Compat.SupportsCacheControlOnTools {
 		t.Fatalf("fireworks/deepseek-v4-flash compat = %#v", fireworks.Models[index].Compat)
 	}
+	baseten, err := resolvePiAIProfile("baseten", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index = slices.IndexFunc(baseten.models, func(model piAIModel) bool { return model.ID == "moonshotai/Kimi-K2.5" })
+	if index < 0 || baseten.models[index].Compat.ThinkingFormat != "baseten" || !reflect.DeepEqual(
+		baseten.models[index].Compat.ChatTemplateArgs,
+		map[string]any{"enable_thinking": map[string]any{"$var": "thinking.enabled"}},
+	) {
+		t.Fatalf("baseten/moonshotai/Kimi-K2.5 compat = %#v", baseten.models[index].Compat)
+	}
 }
 
 func TestPiAIRouteCompatRequiresCompletionsModel(t *testing.T) {
@@ -118,6 +130,32 @@ func TestPiAICompatIsMergedPerProtocolAndPerField(t *testing.T) {
 	}
 }
 
+func TestPiAIAlphaCompletionsCompatFields(t *testing.T) {
+	profile, err := resolvePiAIProfile("private-baseten", map[string]any{
+		"api": "openai-completions", "baseURL": "https://example.test/v1",
+		"models": []any{map[string]any{
+			"id": "reasoning-local", "reasoningEfforts": map[string]any{"off": "off", "high": "provider-high"},
+			"compat": map[string]any{
+				"supportsFinishReason": false, "thinkingFormat": "baseten",
+				"chatTemplateArgs":            map[string]any{"enable_thinking": map[string]any{"$var": "thinking.enabled"}},
+				"supportsThinkingTokenBudget": true,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compat := profile.models[0].Compat
+	if compat.SupportsFinishReason == nil || *compat.SupportsFinishReason ||
+		compat.SupportsThinkingTokenBudget == nil || !*compat.SupportsThinkingTokenBudget ||
+		compat.ThinkingFormat != "baseten" || !reflect.DeepEqual(
+		compat.ChatTemplateArgs,
+		map[string]any{"enable_thinking": map[string]any{"$var": "thinking.enabled"}},
+	) {
+		t.Fatalf("alpha compat = %#v", compat)
+	}
+}
+
 func TestPiAICompatRejectsWithheldEmptyAndInvalidKwargs(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -125,8 +163,12 @@ func TestPiAICompatRejectsWithheldEmptyAndInvalidKwargs(t *testing.T) {
 		want   string
 	}{
 		{name: "withheld", compat: map[string]any{"sessionAffinityFormat": "openai"}, want: "not configurable"},
+		{name: "withheld additional tools", compat: map[string]any{"supportsAdditionalTools": true}, want: "not configurable"},
 		{name: "empty", compat: map[string]any{"supportsStore": nil}, want: "with no value"},
 		{name: "variable", compat: map[string]any{"chatTemplateKwargs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled or thinking.effort"},
+		{name: "argument variable", compat: map[string]any{"chatTemplateArgs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled or thinking.effort"},
+		{name: "finish reason type", compat: map[string]any{"supportsFinishReason": "no"}, want: "must be boolean"},
+		{name: "thinking budget type", compat: map[string]any{"supportsThinkingTokenBudget": "yes"}, want: "must be boolean"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := resolvePiAIProfile("custom", map[string]any{
@@ -500,6 +542,109 @@ func TestOpenAICompletionsPiAICompatWire(t *testing.T) {
 	}
 }
 
+func TestOpenAICompletionsAlphaBasetenBudgetAndFinishInference(t *testing.T) {
+	var requests []map[string]any
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, request)
+		index := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if index == 1 {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+		} else {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"probe\",\"arguments\":\"{}\"}}]}}]}\n\n"))
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	model := piAIModel{
+		ID: "baseten-local", MaxTokens: 5000, Reasoning: true,
+		ThinkingLevelMap: map[string]*string{"off": stringPointer("off"), "high": stringPointer("high")},
+		Compat: piAIModelCompat{
+			ThinkingFormat:              "baseten",
+			ChatTemplateArgs:            map[string]any{"enable_thinking": map[string]any{"$var": "thinking.enabled"}},
+			SupportsReasoningEffort:     boolPointer(true),
+			SupportsFinishReason:        boolPointer(false),
+			SupportsThinkingTokenBudget: boolPointer(true),
+			MaxTokensField:              "max_tokens",
+		},
+	}
+	provider := NewOpenAIProvider("baseten", server.URL, "key", model.ID)
+	provider.modelSpec = model
+	first, err := provider.Complete(t.Context(), ChatRequest{
+		Model: model.ID, ReasoningEffort: "high", MaxTokens: 5000,
+		Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+	}, func(Delta) error { return nil })
+	if err != nil || first.Finish != "stop" {
+		t.Fatalf("inferred stop completion = %#v, %v", first, err)
+	}
+	second, err := provider.Complete(t.Context(), ChatRequest{
+		Model: model.ID, ReasoningEffort: "xhigh", MaxTokens: 2000,
+		Messages: []ChatMessage{{Role: "user", Content: "call"}},
+	}, func(Delta) error { return nil })
+	if err != nil || second.Finish != "tool_calls" || len(second.ToolCalls) != 1 {
+		t.Fatalf("inferred tool completion = %#v, %v", second, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d", len(requests))
+	}
+	firstBody := requests[0]
+	if firstBody["chat_template_args"].(map[string]any)["enable_thinking"] != true ||
+		firstBody["reasoning_effort"] != "high" || firstBody["thinking_token_budget"] != float64(3976) {
+		t.Fatalf("baseten request = %#v", firstBody)
+	}
+	secondBody := requests[1]
+	if secondBody["thinking_token_budget"] != float64(976) {
+		t.Fatalf("clamped budget request = %#v", secondBody)
+	}
+}
+
+func TestOpenAICompletionsFinishReasonRequiredByDefault(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	provider := NewOpenAIProvider("strict-finish", server.URL, "key", "model")
+	provider.modelSpec = piAIModel{ID: "model", Input: []string{"text"}}
+	_, err := provider.Complete(t.Context(), ChatRequest{Model: "model"}, func(Delta) error { return nil })
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "TRANSPORT" || !strings.Contains(providerErr.Message, "Stream ended without finish_reason") {
+		t.Fatalf("missing finish_reason error = %#v", err)
+	}
+}
+
+func TestOpenAIThinkingTokenBudgetDefaultsAndCustomCeiling(t *testing.T) {
+	for _, test := range []struct {
+		effort        string
+		configured    map[string]int
+		ceiling, want int
+	}{
+		{effort: "minimal", ceiling: 10000, want: 1024},
+		{effort: "low", configured: map[string]int{"low": 777}, ceiling: 10000, want: 777},
+		{effort: "xhigh", ceiling: 2000, want: 976},
+		{effort: "high", ceiling: 1024, want: 0},
+	} {
+		t.Run(test.effort, func(t *testing.T) {
+			budget, ok := openAIThinkingTokenBudget(test.effort, test.configured, test.ceiling)
+			if budget != test.want || (test.want > 0 && !ok) || (test.want == 0 && ok) {
+				t.Fatalf("budget = %d, ok=%v, want %d", budget, ok, test.want)
+			}
+		})
+	}
+}
+
 func TestAnthropicPiAICacheAndAdaptiveThinkingWire(t *testing.T) {
 	xhigh := "xhigh"
 	adaptive := true
@@ -657,3 +802,5 @@ func containsText(value, part string) bool {
 }
 
 func boolPointer(value bool) *bool { return &value }
+
+func stringPointer(value string) *string { return &value }

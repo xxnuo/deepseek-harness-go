@@ -85,7 +85,7 @@ func TestVersionDoesNotLoadProjectEnv(t *testing.T) {
 	if err := runWithIO([]string{"--version"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(stdout.String()) != "0.1.1-rc.2" || stderr.Len() != 0 {
+	if strings.TrimSpace(stdout.String()) != "0.1.2-alpha.1" || stderr.Len() != 0 {
 		t.Fatalf("version output = %q, stderr = %q", stdout.String(), stderr.String())
 	}
 }

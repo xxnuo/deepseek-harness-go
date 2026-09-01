@@ -878,7 +878,7 @@ func (provider *llmSessionTitleProvider) Generate(ctx context.Context, request S
 	var text, finish string
 	completion, err := modelProvider.Complete(callCtx, ChatRequest{
 		SessionID: request.Session.Header.ID, Model: route.Model, System: system, Messages: []ChatMessage{{Role: "user", Content: framed}},
-		Thinking: "disabled", MaxTokens: provider.config.MaxOutputTokens,
+		Purpose: "session-title", Thinking: "disabled", MaxTokens: provider.config.MaxOutputTokens,
 	}, func(delta Delta) error {
 		if len(delta.ToolCalls) > 0 {
 			return errors.New("session-title-llm: title model unexpectedly requested a tool")

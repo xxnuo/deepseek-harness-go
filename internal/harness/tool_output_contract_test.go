@@ -61,7 +61,7 @@ func TestCustomToolWithoutOutputFallsBackToJsonValue(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "custom-output", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "custom-output", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}

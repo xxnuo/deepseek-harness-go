@@ -14,7 +14,7 @@ import (
 
 var builtinSettingsNamespaces = []string{
 	"agent-default-model", "agent-loop", "agent-presets", "llm-deepseek", "llm-pi-ai",
-	"locale", "permission", "shell", "ui-conversation", "ui-onboarding", "ui-theme",
+	"locale", "permission", "shell", "subagent-model-selection", "ui-conversation", "ui-onboarding", "ui-theme",
 	"web-search-deepseek",
 }
 
@@ -62,6 +62,9 @@ func (e *Engine) resolvedSettingsValueLocked(ns string) (map[string]any, map[str
 	case "web-search-deepseek":
 		base = deepSeekWebSearchBaseSettings(e.cfg.DeepSeekWebSearch)
 		value = mergeSettings(base, user)
+	case subagentModelSelectionSettingsNamespace:
+		base = map[string]any{"enabled": false, "allowedModels": []any{}}
+		value = mergeSettings(base, user)
 	}
 	return value, base
 }
@@ -102,6 +105,9 @@ func (e *Engine) settingsViewLocked(ns string) map[string]any {
 		delete(value, "apiKey")
 		delete(user, "apiKey")
 		view["secrets"] = []any{map[string]any{"path": []any{"apiKey"}, "set": secretSet}}
+	case subagentModelSelectionSettingsNamespace:
+		view["schema"] = subagentModelSelectionSettingsSchema()
+		view["base"] = base
 	}
 	if _, ok := e.settings[ns]; ok {
 		view["user"] = user
@@ -198,6 +204,9 @@ func validateSettingsValue(ns string, value map[string]any) error {
 		}
 	case "llm-deepseek":
 		return validateDeepSeekSettings(value)
+	case subagentModelSelectionSettingsNamespace:
+		_, err := decodeSubagentModelSelectionSettings(value)
+		return err
 	}
 	return nil
 }

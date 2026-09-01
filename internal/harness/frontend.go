@@ -1,14 +1,19 @@
 package harness
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -24,10 +29,84 @@ type BootEntry struct {
 	External    []string `json:"external,omitempty"`
 }
 
+type BootBatchPhase string
+
+const (
+	BootBatchBootstrap   BootBatchPhase = "bootstrap"
+	BootBatchApplication BootBatchPhase = "application"
+)
+
+type BootBatch struct {
+	Phase   BootBatchPhase `json:"phase"`
+	URL     string         `json:"url"`
+	Rev     string         `json:"rev"`
+	Entries []string       `json:"entries"`
+}
+
 type BootGraph struct {
 	Rev     string      `json:"rev"`
 	Entries []BootEntry `json:"entries"`
+	Batches []BootBatch `json:"batches"`
 }
+
+type clientSourceMap struct {
+	body   []byte
+	parsed map[string]any
+}
+
+type bootPluginRecord struct {
+	entry     BootEntry
+	path      string
+	bundle    []byte
+	sourceMap *clientSourceMap
+	baseline  bootArtifactBaseline
+}
+
+// bootArtifactBaseline is captured before reading a bundle. The HMR side
+// compares this snapshot with the live file when it installs its watcher, so
+// a write in the startup-to-watch window cannot be lost.
+type bootArtifactBaseline struct {
+	path    string
+	mtimeNS int64
+	size    int64
+}
+
+type bootResponse struct {
+	body        []byte
+	contentType string
+}
+
+type bootCombo struct {
+	url          string
+	rev          string
+	entries      []string
+	script       []byte
+	sourceMap    []byte
+	sourceMapURL string
+}
+
+type bootSnapshot struct {
+	graph                  BootGraph
+	paths                  map[string]string
+	responses              map[string]bootResponse
+	batchResponses         map[string]bootResponse
+	previousBatchResponses map[string]bootResponse
+	records                map[string]bootPluginRecord
+	baselines              map[string]bootArtifactBaseline
+	configKey              string
+}
+
+const (
+	clientModulesID          = "@deepseek-ai/dsh-client-modules"
+	maxComboURLBytes         = 3 * 1024
+	comboRevisionPlaceholder = "000000000000"
+)
+
+var (
+	clientSourceMapTrailer = regexp.MustCompile(`(?:\r?\n)?//# sourceMappingURL=[^\r\n]*(?:\r?\n)?$`)
+	clientSourceURLTrailer = regexp.MustCompile(`(?:\r?\n)?//# sourceURL=([^\r\n]+)(?:\r?\n)?$`)
+	absoluteSourceURL      = regexp.MustCompile(`^[A-Za-z][A-Za-z\d+.-]*:`)
+)
 
 type clientPackageManifest struct {
 	Name    string                     `json:"name"`
@@ -132,13 +211,177 @@ func (e *Engine) clientPluginComposed(name string) bool {
 	return e.cfg.ClientPlugins != nil && e.clientPluginActive(name)
 }
 
-// buildBootGraph derives the client roster from the upstream package.json
-// dsh.client declarations and built lib/client.js artifacts. The browse picker
-// is intentionally omitted because the web profile composes the native picker.
+// buildBootGraph derives the alpha.1 client boot wire and the package paths
+// used by the HMR watcher.
 func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
+	snapshot, err := e.buildBootSnapshot()
+	if err != nil {
+		return BootGraph{}, nil, err
+	}
+	return snapshot.graph, snapshot.paths, nil
+}
+
+// buildBootSnapshot returns the Engine's immutable boot generation. The
+// generation is deliberately shared by index rendering, HTTP bundle serving,
+// and the HMR endpoint; rebuilding it independently would invalidate URLs
+// while a browser is still consuming the prior graph.
+func (e *Engine) buildBootSnapshot() (bootSnapshot, error) {
+	key := e.bootConfigKey()
+	e.bootMu.Lock()
+	defer e.bootMu.Unlock()
+	if e.bootSnapshot != nil && e.bootSnapshot.configKey == key {
+		return *e.bootSnapshot, nil
+	}
+	snapshot, err := e.buildBootSnapshotFreshLocked(key)
+	if err != nil {
+		return bootSnapshot{}, err
+	}
+	if e.bootSnapshot != nil {
+		snapshot.previousBatchResponses = e.bootSnapshot.batchResponses
+	}
+	e.bootSnapshot = &snapshot
+	return snapshot, nil
+}
+
+// rebuildBootArtifact snapshots one changed bundle and publishes a new boot
+// generation. It returns changed=false when the bytes still produce the
+// current artifact revision (for example, a metadata-only write).
+func (e *Engine) rebuildBootArtifact(id string) (rev string, changed bool, err error) {
+	e.bootMu.Lock()
+	defer e.bootMu.Unlock()
+	key := e.bootConfigKey()
+	if e.bootSnapshot == nil || e.bootSnapshot.configKey != key {
+		snapshot, buildErr := e.buildBootSnapshotFreshLocked(key)
+		if buildErr != nil {
+			return "", false, buildErr
+		}
+		if e.bootSnapshot != nil {
+			snapshot.previousBatchResponses = e.bootSnapshot.batchResponses
+		}
+		e.bootSnapshot = &snapshot
+	}
+	current := e.bootSnapshot
+	record, ok := current.records[id]
+	if !ok {
+		return "", false, os.ErrNotExist
+	}
+	stat, err := os.Stat(record.path)
+	if err != nil {
+		return "", false, err
+	}
+	content, err := os.ReadFile(record.path)
+	if err != nil {
+		return "", false, err
+	}
+	sourceMap, err := readClientSourceMap(record.path)
+	if err != nil {
+		return "", false, err
+	}
+	rev = clientArtifactRevision(content, sourceMap)
+	if rev == record.entry.Rev {
+		record.baseline = bootArtifactBaseline{path: record.path, mtimeNS: stat.ModTime().UnixNano(), size: stat.Size()}
+		next := *current
+		next.records = cloneBootRecords(current.records)
+		next.baselines = cloneBootBaselines(current.baselines)
+		next.records[id] = record
+		next.baselines[id] = record.baseline
+		e.bootSnapshot = &next
+		return rev, false, nil
+	}
+	record.entry.Rev = rev
+	record.entry.URL = comboURL([]string{id}, rev, false)
+	record.bundle = content
+	record.sourceMap = sourceMap
+	record.baseline = bootArtifactBaseline{path: record.path, mtimeNS: stat.ModTime().UnixNano(), size: stat.Size()}
+	records := make([]bootPluginRecord, 0, len(current.records))
+	paths := make(map[string]string, len(current.paths))
+	for packageID, item := range current.records {
+		if packageID == id {
+			item = record
+		}
+		records = append(records, item)
+		paths[packageID] = item.path
+	}
+	next, err := e.composeBootSnapshotLocked(records, paths, current.configKey)
+	if err != nil {
+		return "", false, err
+	}
+	next.previousBatchResponses = current.batchResponses
+	e.bootSnapshot = &next
+	return rev, true, nil
+}
+
+func cloneBootRecords(records map[string]bootPluginRecord) map[string]bootPluginRecord {
+	cloned := make(map[string]bootPluginRecord, len(records))
+	for id, record := range records {
+		record.entry.Inject = append([]string(nil), record.entry.Inject...)
+		record.entry.External = append([]string(nil), record.entry.External...)
+		record.bundle = append([]byte(nil), record.bundle...)
+		if record.sourceMap != nil {
+			mapped := &clientSourceMap{body: append([]byte(nil), record.sourceMap.body...), parsed: make(map[string]any, len(record.sourceMap.parsed))}
+			for key, value := range record.sourceMap.parsed {
+				mapped.parsed[key] = value
+			}
+			record.sourceMap = mapped
+		}
+		cloned[id] = record
+	}
+	return cloned
+}
+
+func cloneBootBaselines(baselines map[string]bootArtifactBaseline) map[string]bootArtifactBaseline {
+	cloned := make(map[string]bootArtifactBaseline, len(baselines))
+	for id, baseline := range baselines {
+		cloned[id] = baseline
+	}
+	return cloned
+}
+
+func (e *Engine) bootSnapshotResponses() (current, previous map[string]bootResponse, err error) {
+	if _, err := e.buildBootSnapshot(); err != nil {
+		return nil, nil, err
+	}
+	e.bootMu.Lock()
+	defer e.bootMu.Unlock()
+	return e.bootSnapshot.responses, e.bootSnapshot.previousBatchResponses, nil
+}
+
+func (e *Engine) bootConfigKey() string {
+	// This key intentionally describes composition inputs, not bundle bytes.
+	// Bundle changes are HMR events and must preserve the current generation
+	// until rebuilt() publishes a replacement.
+	var plugins []string
+	if e.cfg.ClientPlugins != nil {
+		plugins = append([]string{}, e.cfg.ClientPlugins...)
+	}
+	value := struct {
+		Roots   []string `json:"roots"`
+		Plugins []string `json:"plugins"`
+	}{Roots: e.frontendPluginRoots(), Plugins: plugins}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func (e *Engine) allocateInitialBootRevision() (string, error) {
+	if e.bootInitialRevisionNonce == "" {
+		var value [8]byte
+		if _, err := rand.Read(value[:]); err != nil {
+			return "", fmt.Errorf("client-modules: allocate initial revision nonce: %w", err)
+		}
+		e.bootInitialRevisionNonce = hex.EncodeToString(value[:])
+	}
+	revision := fmt.Sprintf("%s-%d", e.bootInitialRevisionNonce, e.bootNextInitialRevision)
+	e.bootNextInitialRevision++
+	return revision, nil
+}
+
+// buildBootSnapshotFreshLocked scans package declarations and captures the
+// initial artifact baselines. The caller holds bootMu.
+func (e *Engine) buildBootSnapshotFreshLocked(configKey string) (bootSnapshot, error) {
 	roots := e.frontendPluginRoots()
 	if len(roots) == 0 {
-		return BootGraph{Rev: shortRevision("[]"), Entries: []BootEntry{}}, map[string]string{}, nil
+		graph := emptyBootGraph()
+		return bootSnapshot{graph: graph, paths: map[string]string{}, responses: map[string]bootResponse{}, batchResponses: map[string]bootResponse{}, previousBatchResponses: map[string]bootResponse{}, records: map[string]bootPluginRecord{}, baselines: map[string]bootArtifactBaseline{}, configKey: configKey}, nil
 	}
 	var allowed map[string]struct{}
 	if e.cfg.ClientPlugins != nil {
@@ -147,7 +390,7 @@ func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
 			allowed[name] = struct{}{}
 		}
 	}
-	entries := make([]BootEntry, 0)
+	records := make([]bootPluginRecord, 0)
 	paths := make(map[string]string)
 	for _, root := range roots {
 		if stat, err := os.Stat(root); err != nil || !stat.IsDir() {
@@ -191,34 +434,374 @@ func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
 			if !ok {
 				return nil
 			}
-			if _, err := os.Stat(bundle); err != nil {
+			stat, err := os.Stat(bundle)
+			if err != nil {
 				return nil
 			}
 			content, err := os.ReadFile(bundle)
 			if err != nil {
 				return err
 			}
-			rev := shortRevisionBytes(content)
+			sourceMap, err := readClientSourceMap(bundle)
+			if err != nil {
+				return err
+			}
+			rev, err := e.allocateInitialBootRevision()
+			if err != nil {
+				return err
+			}
 			inject := append([]string(nil), pkg.Dsh.Client.Inject...)
 			external := append([]string(nil), pkg.Dsh.Client.External...)
-			entries = append(entries, BootEntry{ID: pkg.Name, URL: "/plugins/" + pkg.Name + "/client.js?rev=" + rev, Rev: rev, Inject: inject, Immediately: pkg.Dsh.Client.Immediately, External: external})
+			entry := BootEntry{ID: pkg.Name, URL: comboURL([]string{pkg.Name}, rev, false), Rev: rev, Inject: inject, Immediately: pkg.Dsh.Client.Immediately, External: external}
+			records = append(records, bootPluginRecord{entry: entry, path: bundle, bundle: content, sourceMap: sourceMap, baseline: bootArtifactBaseline{path: bundle, mtimeNS: stat.ModTime().UnixNano(), size: stat.Size()}})
 			paths[pkg.Name] = bundle
 			return nil
 		})
 		if err != nil {
-			return BootGraph{}, nil, err
+			return bootSnapshot{}, err
 		}
+	}
+	entries := make([]BootEntry, len(records))
+	for index := range records {
+		entries[index] = records[index].entry
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
 	entries, err := orderBootEntries(entries)
 	if err != nil {
-		return BootGraph{}, nil, err
+		return bootSnapshot{}, err
 	}
 	if len(entries) == 0 {
-		return BootGraph{Rev: shortRevision("[]"), Entries: entries}, paths, nil
+		graph := emptyBootGraph()
+		return bootSnapshot{graph: graph, paths: paths, responses: map[string]bootResponse{}, batchResponses: map[string]bootResponse{}, previousBatchResponses: map[string]bootResponse{}, records: map[string]bootPluginRecord{}, baselines: map[string]bootArtifactBaseline{}, configKey: configKey}, nil
 	}
-	encoded, _ := json.Marshal(entries)
-	return BootGraph{Rev: shortRevisionBytes(encoded), Entries: entries}, paths, nil
+	return e.composeBootSnapshotLocked(records, paths, configKey)
+}
+
+// composeBootSnapshotLocked creates response bytes from an already captured
+// record set. Rebuilds update one record and come through this same path.
+func (e *Engine) composeBootSnapshotLocked(records []bootPluginRecord, paths map[string]string, configKey string) (bootSnapshot, error) {
+	entries := make([]BootEntry, len(records))
+	for index := range records {
+		entries[index] = records[index].entry
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	entries, err := orderBootEntries(entries)
+	if err != nil {
+		return bootSnapshot{}, err
+	}
+	if len(entries) == 0 {
+		graph := emptyBootGraph()
+		return bootSnapshot{graph: graph, paths: paths, responses: map[string]bootResponse{}, batchResponses: map[string]bootResponse{}, previousBatchResponses: map[string]bootResponse{}, records: map[string]bootPluginRecord{}, baselines: map[string]bootArtifactBaseline{}, configKey: configKey}, nil
+	}
+	recordByID := make(map[string]bootPluginRecord, len(records))
+	for _, record := range records {
+		recordByID[record.entry.ID] = record
+	}
+	ordered := make([]bootPluginRecord, 0, len(entries))
+	for _, entry := range entries {
+		record := recordByID[entry.ID]
+		record.entry = entry
+		ordered = append(ordered, record)
+	}
+
+	bootstrap := make([]bootPluginRecord, 0, 1)
+	application := make([]bootPluginRecord, 0, len(ordered))
+	for _, record := range ordered {
+		if record.entry.ID == clientModulesID {
+			bootstrap = append(bootstrap, record)
+		} else {
+			application = append(application, record)
+		}
+	}
+	responses := make(map[string]bootResponse, len(records)*2+4)
+	batchResponses := make(map[string]bootResponse, len(records)*2+4)
+	batches := make([]BootBatch, 0, 2)
+	for _, phase := range []struct {
+		name    BootBatchPhase
+		records []bootPluginRecord
+	}{{BootBatchBootstrap, bootstrap}, {BootBatchApplication, application}} {
+		chunks, err := partitionBootRecords(phase.records)
+		if err != nil {
+			return bootSnapshot{}, err
+		}
+		for _, chunk := range chunks {
+			combo, err := buildBootCombo(chunk, "")
+			if err != nil {
+				return bootSnapshot{}, err
+			}
+			batches = append(batches, BootBatch{Phase: phase.name, URL: combo.url, Rev: combo.rev, Entries: combo.entries})
+			addBootComboResponses(batchResponses, combo)
+			addBootComboResponses(responses, combo)
+		}
+	}
+	for _, record := range ordered {
+		combo, err := buildBootCombo([]bootPluginRecord{record}, record.entry.Rev)
+		if err != nil {
+			return bootSnapshot{}, err
+		}
+		addBootComboResponses(responses, combo)
+	}
+	graphPayload := struct {
+		Entries []BootEntry `json:"entries"`
+		Batches []BootBatch `json:"batches"`
+	}{Entries: entries, Batches: batches}
+	encoded, err := json.Marshal(graphPayload)
+	if err != nil {
+		return bootSnapshot{}, err
+	}
+	graph := BootGraph{Rev: shortRevisionBytes(encoded), Entries: entries, Batches: batches}
+	recordMap := make(map[string]bootPluginRecord, len(ordered))
+	baselines := make(map[string]bootArtifactBaseline, len(ordered))
+	for _, record := range ordered {
+		recordMap[record.entry.ID] = record
+		baselines[record.entry.ID] = record.baseline
+	}
+	return bootSnapshot{graph: graph, paths: paths, responses: responses, batchResponses: batchResponses, records: recordMap, baselines: baselines, configKey: configKey}, nil
+}
+
+func emptyBootGraph() BootGraph {
+	entries := []BootEntry{}
+	batches := []BootBatch{}
+	payload, _ := json.Marshal(struct {
+		Entries []BootEntry `json:"entries"`
+		Batches []BootBatch `json:"batches"`
+	}{Entries: entries, Batches: batches})
+	return BootGraph{Rev: shortRevisionBytes(payload), Entries: entries, Batches: batches}
+}
+
+func readClientSourceMap(bundlePath string) (*clientSourceMap, error) {
+	body, err := os.ReadFile(bundlePath + ".map")
+	if err != nil {
+		return nil, nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, nil
+	}
+	version, versionOK := parsed["version"].(float64)
+	sources, sourcesOK := stringArray(parsed["sources"])
+	names, namesOK := stringArray(parsed["names"])
+	_, mappingsOK := parsed["mappings"].(string)
+	if !versionOK || version != 3 || !sourcesOK || !namesOK || !mappingsOK {
+		return nil, nil
+	}
+	parsed["sources"] = sources
+	parsed["names"] = names
+	return &clientSourceMap{body: body, parsed: parsed}, nil
+}
+
+func stringArray(value any) ([]string, bool) {
+	raw, ok := value.([]any)
+	if !ok {
+		if values, typed := value.([]string); typed {
+			return append([]string(nil), values...), true
+		}
+		return nil, false
+	}
+	values := make([]string, len(raw))
+	for index, item := range raw {
+		value, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		values[index] = value
+	}
+	return values, true
+}
+
+func clientArtifactRevision(bundle []byte, sourceMap *clientSourceMap) string {
+	parts := [][]byte{bundle}
+	if sourceMap != nil {
+		parts = append(parts, sourceMap.body)
+	}
+	return framedRevision("plugin-artifact", parts...)
+}
+
+func comboURL(ids []string, revision string, sourceMap bool) string {
+	resources := make([]string, len(ids))
+	for index, id := range ids {
+		resources[index] = id + "/client.js"
+		if sourceMap {
+			resources[index] += ".map"
+		}
+	}
+	return "/plugins/??" + strings.Join(resources, ",") + "&rev=" + revision
+}
+
+func partitionBootRecords(records []bootPluginRecord) ([][]bootPluginRecord, error) {
+	chunks := make([][]bootPluginRecord, 0, 1)
+	current := make([]bootPluginRecord, 0, len(records))
+	for _, record := range records {
+		candidate := append(append([]bootPluginRecord(nil), current...), record)
+		if projectedComboURLBytes(candidate) <= maxComboURLBytes {
+			current = candidate
+			continue
+		}
+		if len(current) == 0 {
+			return nil, fmt.Errorf("client-modules: %s exceeds the %d-byte combo URL limit", record.entry.ID, maxComboURLBytes)
+		}
+		chunks = append(chunks, current)
+		current = []bootPluginRecord{record}
+		if projectedComboURLBytes(current) > maxComboURLBytes {
+			return nil, fmt.Errorf("client-modules: %s exceeds the %d-byte combo URL limit", record.entry.ID, maxComboURLBytes)
+		}
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks, nil
+}
+
+func projectedComboURLBytes(records []bootPluginRecord) int {
+	ids := make([]string, len(records))
+	for index := range records {
+		ids[index] = records[index].entry.ID
+	}
+	return len([]byte(comboURL(ids, comboRevisionPlaceholder, true)))
+}
+
+func buildBootCombo(records []bootPluginRecord, revision string) (bootCombo, error) {
+	var source strings.Builder
+	sections := make([]map[string]any, 0, len(records))
+	line := 0
+	ids := make([]string, 0, len(records))
+	for _, record := range records {
+		prepared, fallback := prepareComboSource(record)
+		var sectionMap map[string]any
+		if record.sourceMap == nil {
+			sectionMap = identitySourceMap(prepared, fallback)
+		} else {
+			sectionMap = relocateSourceMap(record)
+		}
+		sections = append(sections, map[string]any{
+			"offset": map[string]any{"line": line, "column": 0},
+			"map":    sectionMap,
+		})
+		bundle := prepared + ";\n"
+		source.WriteString(bundle)
+		line += strings.Count(bundle, "\n")
+		ids = append(ids, record.entry.ID)
+	}
+	indexedMap, err := json.Marshal(map[string]any{"version": 3, "file": "client.js", "sections": sections})
+	if err != nil {
+		return bootCombo{}, err
+	}
+	indexedMap = append(indexedMap, '\n')
+	sourceBytes := []byte(source.String())
+	if revision == "" {
+		revision = framedRevision("combo", sourceBytes, indexedMap)
+	}
+	sourceMapURL := comboURL(ids, revision, true)
+	script := append(append([]byte(nil), sourceBytes...), []byte("//# sourceMappingURL="+sourceMapURL+"\n")...)
+	return bootCombo{
+		url:          comboURL(ids, revision, false),
+		rev:          revision,
+		entries:      append([]string(nil), ids...),
+		script:       script,
+		sourceMap:    indexedMap,
+		sourceMapURL: sourceMapURL,
+	}, nil
+}
+
+func prepareComboSource(record bootPluginRecord) (string, string) {
+	source := string(record.bundle)
+	fallback := "/plugins/" + record.entry.ID + "/client.js"
+	if match := clientSourceURLTrailer.FindStringSubmatch(source); match != nil {
+		candidate := match[1]
+		if strings.HasPrefix(candidate, "/") || absoluteSourceURL.MatchString(candidate) {
+			fallback = candidate
+		} else {
+			fallback = "/" + candidate
+		}
+	}
+	source = clientSourceURLTrailer.ReplaceAllString(source, "")
+	source = clientSourceMapTrailer.ReplaceAllString(source, "")
+	if !strings.HasSuffix(source, "\n") {
+		source += "\n"
+	}
+	return source, fallback
+}
+
+func identitySourceMap(source, sourceURL string) map[string]any {
+	lines := strings.Count(source, "\n")
+	mappings := make([]string, lines)
+	for index := range mappings {
+		if index == 0 {
+			mappings[index] = "AAAA"
+		} else {
+			mappings[index] = "AACA"
+		}
+	}
+	return map[string]any{
+		"version":        3,
+		"names":          []string{},
+		"sources":        []string{sourceURL},
+		"sourcesContent": []string{source},
+		"mappings":       strings.Join(mappings, ";"),
+	}
+}
+
+func relocateSourceMap(record bootPluginRecord) map[string]any {
+	result := make(map[string]any, len(record.sourceMap.parsed))
+	for key, value := range record.sourceMap.parsed {
+		result[key] = value
+	}
+	sources, _ := stringArray(record.sourceMap.parsed["sources"])
+	sourceRoot, _ := record.sourceMap.parsed["sourceRoot"].(string)
+	base := &url.URL{Scheme: "http", Host: "dsh.invalid", Path: "/plugins/" + record.entry.ID + "/client.js.map"}
+	relocated := make([]string, len(sources))
+	for index, source := range sources {
+		separator := ""
+		if sourceRoot != "" && !strings.HasSuffix(sourceRoot, "/") && !strings.HasPrefix(source, "/") {
+			separator = "/"
+		}
+		reference, err := url.Parse(sourceRoot + separator + source)
+		if err != nil {
+			relocated[index] = source
+			continue
+		}
+		resolved := base.ResolveReference(reference)
+		if resolved.Scheme == base.Scheme && resolved.Host == base.Host {
+			relocated[index] = resolved.EscapedPath()
+			if resolved.RawQuery != "" {
+				relocated[index] += "?" + resolved.RawQuery
+			}
+			if resolved.Fragment != "" {
+				relocated[index] += "#" + resolved.Fragment
+			}
+		} else {
+			relocated[index] = resolved.String()
+		}
+	}
+	result["sources"] = relocated
+	delete(result, "sourceRoot")
+	return result
+}
+
+func addBootComboResponses(responses map[string]bootResponse, combo bootCombo) {
+	responses[combo.url] = bootResponse{body: combo.script, contentType: "text/javascript; charset=utf-8"}
+	responses[combo.sourceMapURL] = bootResponse{body: combo.sourceMap, contentType: "application/json; charset=utf-8"}
+}
+
+func findPluginPath(e *Engine, id string) (string, bool) {
+	_, paths, err := e.buildBootGraph()
+	if err != nil {
+		return "", false
+	}
+	path, ok := paths[id]
+	return path, ok
+}
+
+func framedRevision(domain string, parts ...[]byte) string {
+	hash := sha1.New()
+	_, _ = hash.Write([]byte(domain))
+	_, _ = hash.Write([]byte{0})
+	for _, part := range parts {
+		_, _ = hash.Write([]byte(strconv.Itoa(len(part))))
+		_, _ = hash.Write([]byte{':'})
+		_, _ = hash.Write(part)
+	}
+	return hex.EncodeToString(hash.Sum(nil))[:12]
 }
 
 func orderBootEntries(entries []BootEntry) ([]BootEntry, error) {
@@ -279,14 +862,3 @@ func shortRevisionBytes(value []byte) string {
 	sum := sha1.Sum(value)
 	return hex.EncodeToString(sum[:])[:12]
 }
-
-func findPluginPath(e *Engine, id string) (string, bool) {
-	_, paths, err := e.buildBootGraph()
-	if err != nil {
-		return "", false
-	}
-	path, ok := paths[id]
-	return path, ok
-}
-
-var errPluginNotFound = errors.New("plugin bundle not found")

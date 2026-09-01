@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +78,30 @@ func TestUpstreamContractWorkspaceInventory(t *testing.T) {
 	}
 	if len(changed) > 0 {
 		t.Fatalf("upstream tracked-file sets changed; review each package, then replace its row in upstream_inventory.tsv:\n%s", strings.Join(changed, "\n"))
+	}
+}
+
+func TestUpstreamInventoryDoesNotOverclaimSDKClient(t *testing.T) {
+	rows := readUpstreamInventory(t, filepath.Join(repositoryRoot(t), "upstream_inventory.tsv"))
+	counts := make(map[string]int)
+	var client upstreamInventoryRow
+	for _, row := range rows {
+		counts[row.status]++
+		if row.root == "packages/sdk/client" {
+			client = row
+		}
+	}
+	if client.root == "" {
+		t.Fatal("packages/sdk/client is missing from upstream inventory")
+	}
+	if client.status != "hybrid" {
+		t.Fatalf("packages/sdk/client status = %q, want hybrid because Go exposes the SDK server only", client.status)
+	}
+	if !reflect.DeepEqual(client.goFiles, []string{"internal/harness/sdk.go"}) {
+		t.Fatalf("packages/sdk/client Go surface = %#v, want SDK server surface", client.goFiles)
+	}
+	if counts["frontend"] != 41 || counts["hybrid"] != 9 || counts["ported"] != 178 || counts["replaced"] != 23 || counts["support"] != 13 {
+		t.Fatalf("alpha.1 inventory counts = %#v, want frontend=41 hybrid=9 ported=178 replaced=23 support=13", counts)
 	}
 }
 

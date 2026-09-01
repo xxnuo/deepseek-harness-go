@@ -4,10 +4,11 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
-const piAICatalogPackageVersion = "0.82.1"
-const piAICatalogManifestHash = "1a3c7cf59ada71c94abe4540976960524ee933034491c75d6418e2abc1b42535"
+const piAICatalogPackageVersion = "0.84.2"
+const piAICatalogManifestHash = "012f19b2e2c92706bc700f4c9dd80a21f1f43d68959bc90c78d2cdb51374d5cc"
 
 //go:embed pi_ai_catalog.json
 var piAICatalogJSON []byte
@@ -19,11 +20,14 @@ type piAIModelCompat struct {
 	SessionAffinityFormat            string         `json:"sessionAffinityFormat,omitempty"`
 	DeferredToolsMode                string         `json:"deferredToolsMode,omitempty"`
 	ChatTemplateKwargs               map[string]any `json:"chatTemplateKwargs,omitempty"`
+	ChatTemplateArgs                 map[string]any `json:"chatTemplateArgs,omitempty"`
 	SupportsReasoningEffort          *bool          `json:"supportsReasoningEffort,omitempty"`
 	SupportsLongCacheRetention       *bool          `json:"supportsLongCacheRetention,omitempty"`
 	SupportsExplicitPromptCacheMode  *bool          `json:"supportsExplicitPromptCacheMode,omitempty"`
 	SupportsStore                    *bool          `json:"supportsStore,omitempty"`
 	SupportsUsageInStreaming         *bool          `json:"supportsUsageInStreaming,omitempty"`
+	SupportsFinishReason             *bool          `json:"supportsFinishReason,omitempty"`
+	SupportsThinkingTokenBudget      *bool          `json:"supportsThinkingTokenBudget,omitempty"`
 	RequiresToolResultName           *bool          `json:"requiresToolResultName,omitempty"`
 	RequiresAssistantAfterToolResult *bool          `json:"requiresAssistantAfterToolResult,omitempty"`
 	RequiresThinkingAsText           *bool          `json:"requiresThinkingAsText,omitempty"`
@@ -57,7 +61,23 @@ type piAIModel struct {
 }
 
 func (m piAIModel) info() ModelInfo {
-	return ModelInfo{ID: m.ID, Name: m.Name, InputModalities: append([]string(nil), m.Input...), ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens}
+	info := ModelInfo{ID: m.ID, Name: m.Name, InputModalities: append([]string(nil), m.Input...), ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens}
+	if !m.Reasoning {
+		return info
+	}
+	efforts := make([]ReasoningEffortInfo, 0, 7)
+	for _, id := range []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"} {
+		wire, declared := m.ThinkingLevelMap[id]
+		if declared && wire == nil {
+			continue
+		}
+		if (id == "xhigh" || id == "max") && !declared {
+			continue
+		}
+		efforts = append(efforts, ReasoningEffortInfo{ID: id, Name: strings.ToUpper(id[:1]) + id[1:]})
+	}
+	info.Reasoning = &ModelReasoningInfo{Efforts: efforts}
+	return info
 }
 
 type piAICatalogRoute struct {
@@ -130,6 +150,12 @@ func loadPiAICatalog() (map[string]piAICatalogRoute, []string) {
 func clonePiAIModel(model piAIModel) piAIModel {
 	model.Input = append([]string(nil), model.Input...)
 	model.Headers = clonePIAIHeaders(model.Headers)
+	if model.Compat.ChatTemplateKwargs != nil {
+		model.Compat.ChatTemplateKwargs = cloneSettingsValue(model.Compat.ChatTemplateKwargs)
+	}
+	if model.Compat.ChatTemplateArgs != nil {
+		model.Compat.ChatTemplateArgs = cloneSettingsValue(model.Compat.ChatTemplateArgs)
+	}
 	if model.ThinkingLevelMap != nil {
 		levels := make(map[string]*string, len(model.ThinkingLevelMap))
 		for level, value := range model.ThinkingLevelMap {

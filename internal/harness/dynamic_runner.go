@@ -987,7 +987,11 @@ func (e *Engine) disposeDynamicCordisRun(run *dynamicCordisRun) {
 	e.cleanupDynamicCordisRun(run, true)
 }
 
-func (e *Engine) closeDynamicCordis() {
+// disposeDynamicCordisRuns tears down every active run while the shared loop
+// remains available. Engine shutdown uses this phase after the final session
+// projection checkpoint: run disposers can unregister dynamic projections and
+// detach prepared sessions, both of which still need the runtime.
+func (e *Engine) disposeDynamicCordisRuns() {
 	e.dynamicCordis.Lock()
 	runs := make([]*dynamicCordisRun, 0, len(e.dynamicCordis.plugins))
 	for _, plugin := range e.dynamicCordis.plugins {
@@ -1000,7 +1004,15 @@ func (e *Engine) closeDynamicCordis() {
 	for _, run := range runs {
 		e.disposeDynamicCordisRun(run)
 	}
+}
+
+func (e *Engine) closeDynamicCordisLoop() {
 	e.dynamicCordis.loop.close()
+}
+
+func (e *Engine) closeDynamicCordis() {
+	e.disposeDynamicCordisRuns()
+	e.closeDynamicCordisLoop()
 }
 
 func (e *Engine) DynamicCordisRun(ctx context.Context, sessionID, pluginID, packageID, mode string) (DynamicCordisRunResponse, error) {

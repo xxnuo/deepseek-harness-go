@@ -247,6 +247,10 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		job.done = make(chan promptOutcome, 1)
 	}
 	s.mu.Lock()
+	if guard := req.attachmentGuard; guard != nil && (s != guard.session || !s.attached || s.attachmentGeneration != guard.generation) {
+		s.mu.Unlock()
+		return nil, nil, fmt.Errorf("session agent was disposed outside the server: %s", id)
+	}
 	if s.draining {
 		s.mu.Unlock()
 		return nil, nil, fmt.Errorf("session-draining: session %q is being released", id)

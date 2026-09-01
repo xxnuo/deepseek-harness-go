@@ -93,9 +93,12 @@ func NewDSHSDKSubagentProvider(config DSHSDKSubagentConfig) (*DSHSDKSubagentProv
 
 func (p *DSHSDKSubagentProvider) Name() string { return p.name }
 func (p *DSHSDKSubagentProvider) Capabilities() SubagentCapabilities {
-	return NoSubagentStartCapabilities()
+	return SubagentCapabilities{AgentOptions: true}
 }
 func (p *DSHSDKSubagentProvider) InheritsParentContext() bool { return false }
+func (p *DSHSDKSubagentProvider) AgentRouteDefaults() SubagentAgentOptions {
+	return SubagentAgentOptions{Provider: p.provider, Model: p.model}
+}
 
 func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStartRequest) (*SubagentRun, error) {
 	if err := ctx.Err(); err != nil {
@@ -122,9 +125,31 @@ func (p *DSHSDKSubagentProvider) Start(ctx context.Context, request SubagentStar
 		rpc.close()
 		return process.dispose(p.disposeEOFGrace, p.disposeGrace)
 	}
-	initialize := map[string]any{"cwd": cwd, "provider": p.provider, "model": p.model}
-	if p.maxTokens > 0 {
-		initialize["maxTokens"] = p.maxTokens
+	route := SubagentAgentOptions{Provider: p.provider, Model: p.model, MaxTokens: p.maxTokens}
+	if request.AgentOptions != nil {
+		if request.AgentOptions.Provider != "" {
+			route.Provider = request.AgentOptions.Provider
+		}
+		if request.AgentOptions.Model != "" {
+			route.Model = request.AgentOptions.Model
+		}
+		if request.AgentOptions.ReasoningEffort != "" {
+			route.ReasoningEffort = request.AgentOptions.ReasoningEffort
+		}
+		if request.AgentOptions.MaxTokens != 0 {
+			if request.AgentOptions.MaxTokens < 0 || int64(request.AgentOptions.MaxTokens) > maxJSONSafeInteger {
+				_ = startupDispose()
+				return nil, errors.New("subagent-dsh-sdk: agentOptions.maxTokens must be a positive safe integer")
+			}
+			route.MaxTokens = request.AgentOptions.MaxTokens
+		}
+	}
+	initialize := map[string]any{"cwd": cwd, "provider": route.Provider, "model": route.Model}
+	if route.ReasoningEffort != "" {
+		initialize["reasoningEffort"] = route.ReasoningEffort
+	}
+	if route.MaxTokens > 0 {
+		initialize["maxTokens"] = route.MaxTokens
 	}
 	var initialized struct {
 		ServerInfo struct {

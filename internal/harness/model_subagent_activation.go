@@ -396,6 +396,7 @@ func (e *Engine) emitModelSubagentActivationEnd(activation *modelSubagentActivat
 	if len(output) > 0 {
 		terminal["lastAssistantMessage"] = cloneContentBlocks(output)
 	}
+	e.notifySDKSubagentEnd(activation.parentID, terminal)
 	e.emitDynamicCordisScopedContained(activation.parentID, "subagent/end", terminal)
 }
 

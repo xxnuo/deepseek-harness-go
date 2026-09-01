@@ -27,11 +27,21 @@ const (
 	baseBundle       = "@deepseek-ai/dsh-base"
 	webBundle        = "@deepseek-ai/dsh-web-app"
 	headlessBundle   = "@deepseek-ai/dsh-headless"
+	acpBundle        = "@deepseek-ai/dsh-acp-app"
+	sdkBundle        = "@deepseek-ai/dsh-sdk-app"
+	sdkMinimalBundle = "@deepseek-ai/dsh-sdk-minimal"
 )
 
 var profileTemplates = map[string][]string{
-	"web":      {baseBundle, webBundle},
-	"headless": {baseBundle, headlessBundle},
+	"acp":         {baseBundle, acpBundle},
+	"web":         {baseBundle, webBundle},
+	"headless":    {baseBundle, headlessBundle},
+	"sdk":         {baseBundle, sdkBundle},
+	"sdk-minimal": {sdkMinimalBundle},
+}
+
+var profilePatchReload = map[string]string{
+	"acp": "startup", "web": "live", "headless": "startup", "sdk": "startup", "sdk-minimal": "startup",
 }
 
 const profilePatchTemplate = `# Your patch layer for this dsh profile, applied after every bundle layer:
@@ -56,7 +66,13 @@ type profileLoader struct {
 	home              string
 	upstream          string
 	bundleDirs        map[string]string
+	packageIdentities map[string]profilePackageIdentity
 	launchEnvironment *harness.LaunchEnvironmentSnapshot
+}
+
+type profilePackageIdentity struct {
+	name    string
+	version string
 }
 
 type profile struct {
@@ -66,6 +82,7 @@ type profile struct {
 	patchPath   string
 	patches     []*yaml.Node
 	patchExists bool
+	patchReload string
 }
 
 type patchLayer struct {
@@ -89,6 +106,7 @@ type composition struct {
 	provenance             []provenance
 	index                  map[string]entryRef
 	profileDir             string
+	packageIdentities      map[string]profilePackageIdentity
 	e2b                    *harness.E2BConfig
 	hooks                  []harness.HookBridgeConfig
 	mcpConfigs             []harness.MCPConfig
@@ -119,6 +137,8 @@ type composition struct {
 	webSearchSet           bool
 	webFetchProvider       string
 	webFetchSet            bool
+	patchReload            string
+	sdkServer              harness.SDKServerOptions
 }
 
 type pluginEntry struct {
@@ -127,173 +147,189 @@ type pluginEntry struct {
 }
 
 var supportedPluginNames = map[string]bool{
-	"@deepseek-ai/cordis-plugin-hmr":                       true,
-	"@deepseek-ai/cordis-plugin-timer":                     true,
-	"@deepseek-ai/dsh-agent":                               true,
-	"@deepseek-ai/dsh-agent-default-model":                 true,
-	"@deepseek-ai/dsh-agent-instructions":                  true,
-	"@deepseek-ai/dsh-agent-loop":                          true,
-	"@deepseek-ai/dsh-agent-presets":                       true,
-	"@deepseek-ai/dsh-attachment-local":                    true,
-	"@deepseek-ai/dsh-api-gateway":                         true,
-	"@deepseek-ai/dsh-api-remotes":                         true,
-	"@deepseek-ai/dsh-bash-sandbox":                        true,
-	"@deepseek-ai/dsh-client-connection":                   true,
-	"@deepseek-ai/dsh-client-hmr":                          true,
-	"@deepseek-ai/dsh-client-locale":                       true,
-	"@deepseek-ai/dsh-client-modules":                      true,
-	"@deepseek-ai/dsh-client-runtime":                      true,
-	"@deepseek-ai/dsh-client-ui-conversation":              true,
-	"@deepseek-ai/dsh-client-ui-deliverables":              true,
-	"@deepseek-ai/dsh-client-ui-directory-picker-native":   true,
-	"@deepseek-ai/dsh-client-ui-agent-preset":              true,
-	"@deepseek-ai/dsh-client-ui-attachment":                true,
-	"@deepseek-ai/dsh-client-ui-commands":                  true,
-	"@deepseek-ai/dsh-client-ui-brand-official":            true,
-	"@deepseek-ai/dsh-client-ui-cordis":                    true,
-	"@deepseek-ai/dsh-client-ui-goal":                      true,
-	"@deepseek-ai/dsh-client-ui-input-trigger":             true,
-	"@deepseek-ai/dsh-client-ui-jobs":                      true,
-	"@deepseek-ai/dsh-client-ui-layout":                    true,
-	"@deepseek-ai/dsh-client-ui-message-feedback":          true,
-	"@deepseek-ai/dsh-client-ui-model-selection":           true,
-	"@deepseek-ai/dsh-client-ui-permission-presets":        true,
-	"@deepseek-ai/dsh-client-ui-plan":                      true,
-	"@deepseek-ai/dsh-client-ui-reference":                 true,
-	"@deepseek-ai/dsh-client-ui-renderer":                  true,
-	"@deepseek-ai/dsh-client-ui-settings":                  true,
-	"@deepseek-ai/dsh-client-ui-settings-general":          true,
-	"@deepseek-ai/dsh-client-ui-settings-models":           true,
-	"@deepseek-ai/dsh-client-ui-settings-plugin-inventory": true,
-	"@deepseek-ai/dsh-client-ui-settings-plugins":          true,
-	"@deepseek-ai/dsh-client-ui-sidebar":                   true,
-	"@deepseek-ai/dsh-client-ui-skill":                     true,
-	"@deepseek-ai/dsh-client-ui-subagent":                  true,
-	"@deepseek-ai/dsh-client-ui-theme":                     true,
-	"@deepseek-ai/dsh-client-ui-tool":                      true,
-	"@deepseek-ai/dsh-client-ui-trajectory":                true,
-	"@deepseek-ai/dsh-client-ui-user-questions":            true,
-	"@deepseek-ai/dsh-client-ui-workflow-run":              true,
-	"@deepseek-ai/dsh-client-ui-workspace":                 true,
-	"@deepseek-ai/dsh-code-runtime-worker-thread":          true,
-	"@deepseek-ai/dsh-command-compact":                     true,
-	"@deepseek-ai/dsh-command-feedback":                    true,
-	"@deepseek-ai/dsh-command-goal":                        true,
-	"@deepseek-ai/dsh-commands":                            true,
-	"@deepseek-ai/dsh-compaction-basic":                    true,
-	"@deepseek-ai/dsh-compaction-tool-result-pruner":       true,
-	"@deepseek-ai/dsh-session-reference":                   true,
-	"@deepseek-ai/dsh-time-context":                        true,
-	"@deepseek-ai/dsh-tmux-context":                        true,
-	"@deepseek-ai/dsh-credentials-local":                   true,
-	"@deepseek-ai/dsh-cordis-client-runner":                true,
-	"@deepseek-ai/dsh-cordis-host-runner":                  true,
-	"@deepseek-ai/dsh-e2b":                                 true,
-	"@deepseek-ai/dsh-experimental-agent-team":             true,
-	"@deepseek-ai/dsh-experimental-tool-agent-team":        true,
-	"@deepseek-ai/dsh-fs-e2b":                              true,
-	"@deepseek-ai/dsh-file-reference":                      true,
-	"@deepseek-ai/dsh-file-reference-local":                true,
-	"@deepseek-ai/dsh-fs-observation-policy":               true,
-	"@deepseek-ai/dsh-fs-sandbox":                          true,
-	"@deepseek-ai/dsh-goal":                                true,
-	"@deepseek-ai/dsh-goal-round-driver":                   true,
-	"@deepseek-ai/dsh-headless":                            true,
-	"@deepseek-ai/dsh-headless/startup":                    true,
-	"@deepseek-ai/dsh-host-apiproxy":                       true,
-	"@deepseek-ai/dsh-host-directory-picker-auto":          true,
-	"@deepseek-ai/dsh-host-plugin-inventory":               true,
-	"@deepseek-ai/dsh-host-webserver":                      true,
-	"@deepseek-ai/dsh-hooks-claude-code":                   true,
-	"@deepseek-ai/dsh-hooks-codex":                         true,
-	"@deepseek-ai/dsh-jobs-local":                          true,
-	"@deepseek-ai/dsh-llm":                                 true,
-	"@deepseek-ai/dsh-llm-deepseek":                        true,
-	"@deepseek-ai/dsh-llm-pi-ai":                           true,
-	"@deepseek-ai/dsh-llm-retry":                           true,
-	"@deepseek-ai/dsh-lsp":                                 true,
-	"@deepseek-ai/dsh-lsp-stdio":                           true,
-	"@deepseek-ai/dsh-message-feedback":                    true,
-	"@deepseek-ai/dsh-mcp-client":                          true,
-	"@deepseek-ai/dsh-permission-presets":                  true,
-	"@deepseek-ai/dsh-plan-mode":                           true,
-	"@deepseek-ai/dsh-pwsh-sandbox":                        true,
-	"@deepseek-ai/dsh-repeat-tool-reminder":                true,
-	"@deepseek-ai/dsh-sandbox-local":                       true,
-	"@deepseek-ai/dsh-sandbox-policy":                      true,
-	"@deepseek-ai/dsh-schedule":                            true,
-	"@deepseek-ai/dsh-session":                             true,
-	"@deepseek-ai/dsh-session-checkpoint-policy":           true,
-	"@deepseek-ai/dsh-session-log-export":                  true,
-	"@deepseek-ai/dsh-session-persistence-jsonl":           true,
-	"@deepseek-ai/dsh-session-persistence-sqlite":          true,
-	"@deepseek-ai/dsh-session-projection":                  true,
-	"@deepseek-ai/dsh-session-projection-cache":            true,
-	"@deepseek-ai/dsh-session-query-sqlite":                true,
-	"@deepseek-ai/dsh-session-stats":                       true,
-	"@deepseek-ai/dsh-session-telemetry-otel":              true,
-	"@deepseek-ai/dsh-session-title":                       true,
-	"@deepseek-ai/dsh-session-title-all-prompts-llm":       true,
-	"@deepseek-ai/dsh-session-title-first-prompt-llm":      true,
-	"@deepseek-ai/dsh-settings-file":                       true,
-	"@deepseek-ai/dsh-shell-env":                           true,
-	"@deepseek-ai/dsh-skill":                               true,
-	"@deepseek-ai/dsh-skill-badge":                         true,
-	"@deepseek-ai/dsh-skill-filesystem":                    true,
-	"@deepseek-ai/dsh-spill-local":                         true,
-	"@deepseek-ai/dsh-spill-policy":                        true,
-	"@deepseek-ai/dsh-storage":                             true,
-	"@deepseek-ai/dsh-storage-domain":                      true,
-	"@deepseek-ai/dsh-storage-json":                        true,
-	"@deepseek-ai/dsh-storage-sqlite":                      true,
-	"@deepseek-ai/dsh-subagent":                            true,
-	"@deepseek-ai/dsh-subagent-acp":                        true,
-	"@deepseek-ai/dsh-subagent-claude-code":                true,
-	"@deepseek-ai/dsh-subagent-codex":                      true,
-	"@deepseek-ai/dsh-subagent-dsh-sdk":                    true,
-	"@deepseek-ai/dsh-subagent-fork-in-process":            true,
-	"@deepseek-ai/dsh-subagent-spawn-in-process":           true,
-	"@deepseek-ai/dsh-subprocess-local":                    true,
-	"@deepseek-ai/dsh-subprocess-e2b":                      true,
-	"@deepseek-ai/dsh-system-prompt":                       true,
-	"@deepseek-ai/dsh-terminal":                            true,
-	"@deepseek-ai/dsh-terminal-bash":                       true,
-	"@deepseek-ai/dsh-token-meter":                         true,
-	"@deepseek-ai/dsh-tool-bash":                           true,
-	"@deepseek-ai/dsh-tool-bash-persistent":                true,
-	"@deepseek-ai/dsh-tool-call-timeout-policy":            true,
-	"@deepseek-ai/dsh-tool-fs":                             true,
-	"@deepseek-ai/dsh-tool-fs-search":                      true,
-	"@deepseek-ai/dsh-tool-goal":                           true,
-	"@deepseek-ai/dsh-tool-jobs":                           true,
-	"@deepseek-ai/dsh-tool-lsp":                            true,
-	"@deepseek-ai/dsh-tool-pwsh":                           true,
-	"@deepseek-ai/dsh-tool-pwsh-persistent":                true,
-	"@deepseek-ai/dsh-tool-ralph":                          true,
-	"@deepseek-ai/dsh-tool-skill":                          true,
-	"@deepseek-ai/dsh-tool-str-replace-editor":             true,
-	"@deepseek-ai/dsh-tool-subagent":                       true,
-	"@deepseek-ai/dsh-tool-subagent-control":               true,
-	"@deepseek-ai/dsh-tool-subagent-control/list-agents":   true,
-	"@deepseek-ai/dsh-tool-subagent-report":                true,
-	"@deepseek-ai/dsh-tool-todo":                           true,
-	"@deepseek-ai/dsh-tool-terminal":                       true,
-	"@deepseek-ai/dsh-tool-web":                            true,
-	"@deepseek-ai/dsh-tool-workflow":                       true,
-	"@deepseek-ai/dsh-tools":                               true,
-	"@deepseek-ai/dsh-typert-loader":                       true,
-	"@deepseek-ai/dsh-typert-registry":                     true,
-	"@deepseek-ai/dsh-user-approval":                       true,
-	"@deepseek-ai/dsh-user-questions":                      true,
-	"@deepseek-ai/dsh-web":                                 true,
-	"@deepseek-ai/dsh-web-app":                             true,
-	"@deepseek-ai/dsh-web-app/startup":                     true,
-	"@deepseek-ai/dsh-web-fetch-http":                      true,
-	"@deepseek-ai/dsh-web-search-deepseek":                 true,
-	"@deepseek-ai/dsh-web-search-exa":                      true,
-	"@deepseek-ai/dsh-web-search-perplexity":               true,
-	"@deepseek-ai/dsh-workspace":                           true,
-	"@deepseek-ai/dsh-workflow-worker-thread":              true,
+	"@deepseek-ai/cordis-plugin-hmr":                          true,
+	"@deepseek-ai/cordis-plugin-timer":                        true,
+	"@deepseek-ai/dsh-agent":                                  true,
+	"@deepseek-ai/dsh-agent-default-model":                    true,
+	"@deepseek-ai/dsh-agent-instructions":                     true,
+	"@deepseek-ai/dsh-agent-loop":                             true,
+	"@deepseek-ai/dsh-agent-presets":                          true,
+	"@deepseek-ai/dsh-agent-spine-demo":                       true,
+	"@deepseek-ai/dsh-acp":                                    true,
+	"@deepseek-ai/dsh-acp-app":                                true,
+	"@deepseek-ai/dsh-attachment-local":                       true,
+	"@deepseek-ai/dsh-api-gateway":                            true,
+	"@deepseek-ai/dsh-api-remotes":                            true,
+	"@deepseek-ai/dsh-api-session-controller":                 true,
+	"@deepseek-ai/dsh-api-settings-controller":                true,
+	"@deepseek-ai/dsh-api-workspace-controller":               true,
+	"@deepseek-ai/dsh-bash-sandbox":                           true,
+	"@deepseek-ai/dsh-client-connection":                      true,
+	"@deepseek-ai/dsh-client-hmr":                             true,
+	"@deepseek-ai/dsh-client-locale":                          true,
+	"@deepseek-ai/dsh-client-modules":                         true,
+	"@deepseek-ai/dsh-client-runtime":                         true,
+	"@deepseek-ai/dsh-client-ui-conversation":                 true,
+	"@deepseek-ai/dsh-client-ui-deliverables":                 true,
+	"@deepseek-ai/dsh-client-ui-directory-picker-native":      true,
+	"@deepseek-ai/dsh-client-ui-agent-preset":                 true,
+	"@deepseek-ai/dsh-client-ui-approval":                     true,
+	"@deepseek-ai/dsh-client-ui-attachment":                   true,
+	"@deepseek-ai/dsh-client-ui-commands":                     true,
+	"@deepseek-ai/dsh-client-ui-brand-official":               true,
+	"@deepseek-ai/dsh-client-ui-cordis":                       true,
+	"@deepseek-ai/dsh-client-ui-chat":                         true,
+	"@deepseek-ai/dsh-client-ui-goal":                         true,
+	"@deepseek-ai/dsh-client-ui-input-trigger":                true,
+	"@deepseek-ai/dsh-client-ui-jobs":                         true,
+	"@deepseek-ai/dsh-client-ui-layout":                       true,
+	"@deepseek-ai/dsh-client-ui-message-feedback":             true,
+	"@deepseek-ai/dsh-client-ui-model-selection":              true,
+	"@deepseek-ai/dsh-client-ui-permission-presets":           true,
+	"@deepseek-ai/dsh-client-ui-plan":                         true,
+	"@deepseek-ai/dsh-client-ui-reference":                    true,
+	"@deepseek-ai/dsh-client-ui-renderer":                     true,
+	"@deepseek-ai/dsh-client-ui-settings":                     true,
+	"@deepseek-ai/dsh-client-ui-settings-general":             true,
+	"@deepseek-ai/dsh-client-ui-settings-models":              true,
+	"@deepseek-ai/dsh-client-ui-settings-plugin-inventory":    true,
+	"@deepseek-ai/dsh-client-ui-settings-plugins":             true,
+	"@deepseek-ai/dsh-client-ui-session":                      true,
+	"@deepseek-ai/dsh-client-ui-sidebar":                      true,
+	"@deepseek-ai/dsh-client-ui-skill":                        true,
+	"@deepseek-ai/dsh-client-ui-subagent":                     true,
+	"@deepseek-ai/dsh-client-ui-theme":                        true,
+	"@deepseek-ai/dsh-client-ui-tool":                         true,
+	"@deepseek-ai/dsh-client-ui-trajectory":                   true,
+	"@deepseek-ai/dsh-client-ui-user-questions":               true,
+	"@deepseek-ai/dsh-client-ui-workflow-run":                 true,
+	"@deepseek-ai/dsh-client-ui-workspace":                    true,
+	"@deepseek-ai/dsh-code-runtime-worker-thread":             true,
+	"@deepseek-ai/dsh-command-compact":                        true,
+	"@deepseek-ai/dsh-command-feedback":                       true,
+	"@deepseek-ai/dsh-command-goal":                           true,
+	"@deepseek-ai/dsh-commands":                               true,
+	"@deepseek-ai/dsh-compaction-basic":                       true,
+	"@deepseek-ai/dsh-compaction-tool-result-pruner":          true,
+	"@deepseek-ai/dsh-session-reference":                      true,
+	"@deepseek-ai/dsh-time-context":                           true,
+	"@deepseek-ai/dsh-tmux-context":                           true,
+	"@deepseek-ai/dsh-credentials-local":                      true,
+	"@deepseek-ai/dsh-deepseek-llm-api-extensions":            true,
+	"@deepseek-ai/dsh-cordis-client-runner":                   true,
+	"@deepseek-ai/dsh-cordis-host-runner":                     true,
+	"@deepseek-ai/dsh-e2b":                                    true,
+	"@deepseek-ai/dsh-experimental-agent-team":                true,
+	"@deepseek-ai/dsh-experimental-tool-agent-team":           true,
+	"@deepseek-ai/dsh-fs-e2b":                                 true,
+	"@deepseek-ai/dsh-fs-local":                               true,
+	"@deepseek-ai/dsh-file-reference":                         true,
+	"@deepseek-ai/dsh-file-reference-local":                   true,
+	"@deepseek-ai/dsh-fs-observation-policy":                  true,
+	"@deepseek-ai/dsh-fs-sandbox":                             true,
+	"@deepseek-ai/dsh-goal":                                   true,
+	"@deepseek-ai/dsh-goal-round-driver":                      true,
+	"@deepseek-ai/dsh-headless":                               true,
+	"@deepseek-ai/dsh-headless/startup":                       true,
+	"@deepseek-ai/dsh-host-apiproxy":                          true,
+	"@deepseek-ai/dsh-host-directory-picker-auto":             true,
+	"@deepseek-ai/dsh-host-plugin-inventory":                  true,
+	"@deepseek-ai/dsh-host-webserver":                         true,
+	"@deepseek-ai/dsh-hooks-claude-code":                      true,
+	"@deepseek-ai/dsh-hooks-codex":                            true,
+	"@deepseek-ai/dsh-jobs-local":                             true,
+	"@deepseek-ai/dsh-llm":                                    true,
+	"@deepseek-ai/dsh-llm-deepseek":                           true,
+	"@deepseek-ai/dsh-llm-pi-ai":                              true,
+	"@deepseek-ai/dsh-llm-retry":                              true,
+	"@deepseek-ai/dsh-lsp":                                    true,
+	"@deepseek-ai/dsh-lsp-stdio":                              true,
+	"@deepseek-ai/dsh-message-feedback":                       true,
+	"@deepseek-ai/dsh-mcp-client":                             true,
+	"@deepseek-ai/dsh-permission-presets":                     true,
+	"@deepseek-ai/dsh-plan-mode":                              true,
+	"@deepseek-ai/dsh-plugin-package-inventory-deepseek":      true,
+	"@deepseek-ai/dsh-pwsh-sandbox":                           true,
+	"@deepseek-ai/dsh-repeat-tool-reminder":                   true,
+	"@deepseek-ai/dsh-sandbox-local":                          true,
+	"@deepseek-ai/dsh-sandbox-policy":                         true,
+	"@deepseek-ai/dsh-schedule":                               true,
+	"@deepseek-ai/dsh-session":                                true,
+	"@deepseek-ai/dsh-session-checkpoint-policy":              true,
+	"@deepseek-ai/dsh-session-log-export":                     true,
+	"@deepseek-ai/dsh-session-log-deepseek":                   true,
+	"@deepseek-ai/dsh-session-persistence-jsonl":              true,
+	"@deepseek-ai/dsh-session-persistence-sqlite":             true,
+	"@deepseek-ai/dsh-session-projection":                     true,
+	"@deepseek-ai/dsh-session-projection-cache":               true,
+	"@deepseek-ai/dsh-session-query-sqlite":                   true,
+	"@deepseek-ai/dsh-session-stats":                          true,
+	"@deepseek-ai/dsh-session-telemetry-otel":                 true,
+	"@deepseek-ai/dsh-session-title":                          true,
+	"@deepseek-ai/dsh-session-title-all-prompts-llm":          true,
+	"@deepseek-ai/dsh-session-title-first-prompt-llm":         true,
+	"@deepseek-ai/dsh-settings-file":                          true,
+	"@deepseek-ai/dsh-sdk-app":                                true,
+	"@deepseek-ai/dsh-sdk-jsonrpc-server":                     true,
+	"@deepseek-ai/dsh-shell-env":                              true,
+	"@deepseek-ai/dsh-skill":                                  true,
+	"@deepseek-ai/dsh-skill-badge":                            true,
+	"@deepseek-ai/dsh-skill-filesystem":                       true,
+	"@deepseek-ai/dsh-spill-local":                            true,
+	"@deepseek-ai/dsh-spill-policy":                           true,
+	"@deepseek-ai/dsh-storage":                                true,
+	"@deepseek-ai/dsh-storage-domain":                         true,
+	"@deepseek-ai/dsh-storage-json":                           true,
+	"@deepseek-ai/dsh-storage-sqlite":                         true,
+	"@deepseek-ai/dsh-subagent":                               true,
+	"@deepseek-ai/dsh-subagent-acp":                           true,
+	"@deepseek-ai/dsh-subagent-claude-code":                   true,
+	"@deepseek-ai/dsh-subagent-codex":                         true,
+	"@deepseek-ai/dsh-subagent-dsh-sdk":                       true,
+	"@deepseek-ai/dsh-subagent-fork-in-process":               true,
+	"@deepseek-ai/dsh-subagent-spawn-in-process":              true,
+	"@deepseek-ai/dsh-subprocess-local":                       true,
+	"@deepseek-ai/dsh-subprocess-e2b":                         true,
+	"@deepseek-ai/dsh-system-prompt":                          true,
+	"@deepseek-ai/dsh-terminal":                               true,
+	"@deepseek-ai/dsh-terminal-bash":                          true,
+	"@deepseek-ai/dsh-token-meter":                            true,
+	"@deepseek-ai/dsh-tool-bash":                              true,
+	"@deepseek-ai/dsh-tool-bash-persistent":                   true,
+	"@deepseek-ai/dsh-tool-call-timeout-policy":               true,
+	"@deepseek-ai/dsh-tool-fs":                                true,
+	"@deepseek-ai/dsh-tool-fs-search":                         true,
+	"@deepseek-ai/dsh-tool-goal":                              true,
+	"@deepseek-ai/dsh-tool-jobs":                              true,
+	"@deepseek-ai/dsh-tool-lsp":                               true,
+	"@deepseek-ai/dsh-tool-pwsh":                              true,
+	"@deepseek-ai/dsh-tool-pwsh-persistent":                   true,
+	"@deepseek-ai/dsh-tool-ralph":                             true,
+	"@deepseek-ai/dsh-tool-skill":                             true,
+	"@deepseek-ai/dsh-tool-str-replace-editor":                true,
+	"@deepseek-ai/dsh-tool-subagent":                          true,
+	"@deepseek-ai/dsh-tool-subagent/model-selection-settings": true,
+	"@deepseek-ai/dsh-tool-subagent-control":                  true,
+	"@deepseek-ai/dsh-tool-subagent-control/list-agents":      true,
+	"@deepseek-ai/dsh-tool-subagent-report":                   true,
+	"@deepseek-ai/dsh-tool-todo":                              true,
+	"@deepseek-ai/dsh-tool-terminal":                          true,
+	"@deepseek-ai/dsh-tool-web":                               true,
+	"@deepseek-ai/dsh-tool-workflow":                          true,
+	"@deepseek-ai/dsh-tools":                                  true,
+	"@deepseek-ai/dsh-typert-loader":                          true,
+	"@deepseek-ai/dsh-typert-registry":                        true,
+	"@deepseek-ai/dsh-user-approval":                          true,
+	"@deepseek-ai/dsh-user-questions":                         true,
+	"@deepseek-ai/dsh-web":                                    true,
+	"@deepseek-ai/dsh-web-app":                                true,
+	"@deepseek-ai/dsh-web-app/startup":                        true,
+	"@deepseek-ai/dsh-web-fetch-http":                         true,
+	"@deepseek-ai/dsh-web-search-deepseek":                    true,
+	"@deepseek-ai/dsh-web-search-exa":                         true,
+	"@deepseek-ai/dsh-web-search-perplexity":                  true,
+	"@deepseek-ai/dsh-workspace":                              true,
+	"@deepseek-ai/dsh-workflow-worker-thread":                 true,
 }
 
 func newProfileLoader(_ bool) (*profileLoader, error) {
@@ -307,6 +343,10 @@ func newProfileLoader(_ bool) (*profileLoader, error) {
 	}
 	loader := &profileLoader{home: home, upstream: assets.UpstreamDir}
 	loader.bundleDirs, err = scanBundleDirs(loader.upstream)
+	if err != nil {
+		return nil, err
+	}
+	loader.packageIdentities, err = scanPackageIdentities(loader.upstream)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +388,39 @@ func scanBundleDirs(upstream string) (map[string]string, error) {
 	return bundles, nil
 }
 
+func scanPackageIdentities(upstream string) (map[string]profilePackageIdentity, error) {
+	identities := map[string]profilePackageIdentity{}
+	for _, relative := range []string{"packages", "vendor"} {
+		root := filepath.Join(upstream, relative)
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				if entry.Name() == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if entry.Name() != "package.json" {
+				return nil
+			}
+			identity, ok := readProfilePackageIdentity(path)
+			if ok {
+				identities[identity.name] = identity
+			}
+			return nil
+		})
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("dsh: scan upstream package identities: %w", err)
+		}
+	}
+	return identities, nil
+}
+
 func (loader *profileLoader) frontendDir() string {
 	if loader.upstream == "" {
 		return ""
@@ -370,7 +443,7 @@ func (loader *profileLoader) presetsDir() string {
 	if loader.upstream == "" {
 		return ""
 	}
-	return filepath.Join(loader.upstream, "apps", "cli", "config", "agent-presets")
+	return filepath.Join(loader.upstream, "packages", "preset", "agent-presets", "presets")
 }
 
 func (loader *profileLoader) profileDir(name string) (string, error) {
@@ -380,7 +453,11 @@ func (loader *profileLoader) profileDir(name string) (string, error) {
 	return filepath.Join(loader.home, profilesDir, name), nil
 }
 
-func (loader *profileLoader) initProfile(dir string, bundles []string) error {
+func (loader *profileLoader) initProfile(dir string, bundles []string, reload ...string) error {
+	patchReload := "live"
+	if len(reload) > 0 && reload[0] != "" {
+		patchReload = reload[0]
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -390,7 +467,9 @@ func (loader *profileLoader) initProfile(dir string, bundles []string) error {
 			"name":         "dsh-profile-" + filepath.Base(dir),
 			"private":      true,
 			"dependencies": map[string]any{},
-			"dsh":          map[string]any{"profile": map[string]any{"bundles": stringsToAny(bundles)}},
+			"dsh": map[string]any{"profile": map[string]any{
+				"bundles": stringsToAny(bundles), "patchReload": patchReload,
+			}},
 		}
 		if err := writeManifest(dir, manifest); err != nil {
 			return err
@@ -423,7 +502,7 @@ func (loader *profileLoader) loadProfile(name string, userLayer bool) (*profile,
 		if !ok {
 			return nil, fmt.Errorf("dsh: profile %q does not exist; create it with 'dsh plugin --profile %s add <package>'", name, name)
 		}
-		if err := loader.initProfile(dir, template); err != nil {
+		if err := loader.initProfile(dir, template, profilePatchReload[name]); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
@@ -437,12 +516,26 @@ func (loader *profileLoader) loadProfile(name string, userLayer bool) (*profile,
 	if err != nil {
 		return nil, fmt.Errorf("dsh: profile manifest %s: %w", filepath.Join(dir, "package.json"), err)
 	}
-	if name == "headless" && reflect.DeepEqual(bundles, []string{baseBundle, webBundle, headlessBundle}) {
-		bundles = append([]string(nil), profileTemplates["headless"]...)
+	template, shipped := profileTemplates[name]
+	retiredHeadless := name == "headless" && reflect.DeepEqual(bundles, []string{baseBundle, webBundle, headlessBundle})
+	currentShipped := shipped && reflect.DeepEqual(bundles, template)
+	patchReload, hasPatchReload, err := profilePatchReloadValue(doc)
+	if err != nil {
+		return nil, fmt.Errorf("dsh: profile manifest %s: %w", filepath.Join(dir, "package.json"), err)
+	}
+	if retiredHeadless || (currentShipped && !hasPatchReload) {
+		bundles = append([]string(nil), template...)
+		if !hasPatchReload {
+			patchReload = profilePatchReload[name]
+		}
 		setProfileBundles(doc, bundles)
+		setProfilePatchReload(doc, patchReload)
 		if err := writeManifest(dir, doc); err != nil {
 			return nil, err
 		}
+	}
+	if !hasPatchReload && patchReload == "" {
+		patchReload = "live"
 	}
 	layers := make([]patchLayer, 0, len(bundles))
 	for _, packageName := range bundles {
@@ -477,7 +570,7 @@ func (loader *profileLoader) loadProfile(name string, userLayer bool) (*profile,
 	if err := os.WriteFile(filepath.Join(dir, profileRootFile), []byte(profileRoot), 0o644); err != nil {
 		return nil, err
 	}
-	return &profile{name: name, dir: dir, layers: layers, patchPath: patchPath, patches: patches, patchExists: patchExists}, nil
+	return &profile{name: name, dir: dir, layers: layers, patchPath: patchPath, patches: patches, patchExists: patchExists, patchReload: patchReload}, nil
 }
 
 func (loader *profileLoader) resolveBundleDir(packageName, profileDir string) (string, error) {
@@ -524,6 +617,8 @@ func (loader *profileLoader) compose(name string, patchFiles []string, stderr io
 		fmt.Fprintf(stderr, "dsh: [%s] %s\n", layer, warning)
 	})
 	result.profileDir = loaded.dir
+	result.packageIdentities = loader.packageIdentities
+	result.patchReload = loaded.patchReload
 	return result, nil
 }
 
@@ -752,7 +847,15 @@ func (provenance provenance) label() string {
 func (composition *composition) surface() string {
 	_, web := composition.index["webserver"]
 	_, headless := composition.index["headless-runner"]
-	if web && headless {
+	_, acp := composition.index["acp"]
+	_, sdk := composition.index["sdk-jsonrpc-server"]
+	count := 0
+	for _, enabled := range []bool{web, headless, acp, sdk} {
+		if enabled {
+			count++
+		}
+	}
+	if count > 1 {
 		return ""
 	}
 	if web {
@@ -760,6 +863,12 @@ func (composition *composition) surface() string {
 	}
 	if headless {
 		return "headless"
+	}
+	if acp {
+		return "acp"
+	}
+	if sdk {
+		return "sdk"
 	}
 	if len(composition.externalPluginEntries()) > 0 {
 		return "custom"
@@ -836,10 +945,11 @@ func (composition *composition) pluginInventoryEntries() []harness.PluginInvento
 				value := "active"
 				phase = &value
 			}
+			identity, _ := composition.pluginPackageIdentity(name)
 			entries = append(entries, harness.PluginInventoryEntry{
 				EntryID: entryID, ModuleName: name, Enabled: !disabled,
-				FiberPhase: phase,
-				Group:      group,
+				PackageName: identity.name, PackageVersion: identity.version,
+				FiberPhase: phase, Group: group,
 			})
 		}
 		if group {
@@ -856,6 +966,67 @@ func (composition *composition) pluginInventoryEntries() []harness.PluginInvento
 		walk(entry, false, "")
 	}
 	return entries
+}
+
+func (composition *composition) pluginPackageIdentity(name string) (profilePackageIdentity, bool) {
+	if name == "" || strings.HasPrefix(name, "cordis:") || strings.Contains(name, ":") && !strings.HasPrefix(name, "file://") {
+		return profilePackageIdentity{}, false
+	}
+	if !filepath.IsAbs(name) && !strings.HasPrefix(name, ".") && !strings.HasPrefix(name, "file://") {
+		packageName, _ := splitProfilePackageName(name)
+		if packageName == "" {
+			return profilePackageIdentity{}, false
+		}
+		manifest := filepath.Join(composition.profileDir, "node_modules", filepath.FromSlash(packageName), "package.json")
+		if info, err := os.Stat(manifest); err == nil && !info.IsDir() {
+			return readProfilePackageIdentity(manifest)
+		}
+		identity, ok := composition.packageIdentities[packageName]
+		return identity, ok
+	}
+	modulePath, err := resolveProfilePluginPath(composition.profileDir, name)
+	if err != nil {
+		return profilePackageIdentity{}, false
+	}
+	manifest := nearestProfilePackageManifest(modulePath)
+	if manifest == "" {
+		return profilePackageIdentity{}, false
+	}
+	return readProfilePackageIdentity(manifest)
+}
+
+func nearestProfilePackageManifest(modulePath string) string {
+	current := modulePath
+	if info, err := os.Stat(current); err == nil && !info.IsDir() {
+		current = filepath.Dir(current)
+	}
+	for current != "" {
+		manifest := filepath.Join(current, "package.json")
+		if info, err := os.Stat(manifest); err == nil && !info.IsDir() {
+			return manifest
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
+	return ""
+}
+
+func readProfilePackageIdentity(path string) (profilePackageIdentity, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return profilePackageIdentity{}, false
+	}
+	var manifest struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(data, &manifest) != nil || manifest.Name == "" || manifest.Version == "" {
+		return profilePackageIdentity{}, false
+	}
+	return profilePackageIdentity{name: manifest.Name, version: manifest.Version}, true
 }
 
 func (composition *composition) externalPluginEntries() []pluginEntry {
@@ -958,6 +1129,28 @@ func decodeProfileNode(node *yaml.Node, target any) error {
 		return err
 	}
 	return json.Unmarshal(data, target)
+}
+
+func (composition *composition) sdkServerOptions() (harness.SDKServerOptions, error) {
+	var options harness.SDKServerOptions
+	entry, ok := composition.index["sdk-jsonrpc-server"]
+	if !ok || !composition.enabled("sdk-jsonrpc-server") {
+		return options, nil
+	}
+	node := mappingValue(mappingValue(entry.node, "config"), "maxTokensAsSuccess")
+	if node == nil {
+		return options, nil
+	}
+	value, err := profileConfigValue(node)
+	if err != nil {
+		return options, fmt.Errorf("sdk-jsonrpc-server: maxTokensAsSuccess: %w", err)
+	}
+	flag, ok := value.(bool)
+	if !ok {
+		return options, errors.New("sdk-jsonrpc-server: maxTokensAsSuccess must be a boolean")
+	}
+	options.MaxTokensAsSuccess = flag
+	return options, nil
 }
 
 func (composition *composition) resolveE2BConfig() (*harness.E2BConfig, error) {
@@ -1711,6 +1904,11 @@ func (composition *composition) validate() error {
 	if err := composition.resolveWebConfigs(); err != nil {
 		return err
 	}
+	sdkServer, err := composition.sdkServerOptions()
+	if err != nil {
+		return err
+	}
+	composition.sdkServer = sdkServer
 	jobs, err := composition.resolveJobsConfig()
 	if err != nil {
 		return err
@@ -1770,8 +1968,8 @@ func (composition *composition) validate() error {
 	if configured, ok := composition.configString("tools", "mode"); ok {
 		toolsMode = configured
 	}
-	if toolsMode != "" && toolsMode != "native" && toolsMode != "code" && toolsMode != "both" {
-		return fmt.Errorf("tools: mode must be native, code, or both, got %q", toolsMode)
+	if toolsMode != "" && toolsMode != "native" && toolsMode != "ptc" && toolsMode != "both" {
+		return fmt.Errorf("tools: mode must be native, ptc, or both, got %q", toolsMode)
 	}
 	if entry, ok := composition.index["llm-pi-ai"]; ok && composition.enabled("llm-pi-ai") {
 		providers := mappingValue(mappingValue(entry.node, "config"), "providers")
@@ -2088,6 +2286,18 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 			if toolName == "" {
 				toolName = "subagent"
 			}
+			modelSelectionSettings := false
+			if node := mappingValue(config, "modelSelectionSettings"); node != nil {
+				value, err := profileConfigValue(node)
+				if err != nil {
+					return fmt.Errorf("tool-subagent(%s): modelSelectionSettings: %w", id, err)
+				}
+				var ok bool
+				modelSelectionSettings, ok = value.(bool)
+				if !ok {
+					return fmt.Errorf("tool-subagent(%s): modelSelectionSettings must be boolean", id)
+				}
+			}
 			enabled := true
 			var enabledPtr *bool
 			if node := mappingValue(config, "enableRunInBackground"); node != nil {
@@ -2173,7 +2383,7 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 				toolFilter = &value
 			}
 			tools = append(tools, harness.SubagentToolConfig{
-				Provider: provider, ToolName: toolName, BackgroundMode: mode,
+				Provider: provider, ToolName: toolName, ModelSelectionSettings: modelSelectionSettings, BackgroundMode: mode,
 				EnableRunInBackground: enabledPtr, MaxDepth: maxDepth,
 				AgentOptions: agentOptions, Persona: persona, ToolFilter: toolFilter,
 			})
@@ -3037,6 +3247,20 @@ func profileBundles(document map[string]any) ([]string, error) {
 	return bundles, nil
 }
 
+func profilePatchReloadValue(document map[string]any) (string, bool, error) {
+	dsh, _ := document["dsh"].(map[string]any)
+	profile, _ := dsh["profile"].(map[string]any)
+	value, exists := profile["patchReload"]
+	if !exists {
+		return "", false, nil
+	}
+	reload, ok := value.(string)
+	if !ok || (reload != "live" && reload != "startup") {
+		return "", true, errors.New(`dsh.profile.patchReload must be "live" or "startup"`)
+	}
+	return reload, true, nil
+}
+
 func setProfileBundles(document map[string]any, bundles []string) {
 	dsh, _ := document["dsh"].(map[string]any)
 	if dsh == nil {
@@ -3049,6 +3273,20 @@ func setProfileBundles(document map[string]any, bundles []string) {
 		dsh["profile"] = profile
 	}
 	profile["bundles"] = stringsToAny(bundles)
+}
+
+func setProfilePatchReload(document map[string]any, patchReload string) {
+	dsh, _ := document["dsh"].(map[string]any)
+	if dsh == nil {
+		dsh = map[string]any{}
+		document["dsh"] = dsh
+	}
+	profile, _ := dsh["profile"].(map[string]any)
+	if profile == nil {
+		profile = map[string]any{}
+		dsh["profile"] = profile
+	}
+	profile["patchReload"] = patchReload
 }
 
 func stringsToAny(values []string) []any {
@@ -3081,11 +3319,11 @@ func (loader *profileLoader) runPlugin(profileName string, args []string, stdin 
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(dir, "package.json")); errors.Is(err, os.ErrNotExist) {
-		bundles := profileTemplates[profileName]
-		if bundles == nil {
-			bundles = []string{baseBundle}
+		template, ok := profileTemplates[profileName]
+		if !ok {
+			template = []string{baseBundle}
 		}
-		if err := loader.initProfile(dir, bundles); err != nil {
+		if err := loader.initProfile(dir, template, profilePatchReload[profileName]); err != nil {
 			return err
 		}
 		fmt.Fprintf(stderr, "dsh: initialized profile %s at %s\n", profileName, dir)

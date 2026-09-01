@@ -18,7 +18,7 @@ func TestDefaultConfigUsesSupportedEnvironmentSwitches(t *testing.T) {
 	if cfg.DataDir != home || cfg.AgentsHome != agents || cfg.WebSearchProvider != "exa" || cfg.WebFetchProvider != "custom-fetch" || cfg.ToolPresentation != "both" {
 		t.Fatalf("environment config = %#v", cfg)
 	}
-	if cfg.Version != Version() || cfg.Version != "0.1.1-rc.2" {
+	if cfg.Version != Version() || cfg.Version != "0.1.2-alpha.1" {
 		t.Fatalf("version = %q", cfg.Version)
 	}
 }
@@ -30,7 +30,7 @@ func TestToolPresentationControlsModelVisibleCatalog(t *testing.T) {
 		wantBash    bool
 	}{
 		{mode: "native", wantBash: true},
-		{mode: "code", wantRunCode: true},
+		{mode: "ptc", wantRunCode: true},
 		{mode: "both", wantRunCode: true, wantBash: true},
 	} {
 		t.Run(test.mode, func(t *testing.T) {

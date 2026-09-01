@@ -12,32 +12,141 @@ import (
 	"time"
 )
 
-const sdkReconcileInterval = 100 * time.Millisecond
+const (
+	sdkReconcileInterval    = 100 * time.Millisecond
+	sdkShutdownRequestDrain = 10 * time.Millisecond
+)
+
+// SDKServerOptions controls deployment-specific JSON-RPC result semantics.
+type SDKServerOptions struct {
+	MaxTokensAsSuccess bool
+}
 
 // ServeJSONRPC implements the upstream newline-delimited JSON-RPC SDK protocol
 // over caller-owned streams. It keeps stdout-safe transport separate from HTTP.
 func (e *Engine) ServeJSONRPC(ctx context.Context, input io.Reader, output io.Writer) error {
+	return e.ServeJSONRPCWithOptions(ctx, input, output, SDKServerOptions{})
+}
+
+// ServeJSONRPCWithOptions serves the SDK protocol with deployment-specific
+// result mapping while preserving ServeJSONRPC's default behavior.
+func (e *Engine) ServeJSONRPCWithOptions(ctx context.Context, input io.Reader, output io.Writer, options SDKServerOptions) error {
+	serveCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
-	server := newSDKServer(e, ctx, cancel, output)
+	server := newSDKServerWithOptions(e, ctx, cancel, output, options)
 	defer func() { _ = server.close() }()
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 4096), 16<<20)
-	for scanner.Scan() {
-		var request jsonRPCRequest
-		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
-			continue
+	type scanResult struct {
+		request jsonRPCRequest
+	}
+	requests := make(chan scanResult, 64)
+	scanDone := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(input)
+		scanner.Buffer(make([]byte, 4096), 16<<20)
+		for scanner.Scan() {
+			var request jsonRPCRequest
+			if err := json.Unmarshal(scanner.Bytes(), &request); err != nil || request.Method == "" || !isJSONRPCRequestID(request.ID) {
+				continue
+			}
+			select {
+			case requests <- scanResult{request: request}:
+			case <-serveCtx.Done():
+				close(requests)
+				scanDone <- context.Cause(serveCtx)
+				return
+			}
 		}
-		if request.Method == "" {
-			continue
+		close(requests)
+		scanDone <- scanner.Err()
+	}()
+
+	var handlers sync.WaitGroup
+	var beforeShutdown sync.WaitGroup
+	var handlerErrOnce sync.Once
+	var handlerErr error
+	var shutdownOnce sync.Once
+	shutdownComplete := make(chan struct{})
+	shuttingDown := false
+	dispatch := func(request jsonRPCRequest) {
+		if shuttingDown && request.Method != "shutdown" {
+			return
 		}
-		if err := server.handle(request); err != nil {
-			return err
+		handlers.Add(1)
+		if request.Method != "shutdown" {
+			beforeShutdown.Add(1)
 		}
-		if request.Method == "shutdown" {
-			return nil
+		go func() {
+			defer handlers.Done()
+			if request.Method == "shutdown" {
+				beforeShutdown.Wait()
+			} else {
+				defer beforeShutdown.Done()
+			}
+			if err := server.handle(request); err != nil {
+				handlerErrOnce.Do(func() { handlerErr = err })
+			}
+			if request.Method == "shutdown" {
+				shutdownOnce.Do(func() { close(shutdownComplete) })
+			}
+		}()
+	}
+	waitHandlers := func(scanErr error) error {
+		handlers.Wait()
+		if scanErr != nil {
+			return scanErr
+		}
+		return handlerErr
+	}
+	for {
+		select {
+		case scanned, ok := <-requests:
+			if !ok {
+				return waitHandlers(<-scanDone)
+			}
+			if scanned.request.Method == "shutdown" {
+				shuttingDown = true
+			}
+			dispatch(scanned.request)
+		case <-shutdownComplete:
+			timer := time.NewTimer(sdkShutdownRequestDrain)
+			for {
+				select {
+				case scanned, ok := <-requests:
+					if !ok {
+						if !timer.Stop() {
+							<-timer.C
+						}
+						return waitHandlers(<-scanDone)
+					}
+					if scanned.request.Method == "shutdown" {
+						dispatch(scanned.request)
+					}
+				case <-timer.C:
+					return waitHandlers(nil)
+				case <-serveCtx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return waitHandlers(context.Cause(serveCtx))
+				}
+			}
+		case <-serveCtx.Done():
+			return waitHandlers(context.Cause(serveCtx))
 		}
 	}
-	return scanner.Err()
+}
+
+// isJSONRPCRequestID mirrors the SDK transport's request boundary: only
+// string and number ids identify requests. Frames with a missing/null,
+// boolean, array, or object id are notifications (or malformed frames) and
+// must not be dispatched to the server handler.
+func isJSONRPCRequestID(id any) bool {
+	switch id.(type) {
+	case string, float64, json.Number:
+		return true
+	default:
+		return false
+	}
 }
 
 type jsonRPCRequest struct {
@@ -66,6 +175,8 @@ type sdkServer struct {
 	stateMu              sync.Mutex
 	subscriptions        map[string]context.CancelFunc
 	ownedSessions        map[string]struct{}
+	ownedRecords         map[string]sdkOwnedSession
+	sessionCreations     map[string]*sdkSessionCreation
 	startedSubagents     map[string]string
 	sessionStatuses      map[string]bool
 	initialEventCounts   map[string]int
@@ -75,10 +186,28 @@ type sdkServer struct {
 	closing              bool
 	initialized          bool
 	cwd, provider, model string
+	reasoningEffort      string
 	maxTokens            int
+	maxTokensAsSuccess   bool
+	subagentEndDispose   func()
+}
+
+type sdkSessionCreation struct {
+	done   chan struct{}
+	record *sdkOwnedSession
+	err    error
+}
+
+type sdkOwnedSession struct {
+	session    *Session
+	generation uint64
 }
 
 func newSDKServer(e *Engine, ctx context.Context, cancel context.CancelFunc, output io.Writer) *sdkServer {
+	return newSDKServerWithOptions(e, ctx, cancel, output, SDKServerOptions{})
+}
+
+func newSDKServerWithOptions(e *Engine, ctx context.Context, cancel context.CancelFunc, output io.Writer, options SDKServerOptions) *sdkServer {
 	host := e.SubscribeHost(ctx)
 	e.mu.RLock()
 	sessions := make([]*Session, 0, len(e.sessions))
@@ -100,9 +229,10 @@ func newSDKServer(e *Engine, ctx context.Context, cancel context.CancelFunc, out
 	}
 	server := &sdkServer{
 		engine: e, ctx: ctx, cancel: cancel, output: output,
-		subscriptions: map[string]context.CancelFunc{}, ownedSessions: map[string]struct{}{}, startedSubagents: startedSubagents,
-		sessionStatuses: sessionStatuses, initialEventCounts: initialEventCounts,
+		subscriptions: map[string]context.CancelFunc{}, ownedSessions: map[string]struct{}{}, ownedRecords: map[string]sdkOwnedSession{}, sessionCreations: map[string]*sdkSessionCreation{}, startedSubagents: startedSubagents,
+		sessionStatuses: sessionStatuses, initialEventCounts: initialEventCounts, maxTokensAsSuccess: options.MaxTokensAsSuccess,
 	}
+	server.subagentEndDispose = e.subscribeSDKSubagentEnd(ctx, server.handleSubagentEnd)
 	server.watchHost(host)
 	for _, session := range sessions {
 		server.subscribe(session.Header.ID)
@@ -129,10 +259,11 @@ func (s *sdkServer) handle(request jsonRPCRequest) error {
 	switch request.Method {
 	case "initialize":
 		var params struct {
-			CWD       string       `json:"cwd"`
-			Provider  string       `json:"provider"`
-			Model     string       `json:"model"`
-			MaxTokens *json.Number `json:"maxTokens"`
+			CWD             string          `json:"cwd"`
+			Provider        string          `json:"provider"`
+			Model           string          `json:"model"`
+			ReasoningEffort json.RawMessage `json:"reasoningEffort"`
+			MaxTokens       json.RawMessage `json:"maxTokens"`
 		}
 		if err := decode(request.Params, &params); err != nil {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: err.Error()})
@@ -142,10 +273,25 @@ func (s *sdkServer) handle(request jsonRPCRequest) error {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "invalid initialize parameters"})
 			return nil
 		}
-		maxTokens := 0
-		if params.MaxTokens != nil {
+		var reasoningEffort string
+		if len(params.ReasoningEffort) > 0 {
+			if string(params.ReasoningEffort) == "null" {
+				s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "initialize reasoningEffort must be a non-empty string"})
+				return nil
+			}
+			if err := json.Unmarshal(params.ReasoningEffort, &reasoningEffort); err != nil || reasoningEffort == "" {
+				s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "initialize reasoningEffort must be a non-empty string"})
+				return nil
+			}
+		}
+		var maxTokens int
+		if len(params.MaxTokens) > 0 {
+			if string(params.MaxTokens) == "null" {
+				s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "initialize maxTokens must be a positive safe integer"})
+				return nil
+			}
 			var ok bool
-			maxTokens, ok = safePositiveInteger(*params.MaxTokens)
+			maxTokens, ok = safePositiveInteger(json.Number(string(params.MaxTokens)))
 			if !ok {
 				s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "initialize maxTokens must be a positive safe integer"})
 				return nil
@@ -163,20 +309,37 @@ func (s *sdkServer) handle(request jsonRPCRequest) error {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: fmt.Sprintf("no adapter registered for provider %q", params.Provider)})
 			return nil
 		}
+		if err := s.engine.preflightSubagentLlm(s.ctx, ModelSelection{}, &SubagentAgentOptions{
+			Provider: params.Provider, Model: params.Model, ReasoningEffort: reasoningEffort, MaxTokens: maxTokens,
+		}, false); err != nil {
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: err.Error()})
+			return nil
+		}
+		s.stateMu.Lock()
+		if s.closing {
+			s.stateMu.Unlock()
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: "SDK server is shutting down"})
+			return nil
+		}
 		s.cwd = cwd
 		s.provider = params.Provider
 		s.model = params.Model
+		s.reasoningEffort = reasoningEffort
 		s.maxTokens = maxTokens
 		s.initialized = true
+		s.stateMu.Unlock()
 		s.reply(request.ID, map[string]any{"serverInfo": map[string]any{"name": "deepseek-harness-sdk-runtime", "version": s.engine.cfg.Version}}, nil)
 	case "session/prompt":
-		if !s.initialized {
+		s.stateMu.Lock()
+		initialized := s.initialized
+		s.stateMu.Unlock()
+		if !initialized {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: "initialize is required"})
 			return nil
 		}
 		var params struct {
-			SessionID     string         `json:"sessionId"`
-			ContentBlocks []ContentBlock `json:"contentBlocks"`
+			SessionID     string            `json:"sessionId"`
+			ContentBlocks []json.RawMessage `json:"contentBlocks"`
 		}
 		if err := decode(request.Params, &params); err != nil || params.SessionID == "" {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: "invalid session/prompt parameters"})
@@ -186,11 +349,30 @@ func (s *sdkServer) handle(request jsonRPCRequest) error {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: err.Error()})
 			return nil
 		}
-		parts := make([]PromptContentPart, 0, len(params.ContentBlocks))
-		for _, b := range params.ContentBlocks {
-			parts = append(parts, PromptContentPart{Type: b.Type, Text: b.Text})
+		s.stateMu.Lock()
+		record, owned := s.ownedRecords[params.SessionID]
+		s.stateMu.Unlock()
+		if !owned {
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: "SDK server is shutting down"})
+			return nil
 		}
-		job, command, err := s.engine.enqueuePrompt(s.ctx, params.SessionID, PromptRequest{SessionID: params.SessionID, Mode: "queue", Content: parts, Literal: true}, false)
+		if err := s.assertLiveOwnedSession(params.SessionID, record); err != nil {
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: err.Error()})
+			return nil
+		}
+		parts, content, err := s.preparePromptContent(params.ContentBlocks)
+		if err != nil {
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32602, Message: err.Error()})
+			return nil
+		}
+		if err := s.assertLiveOwnedSession(params.SessionID, record); err != nil {
+			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: err.Error()})
+			return nil
+		}
+		job, command, err := s.engine.enqueuePrompt(s.ctx, params.SessionID, PromptRequest{
+			SessionID: params.SessionID, Mode: "queue", Content: parts, Literal: true,
+			preparedContent: content, attachmentGuard: &sessionAttachmentGuard{session: record.session, generation: record.generation},
+		}, false)
 		if err != nil {
 			s.reply(request.ID, nil, &jsonRPCError{Code: -32603, Message: err.Error()})
 			return nil
@@ -210,6 +392,54 @@ func (s *sdkServer) handle(request jsonRPCRequest) error {
 		s.reply(request.ID, nil, &jsonRPCError{Code: -32601, Message: "method not found"})
 	}
 	return nil
+}
+
+func (s *sdkServer) preparePromptContent(raw []json.RawMessage) ([]PromptContentPart, []ContentBlock, error) {
+	parts := make([]PromptContentPart, len(raw))
+	content := make([]ContentBlock, len(raw))
+	inline := make([]PromptContentPart, 0)
+	inlineIndexes := make([]int, 0)
+	for index, encoded := range raw {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+			return nil, nil, errors.New("prompt content must be an object")
+		}
+		var typ string
+		if err := json.Unmarshal(object["type"], &typ); err != nil || typ == "" {
+			return nil, nil, errors.New("prompt content type is required")
+		}
+		if typ == "image" && object["data"] != nil {
+			var image struct {
+				Type     string `json:"type"`
+				Data     string `json:"data"`
+				MimeType string `json:"mimeType"`
+			}
+			if err := json.Unmarshal(encoded, &image); err != nil || image.Data == "" || image.MimeType == "" {
+				return nil, nil, errors.New("image content requires data and mimeType")
+			}
+			parts[index] = PromptContentPart{Type: "image", Data: image.Data, MediaType: image.MimeType}
+			inline = append(inline, parts[index])
+			inlineIndexes = append(inlineIndexes, index)
+			continue
+		}
+		var block ContentBlock
+		if err := json.Unmarshal(encoded, &block); err != nil {
+			return nil, nil, err
+		}
+		parts[index] = PromptContentPart{Type: block.Type, Text: block.Text}
+		content[index] = block
+	}
+	if len(inline) == 0 {
+		return parts, content, nil
+	}
+	admitted, err := s.engine.durablePromptContentContext(s.ctx, inline)
+	if err != nil {
+		return nil, nil, err
+	}
+	for index, target := range inlineIndexes {
+		content[target] = admitted[index]
+	}
+	return parts, content, nil
 }
 
 const maxSafeInteger = int64(1<<53 - 1)
@@ -233,37 +463,99 @@ func (s *sdkServer) ensureSession(id string) error {
 		s.stateMu.Unlock()
 		return errors.New("SDK server is shutting down")
 	}
-	if _, ok := s.ownedSessions[id]; ok {
+	if record, ok := s.ownedRecords[id]; ok {
 		s.stateMu.Unlock()
-		return nil
+		return s.assertLiveOwnedSession(id, record)
 	}
+	if pending := s.sessionCreations[id]; pending != nil {
+		s.stateMu.Unlock()
+		<-pending.done
+		if pending.err != nil {
+			return pending.err
+		}
+		return s.assertLiveOwnedSession(id, *pending.record)
+	}
+	pending := &sdkSessionCreation{done: make(chan struct{})}
+	if s.sessionCreations == nil {
+		s.sessionCreations = map[string]*sdkSessionCreation{}
+	}
+	s.sessionCreations[id] = pending
 	s.stateMu.Unlock()
 
-	session, err := s.engine.getSession(id)
+	record, err := s.createOwnedSession(id)
+	s.stateMu.Lock()
+	if err == nil && s.closing {
+		err = errors.New("SDK server is shutting down")
+	}
 	if err == nil {
+		pending.record = &record
+		if s.ownedSessions == nil {
+			s.ownedSessions = map[string]struct{}{}
+		}
+		if s.ownedRecords == nil {
+			s.ownedRecords = map[string]sdkOwnedSession{}
+		}
+		s.ownedSessions[id] = struct{}{}
+		s.ownedRecords[id] = record
+	}
+	pending.err = err
+	delete(s.sessionCreations, id)
+	s.stateMu.Unlock()
+	if err != nil {
+		if record.session != nil {
+			_ = detachSDKOwnedSession(s.engine, id, record)
+		}
+		close(pending.done)
+		return err
+	}
+	close(pending.done)
+	s.subscribe(id)
+	s.reconcileSubagents()
+	return nil
+}
+
+func (s *sdkServer) createOwnedSession(id string) (sdkOwnedSession, error) {
+	s.stateMu.Lock()
+	cwd, provider, model := s.cwd, s.provider, s.model
+	reasoningEffort, maxTokens := s.reasoningEffort, s.maxTokens
+	s.stateMu.Unlock()
+	if session, err := s.engine.getSession(id); err == nil {
 		session.mu.Lock()
 		attached := session.attached
 		session.mu.Unlock()
 		if attached {
-			return fmt.Errorf("session agent exists outside the SDK server: %s", id)
+			return sdkOwnedSession{}, fmt.Errorf("session agent exists outside the SDK server: %s", id)
 		}
 	}
-	if _, err := s.engine.CreateSession(s.ctx, s.cwd, id, ""); err != nil {
-		return err
+	if _, err := s.engine.CreateSession(s.ctx, cwd, id, ""); err != nil {
+		return sdkOwnedSession{}, err
 	}
-	selection := ModelSelection{Provider: s.provider, Model: s.model, MaxTokens: s.maxTokens}
+	session, err := s.engine.getSession(id)
+	if err != nil {
+		return sdkOwnedSession{}, err
+	}
+	session.mu.Lock()
+	record := sdkOwnedSession{session: session, generation: session.attachmentGeneration}
+	session.mu.Unlock()
+	selection := ModelSelection{Provider: provider, Model: model, ReasoningEffort: reasoningEffort, MaxTokens: maxTokens}
 	if err := s.engine.SelectModel(id, selection); err != nil {
-		_ = detachSDKSession(s.engine, id)
-		return err
+		_ = detachSDKOwnedSession(s.engine, id, record)
+		return sdkOwnedSession{}, err
 	}
-	s.stateMu.Lock()
-	if s.ownedSessions == nil {
-		s.ownedSessions = map[string]struct{}{}
+	return record, nil
+}
+
+func (s *sdkServer) assertLiveOwnedSession(id string, record sdkOwnedSession) error {
+	current, err := s.engine.getSession(id)
+	if err != nil || current != record.session {
+		return fmt.Errorf("session agent was disposed outside the server: %s", id)
 	}
-	s.ownedSessions[id] = struct{}{}
-	s.stateMu.Unlock()
-	s.subscribe(id)
-	s.reconcileSubagents()
+	current.mu.Lock()
+	live := current.attached && current.attachmentGeneration == record.generation
+	current.mu.Unlock()
+	if !live {
+		return fmt.Errorf("session agent was disposed outside the server: %s", id)
+	}
 	return nil
 }
 
@@ -271,6 +563,10 @@ func (s *sdkServer) close() error {
 	s.closeOnce.Do(func() {
 		s.stateMu.Lock()
 		s.closing = true
+		pending := make([]*sdkSessionCreation, 0, len(s.sessionCreations))
+		for _, creation := range s.sessionCreations {
+			pending = append(pending, creation)
+		}
 		cancels := make([]context.CancelFunc, 0, len(s.subscriptions))
 		for _, cancel := range s.subscriptions {
 			cancels = append(cancels, cancel)
@@ -280,8 +576,19 @@ func (s *sdkServer) close() error {
 		for id := range s.ownedSessions {
 			owned = append(owned, id)
 		}
+		records := make(map[string]sdkOwnedSession, len(s.ownedRecords))
+		for id, record := range s.ownedRecords {
+			records[id] = record
+		}
 		s.ownedSessions = map[string]struct{}{}
+		s.ownedRecords = map[string]sdkOwnedSession{}
 		s.stateMu.Unlock()
+		if s.subagentEndDispose != nil {
+			s.subagentEndDispose()
+		}
+		for _, creation := range pending {
+			<-creation.done
+		}
 
 		for _, cancel := range cancels {
 			cancel()
@@ -298,7 +605,13 @@ func (s *sdkServer) close() error {
 			failures = append(failures, err)
 		}
 		for _, id := range owned {
-			if err := detachSDKSession(s.engine, id); err != nil {
+			var err error
+			if record, ok := records[id]; ok {
+				err = detachSDKOwnedSession(s.engine, id, record)
+			} else {
+				err = detachSDKSession(s.engine, id)
+			}
+			if err != nil {
 				failures = append(failures, err)
 			}
 		}
@@ -308,18 +621,30 @@ func (s *sdkServer) close() error {
 }
 
 func detachSDKSession(e *Engine, id string) error {
-	return detachSDKSessionWithDynamicOrigin(e, nil, id)
+	return detachSDKSessionRecordWithDynamicOrigin(e, nil, id, nil)
+}
+
+func detachSDKOwnedSession(e *Engine, id string, record sdkOwnedSession) error {
+	return detachSDKSessionRecordWithDynamicOrigin(e, nil, id, &record)
 }
 
 // detachSDKSessionWithDynamicOrigin is used by dynamic Cordis teardown. A
 // run disposer executes on the Cordis loop, so its contained disposal event
 // must dispatch inline instead of calling back into that same loop.
 func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id string) error {
+	return detachSDKSessionRecordWithDynamicOrigin(e, origin, id, nil)
+}
+
+func detachSDKSessionRecordWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id string, expected *sdkOwnedSession) error {
 	session, err := e.getSession(id)
 	if err != nil {
 		return nil
 	}
 	session.mu.Lock()
+	if expected != nil && (session != expected.session || session.attachmentGeneration != expected.generation) {
+		session.mu.Unlock()
+		return nil
+	}
 	if !session.attached {
 		session.mu.Unlock()
 		return nil
@@ -348,7 +673,7 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 	pending := append(append([]*queuedPrompt(nil), session.pending...), session.steering...)
 	session.pending = nil
 	session.steering = nil
-	session.attached = false
+	detachSessionLocked(session)
 	session.requestHeaderLogged = false
 	activity := session.activity
 	cancel := session.Cancel
@@ -392,6 +717,8 @@ func detachSDKSessionWithDynamicOrigin(e *Engine, origin *dynamicCordisRun, id s
 
 type sdkSessionLineage struct {
 	id, parent string
+	session    *Session
+	generation uint64
 }
 
 func (s *sdkServer) reconcileSubagents() {
@@ -404,7 +731,10 @@ func (s *sdkServer) reconcileSubagents() {
 	lineage := make([]sdkSessionLineage, 0, len(sessions))
 	for _, session := range sessions {
 		session.mu.Lock()
-		row := sdkSessionLineage{id: session.Header.ID, parent: session.Header.ParentSession}
+		row := sdkSessionLineage{
+			id: session.Header.ID, parent: session.Header.ParentSession,
+			session: session, generation: session.attachmentGeneration,
+		}
 		session.mu.Unlock()
 		if row.id != "" && row.parent != "" {
 			lineage = append(lineage, row)
@@ -430,6 +760,16 @@ func (s *sdkServer) reconcileSubagents() {
 		}
 	}
 	inheritSDKOwnedSessions(s.ownedSessions, lineage)
+	if s.ownedRecords == nil {
+		s.ownedRecords = map[string]sdkOwnedSession{}
+	}
+	for _, row := range lineage {
+		if _, owned := s.ownedSessions[row.id]; owned {
+			if _, recorded := s.ownedRecords[row.id]; !recorded && row.session != nil {
+				s.ownedRecords[row.id] = sdkOwnedSession{session: row.session, generation: row.generation}
+			}
+		}
+	}
 	s.stateMu.Unlock()
 
 	for _, row := range discovered {
@@ -565,10 +905,7 @@ func (s *sdkServer) subscribe(id string) {
 		flush := func() {
 			session.mu.Lock()
 			batch := append([]Event(nil), session.Events[cursor:]...)
-			allEvents := append([]Event(nil), session.Events...)
 			currentRunning := session.Running
-			provider := session.Model.Provider
-			isSubagent := session.Header.Origin == "subagent"
 			session.mu.Unlock()
 
 			for _, event := range batch {
@@ -576,14 +913,6 @@ func (s *sdkServer) subscribe(id string) {
 					s.notifySessionStatus(id, true)
 				}
 				s.notify("session.event", map[string]any{"sessionId": id, "event": event})
-				if event.Type == "turn/end" && isSubagent {
-					s.stateMu.Lock()
-					parent := s.startedSubagents[id]
-					s.stateMu.Unlock()
-					if parent != "" {
-						s.notify("subagent.finished", sdkSubagentFinished(parent, id, provider, allEvents, event))
-					}
-				}
 				cursor++
 			}
 			s.notifySessionStatus(id, currentRunning)
@@ -608,84 +937,33 @@ func (s *sdkServer) subscribe(id string) {
 	}()
 }
 
-func sdkSubagentFinished(parent, child, provider string, events []Event, end Event) map[string]any {
-	stopReason := sdkSubagentStopReason(end)
+func (s *sdkServer) handleSubagentEnd(event sdkSubagentEnd) {
+	local, _ := event.Payload["local"].(bool)
+	if !local {
+		return
+	}
+	provider, _ := event.Payload["provider"].(string)
+	child, _ := event.Payload["id"].(string)
+	stopReason, _ := event.Payload["stopReason"].(string)
+	if event.ParentSessionID == "" || provider == "" || child == "" || stopReason == "" {
+		return
+	}
+	status := "error"
+	if stopReason == "completed" || stopReason == "max-tokens" && s.maxTokensAsSuccess {
+		status = "ok"
+	}
 	params := map[string]any{
-		"provider": provider, "agentId": child, "parentSessionId": parent, "childSessionId": child,
-		"status": "error", "stopReason": stopReason,
+		"provider": provider, "agentId": child, "parentSessionId": event.ParentSessionID, "childSessionId": child,
+		"status": status, "stopReason": stopReason,
 	}
-	if stopReason == "completed" {
-		params["status"] = "ok"
-	}
-	if output := sdkAssistantOutput(events, end.Seq); output != nil {
+	if output, ok := event.Payload["lastAssistantMessage"]; ok {
 		params["lastAssistantMessage"] = output
 	}
-	return params
-}
-
-func sdkSubagentStopReason(end Event) string {
-	data, _ := end.Data.(map[string]any)
-	reason, _ := data["reason"].(map[string]any)
-	kind, _ := reason["kind"].(string)
-	switch kind {
-	case "completed", "max-tokens", "aborted":
-		return kind
-	case "blocked", "rejected":
-		return "refusal"
-	default:
-		return "error"
-	}
-}
-
-func sdkAssistantOutput(events []Event, endSeq int) any {
-	if endSeq < 0 || endSeq > len(events) {
-		return nil
-	}
-	start := 0
-	for index := endSeq - 1; index >= 0; index-- {
-		if events[index].Type == "turn/end" {
-			start = index + 1
-			break
-		}
-	}
-	var message any
-	var partial string
-	for _, event := range events[start:endSeq] {
-		data, _ := event.Data.(map[string]any)
-		switch event.Type {
-		case "assistant/message":
-			value, _ := data["message"].(map[string]any)
-			content := value["content"]
-			if sdkContentLength(content) > 0 {
-				message = content
-			}
-		case "assistant/chunk":
-			chunk, _ := data["chunk"].(map[string]any)
-			if chunk["type"] == "text-delta" {
-				text, _ := chunk["text"].(string)
-				partial += text
-			}
-		}
-	}
-	if message != nil {
-		return message
-	}
-	if partial != "" {
-		return []ContentBlock{{Type: "text", Text: partial}}
-	}
-	return nil
-}
-
-func sdkContentLength(value any) int {
-	switch content := value.(type) {
-	case []ContentBlock:
-		return len(content)
-	case []any:
-		return len(content)
-	case []map[string]any:
-		return len(content)
-	default:
-		return 0
+	s.stateMu.Lock()
+	closing := s.closing
+	s.stateMu.Unlock()
+	if !closing {
+		s.notify("subagent.finished", params)
 	}
 }
 

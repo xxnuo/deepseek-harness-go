@@ -57,10 +57,11 @@ var piAICatalogProtocols = map[string]bool{
 var piAICompatProtocolFields = map[string]map[string]bool{
 	"openai-completions": {
 		"supportsStore": true, "supportsDeveloperRole": true, "supportsReasoningEffort": true,
-		"supportsUsageInStreaming": true, "maxTokensField": true, "requiresToolResultName": true,
+		"supportsUsageInStreaming": true, "supportsFinishReason": true, "maxTokensField": true, "requiresToolResultName": true,
 		"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
 		"requiresReasoningContentOnAssistantMessages": true, "thinkingFormat": true,
-		"chatTemplateKwargs": true, "supportsStrictMode": true, "cacheControlFormat": true,
+		"chatTemplateKwargs": true, "chatTemplateArgs": true, "supportsThinkingTokenBudget": true,
+		"supportsStrictMode": true, "cacheControlFormat": true,
 		"supportsLongCacheRetention": true,
 	},
 	"openai-responses": {
@@ -85,11 +86,13 @@ var piAIWithheldCompatFields = map[string]bool{
 	"supportsOpenAIGrammarTools": true, "sendSessionAffinityHeaders": true,
 	"deferredToolsMode": true, "sessionAffinityFormat": true, "supportsToolSearch": true,
 	"supportsExplicitPromptCacheMode": true, "supportsToolReferences": true,
+	"supportsAdditionalTools": true,
 }
 
 var piAIBooleanCompatFields = map[string]bool{
 	"supportsStore": true, "supportsDeveloperRole": true, "supportsReasoningEffort": true,
-	"supportsUsageInStreaming": true, "requiresToolResultName": true,
+	"supportsUsageInStreaming": true, "supportsFinishReason": true, "supportsThinkingTokenBudget": true,
+	"requiresToolResultName":           true,
 	"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
 	"requiresReasoningContentOnAssistantMessages": true, "supportsStrictMode": true,
 	"supportsLongCacheRetention": true, "supportsEagerToolInputStreaming": true,
@@ -193,6 +196,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		provider := NewOpenAIProvider(p.profile.route, baseURL, apiKey, model.ID)
 		provider.headers = headers
 		provider.cacheRetention = p.profile.cacheRetention
+		provider.thinkingBudgets = cloneIntMap(p.profile.thinkingBudgets)
 		provider.modelSpec = model
 		provider.streamIdleTimeout = p.profile.streamIdleTimeout
 		if p.profile.timeout > 0 {
@@ -387,10 +391,11 @@ func piAISettingsBase() map[string]any {
 func piAISettingsSchema() map[string]any {
 	compatFields := map[string]any{
 		"supportsStore": 24, "supportsDeveloperRole": 24, "supportsReasoningEffort": 24,
-		"supportsUsageInStreaming": 24, "maxTokensField": 2, "requiresToolResultName": 24,
+		"supportsUsageInStreaming": 24, "supportsFinishReason": 24, "maxTokensField": 2, "requiresToolResultName": 24,
 		"requiresAssistantAfterToolResult": 24, "requiresThinkingAsText": 24,
 		"requiresReasoningContentOnAssistantMessages": 24, "thinkingFormat": 2,
-		"chatTemplateKwargs": 27, "supportsStrictMode": 24, "cacheControlFormat": 2,
+		"chatTemplateKwargs": 27, "chatTemplateArgs": 27, "supportsThinkingTokenBudget": 24,
+		"supportsStrictMode": 24, "cacheControlFormat": 2,
 		"supportsLongCacheRetention": 24, "supportsEagerToolInputStreaming": 24,
 		"supportsCacheControlOnTools": 24, "supportsTemperature": 24,
 		"forceAdaptiveThinking": 24, "allowEmptySignature": 24, "supportsStrictTools": 24,
@@ -865,6 +870,8 @@ func applyPiAICompat(compat *piAIModelCompat, raw any, api string) {
 			compat.MaxTokensField = value.(string)
 		case "chatTemplateKwargs":
 			compat.ChatTemplateKwargs = cloneSettingsValue(value.(map[string]any))
+		case "chatTemplateArgs":
+			compat.ChatTemplateArgs = cloneSettingsValue(value.(map[string]any))
 		case "supportsStore":
 			compat.SupportsStore = piAIBool(value)
 		case "supportsDeveloperRole":
@@ -873,6 +880,10 @@ func applyPiAICompat(compat *piAIModelCompat, raw any, api string) {
 			compat.SupportsReasoningEffort = piAIBool(value)
 		case "supportsUsageInStreaming":
 			compat.SupportsUsageInStreaming = piAIBool(value)
+		case "supportsFinishReason":
+			compat.SupportsFinishReason = piAIBool(value)
+		case "supportsThinkingTokenBudget":
+			compat.SupportsThinkingTokenBudget = piAIBool(value)
 		case "requiresToolResultName":
 			compat.RequiresToolResultName = piAIBool(value)
 		case "requiresAssistantAfterToolResult":
@@ -952,7 +963,7 @@ func validatePiAICompat(raw any, path string) error {
 		case key == "thinkingFormat":
 			format, ok := rawValue.(string)
 			if !ok || !map[string]bool{
-				"openai": true, "deepseek": true, "openrouter": true, "together": true,
+				"openai": true, "deepseek": true, "openrouter": true, "together": true, "baseten": true,
 				"zai": true, "qwen": true, "chat-template": true, "qwen-chat-template": true,
 				"string-thinking": true, "ant-ling": true,
 			}[format] {
@@ -968,14 +979,14 @@ func validatePiAICompat(raw any, path string) error {
 			if !ok || field != "anthropic" {
 				return fmt.Errorf("%s cacheControlFormat is unsupported", path)
 			}
-		case key == "chatTemplateKwargs":
+		case key == "chatTemplateKwargs" || key == "chatTemplateArgs":
 			kwargs, ok := rawValue.(map[string]any)
 			if !ok {
-				return fmt.Errorf("%s chatTemplateKwargs must be an object", path)
+				return fmt.Errorf("%s %s must be an object", path, key)
 			}
 			for name, item := range kwargs {
 				if err := validatePiAIChatTemplateKwarg(item); err != nil {
-					return fmt.Errorf("%s chatTemplateKwargs.%s %w", path, name, err)
+					return fmt.Errorf("%s %s.%s %w", path, key, name, err)
 				}
 			}
 		case piAIBooleanCompatFields[key]:
@@ -1321,11 +1332,26 @@ func millisecondsDuration(milliseconds float64) time.Duration {
 
 func (e *Engine) replacePiAIProvidersLocked(next map[string]*managedPiAIProvider) {
 	for route, current := range e.piAIProviders {
-		if e.providers[route] == current {
-			delete(e.providers, route)
+		if e.providers[route] != current {
+			continue
 		}
+		if replacement := next[route]; replacement != nil {
+			e.providers[route] = replacement
+			continue
+		}
+		delete(e.providers, route)
+		e.providerOrder = removeProviderID(e.providerOrder, route)
 	}
-	for route, provider := range next {
+	routes := make([]string, 0, len(next))
+	for route := range next {
+		routes = append(routes, route)
+	}
+	sort.Strings(routes)
+	for _, route := range routes {
+		provider := next[route]
+		if _, exists := e.providers[route]; !exists {
+			e.providerOrder = append(e.providerOrder, route)
+		}
 		e.providers[route] = provider
 	}
 	e.piAIProviders = next

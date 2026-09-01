@@ -146,8 +146,8 @@ func TestReadSessionPreservesReplacementSurfaceObject(t *testing.T) {
 }
 
 func TestReadUpstreamPackedSessionLog(t *testing.T) {
-	s := readUpstreamSessionSnapshot(t, "testdata/upstream/examples/jsonrpc-agent/tests/snapshots/text-turn/session.jsonl")
-	if s.Header.ID != "sdk-snapshot-text" || len(s.Events) != 40 {
+	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/text-turn/session.jsonl")
+	if s.Header.ID != "{{session:1}}" || len(s.Events) != 45 {
 		t.Fatalf("upstream session = id %q, events %d", s.Header.ID, len(s.Events))
 	}
 	for seq, event := range s.Events {
@@ -155,16 +155,30 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 			t.Fatalf("event %d has seq %d", seq, event.Seq)
 		}
 	}
-	chunk, _ := s.Events[29].Data.(map[string]any)["chunk"].(map[string]any)
-	if chunk["type"] != "text-delta" || chunk["text"] != "SD" {
-		t.Fatalf("expanded chunk = %#v", chunk)
+	foundTextDelta := false
+	for _, event := range s.Events {
+		data, _ := event.Data.(map[string]any)
+		chunk, _ := data["chunk"].(map[string]any)
+		if event.Type == "assistant/chunk" && chunk["type"] == "text-delta" && chunk["text"] == "SD" {
+			foundTextDelta = true
+			break
+		}
 	}
-	message := s.Events[37]
-	if len(message.SourceEventSeqs) != 29 || message.SourceEventSeqs[0] != 8 || message.SourceEventSeqs[len(message.SourceEventSeqs)-1] != 36 || !isAppendSurfaceEvent(message) {
+	if !foundTextDelta {
+		t.Fatal("expanded text chunk was not found")
+	}
+	var message Event
+	for _, event := range s.Events {
+		if event.Type == "assistant/message" {
+			message = event
+			break
+		}
+	}
+	if len(message.SourceEventSeqs) != 29 || message.SourceEventSeqs[0] != 13 || message.SourceEventSeqs[len(message.SourceEventSeqs)-1] != 41 || !isAppendSurfaceEvent(message) {
 		t.Fatalf("assistant provenance = %#v", message)
 	}
 
-	toolSession := readUpstreamSessionSnapshot(t, "testdata/upstream/examples/jsonrpc-agent/tests/snapshots/bash-tool/session.jsonl")
+	toolSession := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/bash-tool/session.jsonl")
 	foundToolDelta := false
 	for _, event := range toolSession.Events {
 		data, _ := event.Data.(map[string]any)
@@ -180,10 +194,18 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 }
 
 func TestReadUpstreamCompactionRebuildsLiveSurface(t *testing.T) {
-	s := readUpstreamSessionSnapshot(t, "testdata/upstream/examples/headless-agent/tests/snapshots/compaction-recovery/session.jsonl")
-	replacement := s.Events[21]
+	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/session/compaction-recovery/session.jsonl")
+	var replacement Event
+	for _, event := range s.Events {
+		if event.Type == "user/message" {
+			if _, _, ok := surfaceReplaceBounds(event.SurfaceOp); ok {
+				replacement = event
+				break
+			}
+		}
+	}
 	start, end, ok := surfaceReplaceBounds(replacement.SurfaceOp)
-	if !ok || start != 4 || end != 4 || len(replacement.SourceEventSeqs) != 3 {
+	if !ok || start != 7 || end != 8 || len(replacement.SourceEventSeqs) != 4 {
 		t.Fatalf("replacement = %#v", replacement)
 	}
 	messages := transcriptMessages(s.Events, 1)

@@ -543,36 +543,35 @@ func (e *Engine) pluginHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/plugins/")
-	isMap := strings.HasSuffix(path, "/client.js.map")
-	suffix := "/client.js"
-	if isMap {
-		suffix = "/client.js.map"
-	}
-	if !strings.HasSuffix(path, suffix) {
-		http.NotFound(w, r)
+	// Alpha.1 addresses startup and HMR resources through the shared combo
+	// endpoint. Build one snapshot so the route lookup and advertised graph
+	// revisions refer to exactly the same response bytes.
+	current, previous, snapshotErr := e.bootSnapshotResponses()
+	if snapshotErr != nil {
+		http.Error(w, "failed to build plugin graph", http.StatusInternalServerError)
 		return
 	}
-	id := strings.TrimSuffix(path, suffix)
-	bundle, ok := findPluginPath(e, id)
+	resourceURL := r.URL.Path
+	if r.URL.RawQuery != "" {
+		resourceURL += "?" + r.URL.RawQuery
+	}
+	response, ok := current[resourceURL]
 	if !ok {
-		http.NotFound(w, r)
+		response, ok = previous[resourceURL]
+	}
+	if ok {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("Content-Type", response.contentType)
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(response.body)
+		}
 		return
 	}
-	if isMap {
-		bundle += ".map"
-	}
-	if _, err := os.Stat(bundle); err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-cache")
-	if isMap {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	}
-	http.ServeFile(w, r, bundle)
+	// Unknown combinations, stale revisions, and the pre-alpha single-resource
+	// spelling are intentionally rejected. The browser must only execute bytes
+	// that the current (or retained previous) manifest advertised.
+	http.NotFound(w, r)
 }
 func (e *Engine) frontendRoot() string {
 	if e.cfg.FrontendDir != "" {

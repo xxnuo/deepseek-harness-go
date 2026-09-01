@@ -262,6 +262,7 @@ func TestWorkflowStructuredAgentOutput(t *testing.T) {
 func TestWorkflowUsesPinnedToolNameProviderAndLimits(t *testing.T) {
 	e, id := newWorkflowEngine(t)
 	provider := completeRalphFixture("custom-flow")
+	provider.caps.AgentOptions = true
 	provider.result = SubagentResult{StopReason: SubagentCompleted, Output: []ContentBlock{{Type: "text", Text: "custom child"}}}
 	if err := e.RegisterSubagentProvider(provider); err != nil {
 		t.Fatal(err)
@@ -511,7 +512,7 @@ func TestRunCodeExecutesTypeScriptAgainstGoTools(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +554,7 @@ func TestRunCodeExecutesBuiltinBashResultShape(t *testing.T) {
 		t.Skip("bwrap is unavailable")
 	}
 	e, _ := newWorkflowEngine(t)
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +570,7 @@ func TestRunCodeExecutesBuiltinBashResultShape(t *testing.T) {
 
 func TestRunCodeExecutesBuiltinFileToolsWithCanonicalValues(t *testing.T) {
 	e, _ := newWorkflowEngine(t)
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +639,7 @@ func containsPath(values []string, want string) bool {
 
 func TestRunCodeReceivesWorkflowCanonicalValueWithoutNestedPanel(t *testing.T) {
 	e, _ := newWorkflowEngine(t)
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +671,7 @@ func TestRunCodeToolFailureIsCatchable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,7 +687,7 @@ func TestRunCodeToolFailureIsCatchable(t *testing.T) {
 
 func TestRunCodeProgramFailureIsStructured(t *testing.T) {
 	e, _ := newWorkflowEngine(t)
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +739,7 @@ func TestRunCodeCommitsNestedFinalizersAndContextsInSubmissionOrder(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +832,7 @@ func TestRunCodeBoundsNestedParallelBodies(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), cfg.Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), cfg.Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +899,7 @@ func TestRunCodeCancellationDrainsStartedAndAbandonsQueued(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -989,7 +990,7 @@ func TestRunCodeForwardsOnlySuccessfulNestedConclusion(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,7 +1017,7 @@ func TestRunCodeUsesNestedFinalizerFailurePipeline(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,7 +1038,7 @@ func TestRunCodeDefersNestedImageContent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "code")
+	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
 		t.Fatal(err)
 	}

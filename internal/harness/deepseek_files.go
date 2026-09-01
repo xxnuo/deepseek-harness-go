@@ -46,7 +46,9 @@ const (
 
 var deepSeekQuotaPattern = regexp.MustCompile(`(?i)(quota|storage|stored files|file count|too many files)`)
 
-const deepSeekHarnessUserAgent = "deepseek-harness/0.1.1-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)"
+func deepSeekHarnessUserAgent() string {
+	return "deepseek-harness/" + Version() + " (+https://github.com/deepseek-ai/deepseek-harness)"
+}
 
 type DeepSeekFileObject struct {
 	ID           string `json:"id"`
@@ -132,7 +134,7 @@ func (c *DeepSeekFilesClient) request(ctx context.Context, method, path string, 
 	// Match the upstream client: the bearer header is always present, while
 	// managed provider admission rejects missing credentials before transport.
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("User-Agent", deepSeekHarnessUserAgent)
+	req.Header.Set("User-Agent", deepSeekHarnessUserAgent())
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

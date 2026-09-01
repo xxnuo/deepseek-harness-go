@@ -46,6 +46,10 @@ const AuthorizationSettledFailed = core.AuthorizationSettledFailed
 
 const AuthorizationUnknownMethod = core.AuthorizationUnknownMethod
 
+const BootBatchApplication = core.BootBatchApplication
+
+const BootBatchBootstrap = core.BootBatchBootstrap
+
 const ClaudeCodePermissionAcceptEdits = core.ClaudeCodePermissionAcceptEdits
 
 const ClaudeCodePermissionAuto = core.ClaudeCodePermissionAuto
@@ -143,6 +147,8 @@ const IndexInjectionGlobal = core.IndexInjectionGlobal
 const IndexInjectionHTML = core.IndexInjectionHTML
 
 const IndexInjectionHead = core.IndexInjectionHead
+
+const IndexInjectionPreload = core.IndexInjectionPreload
 
 const IndexInjectionScript = core.IndexInjectionScript
 
@@ -308,6 +314,8 @@ type AgentRequestInvariant = core.AgentRequestInvariant
 
 type AgentTeamConfig = core.AgentTeamConfig
 
+type AllowedModelRoute = core.AllowedModelRoute
+
 type AnthropicProvider = core.AnthropicProvider
 
 type AuthorizationDeclinedError = core.AuthorizationDeclinedError
@@ -345,6 +353,10 @@ type AuthorizationSettlementListener = core.AuthorizationSettlementListener
 type AuthorizationStatus = core.AuthorizationStatus
 
 type BackendRegistry = core.BackendRegistry
+
+type BootBatch = core.BootBatch
+
+type BootBatchPhase = core.BootBatchPhase
 
 type BootEntry = core.BootEntry
 
@@ -437,6 +449,18 @@ type DeepSeekFileStore = core.DeepSeekFileStore
 type DeepSeekFilesClient = core.DeepSeekFilesClient
 
 type DeepSeekFilesError = core.DeepSeekFilesError
+
+type DeepSeekLlmAPIExtensionContribution = core.DeepSeekLlmAPIExtensionContribution
+
+type DeepSeekLlmAPIExtensionProvider = core.DeepSeekLlmAPIExtensionProvider
+
+type DeepSeekLlmAPIExtensionRequest = core.DeepSeekLlmAPIExtensionRequest
+
+type DeepSeekPluginPackageIdentity = core.DeepSeekPluginPackageIdentity
+
+type DeepSeekPluginPackageInventoryExtension = core.DeepSeekPluginPackageInventoryExtension
+
+type DeepSeekSessionLogExtension = core.DeepSeekSessionLogExtension
 
 type DeepSeekUploadIndex = core.DeepSeekUploadIndex
 
@@ -676,6 +700,8 @@ type MergedHookOutcome = core.MergedHookOutcome
 
 type ModelInfo = core.ModelInfo
 
+type ModelReasoningInfo = core.ModelReasoningInfo
+
 type ModelSelection = core.ModelSelection
 
 type OpenAIProvider = core.OpenAIProvider
@@ -691,6 +717,8 @@ type PerplexitySearchProvider = core.PerplexitySearchProvider
 type PerplexitySearchProviderOptions = core.PerplexitySearchProviderOptions
 
 type PluginInventoryEntry = core.PluginInventoryEntry
+
+type PreparedDeepSeekLlmAPIExtensions = core.PreparedDeepSeekLlmAPIExtensions
 
 type PreparedSessionReferenceMessage = core.PreparedSessionReferenceMessage
 
@@ -744,6 +772,8 @@ type PythonWireFieldSet = core.PythonWireFieldSet
 
 type RPCError = core.RPCError
 
+type ReasoningEffortInfo = core.ReasoningEffortInfo
+
 type RepeatToolReminderConfig = core.RepeatToolReminderConfig
 
 type RequestImageAttachment = core.RequestImageAttachment
@@ -755,6 +785,8 @@ type RetryPolicy = core.RetryPolicy
 type RetryPolicyProvider = core.RetryPolicyProvider
 
 type RuntimeInvariantConfig = core.RuntimeInvariantConfig
+
+type SDKServerOptions = core.SDKServerOptions
 
 type SQLiteJournalMode = core.SQLiteJournalMode
 
@@ -874,9 +906,13 @@ type StorageRuntimeConfig = core.StorageRuntimeConfig
 
 type SubagentAgentOptions = core.SubagentAgentOptions
 
+type SubagentAgentRouteDefaultsProvider = core.SubagentAgentRouteDefaultsProvider
+
 type SubagentCapabilities = core.SubagentCapabilities
 
 type SubagentDescriptorData = core.SubagentDescriptorData
+
+type SubagentModelSelectionSettings = core.SubagentModelSelectionSettings
 
 type SubagentProvider = core.SubagentProvider
 

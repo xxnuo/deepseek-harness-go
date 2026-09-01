@@ -161,7 +161,7 @@ func safeBundlePath(root, name string) (string, error) {
 
 func assetPaths(root string) AssetPaths {
 	upstream := filepath.Join(root, "deepseek-harness")
-	return AssetPaths{UpstreamDir: upstream, FrontendDir: filepath.Join(upstream, "apps", "web", "dist"), PluginDir: filepath.Join(upstream, "packages"), PresetDir: filepath.Join(upstream, "apps", "cli", "config", "agent-presets")}
+	return AssetPaths{UpstreamDir: upstream, FrontendDir: filepath.Join(upstream, "apps", "web", "dist"), PluginDir: filepath.Join(upstream, "packages"), PresetDir: filepath.Join(upstream, "packages", "preset", "agent-presets", "presets")}
 }
 
 func assetsReady(paths AssetPaths, marker, revision string) bool {
@@ -169,7 +169,7 @@ func assetsReady(paths AssetPaths, marker, revision string) bool {
 	if err != nil || strings.TrimSpace(string(data)) != revision {
 		return false
 	}
-	for _, path := range []string{filepath.Join(paths.FrontendDir, "index.html"), filepath.Join(paths.PluginDir, "client", "runtime", "lib", "client.js"), filepath.Join(paths.PluginDir, "bundle", "base", "cordis.patch.yml"), filepath.Join(paths.PresetDir, "standard", "agent.cordis.yml")} {
+	for _, path := range []string{filepath.Join(paths.FrontendDir, "index.html"), filepath.Join(paths.PluginDir, "client", "connection", "lib", "client.js"), filepath.Join(paths.PluginDir, "bundle", "base", "cordis.patch.yml"), filepath.Join(paths.PresetDir, "standard", "agent.cordis.yml")} {
 		if stat, err := os.Stat(path); err != nil || stat.IsDir() {
 			return false
 		}

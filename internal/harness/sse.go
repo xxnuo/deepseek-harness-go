@@ -191,28 +191,42 @@ func (e *Engine) servePluginEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unavailable", http.StatusNotImplemented)
 		return
 	}
-	graph, paths, err := e.buildBootGraph()
+	snapshot, err := e.buildBootSnapshot()
 	if err != nil {
 		http.Error(w, "failed to build plugin graph", http.StatusInternalServerError)
 		return
 	}
+	graph := snapshot.graph
 	watches := make(map[string]*pluginBundleWatch, len(graph.Entries))
 	for index := range graph.Entries {
 		entry := &graph.Entries[index]
-		watch := &pluginBundleWatch{path: paths[entry.ID], rev: entry.Rev, dirty: true}
-		if stat, statErr := os.Stat(watch.path); statErr == nil {
-			watch.mtimeNS, watch.size = stat.ModTime().UnixNano(), stat.Size()
-			if content, readErr := os.ReadFile(watch.path); readErr == nil {
-				watch.rev = shortRevisionBytes(content)
-				watch.dirty = false
-				entry.Rev = watch.rev
-				entry.URL = "/plugins/" + entry.ID + "/client.js?rev=" + watch.rev
-			}
-		}
+		baseline, exists := snapshot.baselines[entry.ID]
+		watch := &pluginBundleWatch{path: baseline.path, rev: entry.Rev, mtimeNS: baseline.mtimeNS, size: baseline.size, dirty: !exists}
 		watches[entry.ID] = watch
 	}
-	if encoded, encodeErr := json.Marshal(graph.Entries); encodeErr == nil {
-		graph.Rev = shortRevisionBytes(encoded)
+	// Catch up writes that landed after the module host captured its baseline
+	// but before this HMR endpoint installed its watches.
+	for id, watch := range watches {
+		stat, statErr := os.Stat(watch.path)
+		if statErr != nil {
+			watch.dirty = true
+			continue
+		}
+		if watch.mtimeNS == stat.ModTime().UnixNano() && watch.size == stat.Size() {
+			continue
+		}
+		rev, changed, rebuildErr := e.rebuildBootArtifact(id)
+		if rebuildErr != nil {
+			watch.dirty = true
+			continue
+		}
+		watch.mtimeNS, watch.size, watch.dirty, watch.rev = stat.ModTime().UnixNano(), stat.Size(), false, rev
+		if changed {
+			watch.rev = rev
+		}
+	}
+	if refreshed, refreshErr := e.buildBootSnapshot(); refreshErr == nil {
+		graph = refreshed.graph
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -242,17 +256,16 @@ func (e *Engine) servePluginEvents(w http.ResponseWriter, r *http.Request) {
 				if !watch.dirty && watch.mtimeNS == mtimeNS && watch.size == stat.Size() {
 					continue
 				}
-				content, err := os.ReadFile(watch.path)
-				if err != nil {
+				rev, changed, rebuildErr := e.rebuildBootArtifact(id)
+				if rebuildErr != nil {
 					watch.dirty = true
 					continue
 				}
-				rev := shortRevisionBytes(content)
-				watch.mtimeNS, watch.size, watch.dirty = mtimeNS, stat.Size(), false
-				if rev == watch.rev {
+				shouldNotify := changed || watch.rev != rev
+				watch.mtimeNS, watch.size, watch.dirty, watch.rev = mtimeNS, stat.Size(), false, rev
+				if !shouldNotify {
 					continue
 				}
-				watch.rev = rev
 				frame, _ := json.Marshal(map[string]any{"type": "rebuilt", "id": id, "rev": rev})
 				if _, err := fmt.Fprintf(w, "data: %s\n\n", frame); err != nil {
 					return

@@ -110,7 +110,7 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	requestMessages := append(append([]ChatMessage(nil), messages...), ChatMessage{Role: "user", Content: compactionInstruction})
 	completion, completeErr := provider.Complete(ctx, ChatRequest{
 		SessionID: s.Header.ID, Model: summarySelection.Model, System: request.system, Messages: requestMessages, Tools: request.tools,
-		MaxTokens: config.MaxTokens,
+		Purpose: "compaction", MaxTokens: config.MaxTokens,
 	}, func(Delta) error { return nil })
 	if completeErr != nil {
 		return result, completeErr

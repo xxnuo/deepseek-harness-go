@@ -23,7 +23,6 @@ func TestProductSubagentToolProfileConfig(t *testing.T) {
         toolName: subagent_codex
         backgroundMode: one-shot
         maxDepth: provider-managed
-        agentOptions: {provider: child-provider, model: child-model, maxTokens: 321}
     - id: tool-subagent-claude-code
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -42,9 +41,6 @@ func TestProductSubagentToolProfileConfig(t *testing.T) {
 	if cfg.SubagentTools[0].Provider != "codex" || cfg.SubagentTools[0].ToolName != "subagent_codex" || cfg.SubagentTools[0].MaxDepth != nil {
 		t.Fatalf("codex tool = %#v", cfg.SubagentTools[0])
 	}
-	if options := cfg.SubagentTools[0].AgentOptions; options == nil || options.Provider != "child-provider" || options.Model != "child-model" || options.MaxTokens != 321 {
-		t.Fatalf("codex agent options = %#v", options)
-	}
 	if cfg.SubagentTools[1].Provider != "claude-code" || cfg.SubagentTools[1].ToolName != "subagent_claude_code" || cfg.SubagentTools[1].MaxDepth != nil {
 		t.Fatalf("claude tool = %#v", cfg.SubagentTools[1])
 	}
@@ -60,6 +56,28 @@ func TestProductSubagentToolProfileConfig(t *testing.T) {
 	}
 	if !registered["subagent_codex"] || !registered["subagent_claude_code"] {
 		t.Fatalf("registered tools = %#v", registered)
+	}
+}
+
+func TestProductSubagentToolProfileRejectsUnsupportedAgentOptions(t *testing.T) {
+	composed := mcpTestComposition(t, `
+- id: subagent-codex
+  name: '@deepseek-ai/dsh-subagent-codex'
+- id: tool-subagent-codex
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: codex
+    backgroundMode: one-shot
+    maxDepth: provider-managed
+    agentOptions: {provider: child-provider, model: child-model}
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	cfg.Workspace, cfg.Persist = t.TempDir(), false
+	if _, err := harness.New(harness.WithConfig(cfg)); err == nil {
+		t.Fatal("codex tool accepted unsupported child agentOptions")
 	}
 }
 

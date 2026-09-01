@@ -19,7 +19,7 @@ type AssetPaths = core.AssetPaths
 
 func assetPaths(root string) AssetPaths {
 	upstream := filepath.Join(root, "deepseek-harness")
-	return AssetPaths{UpstreamDir: upstream, FrontendDir: filepath.Join(upstream, "apps", "web", "dist"), PluginDir: filepath.Join(upstream, "packages"), PresetDir: filepath.Join(upstream, "apps", "cli", "config", "agent-presets")}
+	return AssetPaths{UpstreamDir: upstream, FrontendDir: filepath.Join(upstream, "apps", "web", "dist"), PluginDir: filepath.Join(upstream, "packages"), PresetDir: filepath.Join(upstream, "packages", "preset", "agent-presets", "presets")}
 }
 
 func MaterializeAssets(dataDir string) (AssetPaths, error) {

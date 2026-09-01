@@ -18,20 +18,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var upstreamRPCPattern = regexp.MustCompile(`(?m)^\s*'([^']+)'\s*:`)
 var upstreamStringItemPattern = regexp.MustCompile(`(?m)^\s*'([^']+)',\s*$`)
 var noHostApplyPattern = regexp.MustCompile(`export function apply\([^)]*\): void \{\}`)
 
-var goOnlyRPCMethods = []string{
-	"dynamicCordisRunner/inventory",
-	"dynamicCordisRunner/resolveInspectQuery",
-	"dynamicCordisRunner/syncInspectManifest",
-}
-
-// Each row is id=package. The base layer is shared by all profiles; web and
-// headless list only their additional bundle rows. The web profile also mounts
-// the shipped standard preset by default.
+// Each row is id=package. Bundle rows are derived from the pinned alpha.1
+// bundle patches; the web profile also mounts the shipped standard preset.
 var backendPluginContract = map[string][]string{
+	"@deepseek-ai/dsh-acp-app": {
+		"acp-app-startup=@deepseek-ai/dsh-acp-app",
+		"acp=@deepseek-ai/dsh-acp",
+	},
 	"@deepseek-ai/dsh-base": {
 		"agent-default-model=@deepseek-ai/dsh-agent-default-model",
 		"agent-instructions=@deepseek-ai/dsh-agent-instructions",
@@ -46,11 +42,11 @@ var backendPluginContract = map[string][]string{
 		"commands=@deepseek-ai/dsh-commands",
 		"compaction-basic=@deepseek-ai/dsh-compaction-basic",
 		"credentials=@deepseek-ai/dsh-credentials-local",
+		"deepseek-llm-api-extensions=@deepseek-ai/dsh-deepseek-llm-api-extensions",
 		"fs-observation-policy=@deepseek-ai/dsh-fs-observation-policy",
 		"fs-sandbox=@deepseek-ai/dsh-fs-sandbox",
 		"goal-round-driver=@deepseek-ai/dsh-goal-round-driver",
 		"goal=@deepseek-ai/dsh-goal",
-		"hmr=@deepseek-ai/cordis-plugin-hmr",
 		"jobs=@deepseek-ai/dsh-jobs-local",
 		"llm-deepseek=@deepseek-ai/dsh-llm-deepseek",
 		"llm-pi-ai=@deepseek-ai/dsh-llm-pi-ai",
@@ -58,12 +54,15 @@ var backendPluginContract = map[string][]string{
 		"llm=@deepseek-ai/dsh-llm",
 		"permission=@deepseek-ai/dsh-permission-presets",
 		"plan-mode=@deepseek-ai/dsh-plan-mode",
+		"plugin-package-inventory-deepseek=@deepseek-ai/dsh-plugin-package-inventory-deepseek",
 		"pwsh-sandbox=@deepseek-ai/dsh-pwsh-sandbox",
 		"repeat-tool-reminder=@deepseek-ai/dsh-repeat-tool-reminder",
 		"sandbox-policy=@deepseek-ai/dsh-sandbox-policy",
 		"sandbox=@deepseek-ai/dsh-sandbox-local",
 		"session-checkpoint-policy=@deepseek-ai/dsh-session-checkpoint-policy",
+		"session-log-deepseek=@deepseek-ai/dsh-session-log-deepseek",
 		"session-persistence-jsonl=@deepseek-ai/dsh-session-persistence-jsonl",
+		"session-projection-cache=@deepseek-ai/dsh-session-projection-cache",
 		"session-projection=@deepseek-ai/dsh-session-projection",
 		"session-query-sqlite=@deepseek-ai/dsh-session-query-sqlite",
 		"session-telemetry-otel=@deepseek-ai/dsh-session-telemetry-otel",
@@ -76,6 +75,9 @@ var backendPluginContract = map[string][]string{
 		"skill=@deepseek-ai/dsh-skill",
 		"spill-local=@deepseek-ai/dsh-spill-local",
 		"spill-policy=@deepseek-ai/dsh-spill-policy",
+		"storage-domain=@deepseek-ai/dsh-storage-domain",
+		"storage-json=@deepseek-ai/dsh-storage-json",
+		"storage=@deepseek-ai/dsh-storage",
 		"subagent-fork-in-process=@deepseek-ai/dsh-subagent-fork-in-process",
 		"subagent-spawn-in-process=@deepseek-ai/dsh-subagent-spawn-in-process",
 		"subagent=@deepseek-ai/dsh-subagent",
@@ -107,6 +109,7 @@ var backendPluginContract = map[string][]string{
 		"typert-loader=@deepseek-ai/dsh-typert-loader",
 		"typert=@deepseek-ai/dsh-typert-registry",
 		"user-questions=@deepseek-ai/dsh-user-questions",
+		"web-fetch-http=@deepseek-ai/dsh-web-fetch-http",
 		"web-search-deepseek=@deepseek-ai/dsh-web-search-deepseek",
 		"web=@deepseek-ai/dsh-web",
 		"workflow-worker-thread=@deepseek-ai/dsh-workflow-worker-thread",
@@ -116,9 +119,33 @@ var backendPluginContract = map[string][]string{
 		"headless-runner=@deepseek-ai/dsh-headless",
 		"headless-startup=@deepseek-ai/dsh-headless/startup",
 	},
+	"@deepseek-ai/dsh-sdk-app": {
+		"sdk-app-startup=@deepseek-ai/dsh-sdk-app",
+		"sdk-jsonrpc-server=@deepseek-ai/dsh-sdk-jsonrpc-server",
+	},
+	"@deepseek-ai/dsh-sdk-minimal": {
+		"agent-spine=@deepseek-ai/dsh-agent-spine-demo",
+		"deepseek-llm-api-extensions=@deepseek-ai/dsh-deepseek-llm-api-extensions",
+		"fs-local=@deepseek-ai/dsh-fs-local",
+		"llm-deepseek=@deepseek-ai/dsh-llm-deepseek",
+		"persistent-bash=@deepseek-ai/dsh-tool-bash-persistent",
+		"persistent-pwsh=@deepseek-ai/dsh-tool-pwsh-persistent",
+		"plugin-package-inventory-deepseek=@deepseek-ai/dsh-plugin-package-inventory-deepseek",
+		"pty=@deepseek-ai/dsh-terminal",
+		"sandbox-policy=@deepseek-ai/dsh-sandbox-policy",
+		"sandbox=@deepseek-ai/dsh-sandbox-local",
+		"sdk-app-startup=@deepseek-ai/dsh-sdk-app",
+		"sdk-jsonrpc-server=@deepseek-ai/dsh-sdk-jsonrpc-server",
+		"session-log-deepseek=@deepseek-ai/dsh-session-log-deepseek",
+		"sessions=@deepseek-ai/dsh-session-persistence-jsonl",
+		"str-replace-editor=@deepseek-ai/dsh-tool-str-replace-editor",
+		"subprocess=@deepseek-ai/dsh-subprocess-local",
+		"terminal-bash=@deepseek-ai/dsh-terminal-bash",
+		"terminal-pwsh=@deepseek-ai/dsh-terminal-bash",
+	},
 	"@deepseek-ai/dsh-web-app": {
 		"agent-presets=@deepseek-ai/dsh-agent-presets",
-		"api-gateway=@deepseek-ai/dsh-host-apiproxy",
+		"api-remotes=@deepseek-ai/dsh-api-remotes",
 		"client-hmr=@deepseek-ai/dsh-client-hmr",
 		"code-runtime=@deepseek-ai/dsh-code-runtime-worker-thread",
 		"connection=@deepseek-ai/dsh-client-connection",
@@ -129,13 +156,13 @@ var backendPluginContract = map[string][]string{
 		"message-feedback=@deepseek-ai/dsh-message-feedback",
 		"modules=@deepseek-ai/dsh-client-modules",
 		"plugin-inventory=@deepseek-ai/dsh-host-plugin-inventory",
+		"session-controller=@deepseek-ai/dsh-api-session-controller",
 		"session-log-download=@deepseek-ai/dsh-session-log-export",
-		"session-projection-cache=@deepseek-ai/dsh-session-projection-cache",
 		"session-reference=@deepseek-ai/dsh-session-reference",
 		"session-stats=@deepseek-ai/dsh-session-stats",
-		"storage-domain=@deepseek-ai/dsh-storage-domain",
-		"storage-json=@deepseek-ai/dsh-storage-json",
-		"storage=@deepseek-ai/dsh-storage",
+		"settings-controller=@deepseek-ai/dsh-api-settings-controller",
+		"subagent-model-selection-settings=@deepseek-ai/dsh-tool-subagent/model-selection-settings",
+		"ui-chat=@deepseek-ai/dsh-client-ui-chat",
 		"ui-conversation=@deepseek-ai/dsh-client-ui-conversation",
 		"ui-deliverables=@deepseek-ai/dsh-client-ui-deliverables",
 		"ui-settings-general=@deepseek-ai/dsh-client-ui-settings-general",
@@ -143,11 +170,13 @@ var backendPluginContract = map[string][]string{
 		"web-runtime=@deepseek-ai/dsh-web-app",
 		"web-startup=@deepseek-ai/dsh-web-app/startup",
 		"webserver=@deepseek-ai/dsh-host-webserver",
+		"workspace-controller=@deepseek-ai/dsh-api-workspace-controller",
 		"workspace=@deepseek-ai/dsh-workspace",
 	},
 	"preset:standard": {
 		"agent-instructions=@deepseek-ai/dsh-agent-instructions",
 		"command-compact=@deepseek-ai/dsh-command-compact",
+		"command-goal=@deepseek-ai/dsh-command-goal",
 		"compaction-basic=@deepseek-ai/dsh-compaction-basic",
 		"persona=@deepseek-ai/dsh-persona",
 		"plan-mode=@deepseek-ai/dsh-plan-mode",
@@ -173,30 +202,26 @@ var backendPluginContract = map[string][]string{
 	},
 }
 
-func TestUpstreamContractRPCMethods(t *testing.T) {
+func TestUpstreamContractConnectionTransport(t *testing.T) {
 	root := repositoryRoot(t)
-	data := readTestFile(t, filepath.Join(root, "deepseek-harness/packages/host/apiproxy/src/api/rpc-map.ts"))
-	block := string(data)
-	start := strings.Index(block, "export interface RpcMethodMap {")
-	if start < 0 {
-		t.Fatal("upstream RpcMethodMap not found")
+	connection := string(readTestFile(t, filepath.Join(root, "deepseek-harness/packages/client/connection/src/rpc.ts")))
+	apiPath := string(readTestFile(t, filepath.Join(root, "deepseek-harness/packages/client/connection/src/api-path.ts")))
+	gateway := string(readTestFile(t, filepath.Join(root, "deepseek-harness/packages/api/gateway/src/stream-protocol.ts")))
+	for label, source := range map[string]string{
+		"client request envelope":  "readonly type: 'client-request'",
+		"server response envelope": "readonly type: 'server-response'",
+		"shared API channel":       "channel: '/api'",
+	} {
+		if !strings.Contains(connection, source) {
+			t.Fatalf("upstream Connection %s contract %q not found", label, source)
+		}
 	}
-	block = block[start:]
-	if end := strings.Index(block, "\n}"); end >= 0 {
-		block = block[:end]
-	} else {
-		t.Fatal("upstream RpcMethodMap is not closed")
+	if !strings.Contains(apiPath, "export const API_PATH = '/api'") {
+		t.Fatal("upstream Connection API_PATH contract changed")
 	}
-	matches := upstreamRPCPattern.FindAllStringSubmatch(block, -1)
-	upstream := make([]string, 0, len(matches)+len(goOnlyRPCMethods))
-	for _, match := range matches {
-		upstream = append(upstream, match[1])
+	if !strings.Contains(gateway, "export const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'") {
+		t.Fatal("upstream Gateway Remote stream path contract changed")
 	}
-	upstream = append(upstream, goOnlyRPCMethods...)
-	sort.Strings(upstream)
-
-	got := dispatchMethods(t, filepath.Join(root, "internal", "harness", "rpc.go"))
-	assertStringSet(t, "RPC methods", got, upstream)
 }
 
 func TestUpstreamContractTypertInvocations(t *testing.T) {
@@ -206,7 +231,7 @@ func TestUpstreamContractTypertInvocations(t *testing.T) {
 }
 
 func TestUpstreamContractOptionalProductSubagentTools(t *testing.T) {
-	path := filepath.Join(repositoryRoot(t), "deepseek-harness", "apps", "cli", "config", "agent-presets", "standard", "agent.cordis.yml")
+	path := filepath.Join(repositoryRoot(t), "deepseek-harness", "packages", "preset", "agent-presets", "presets", "standard", "agent.cordis.yml")
 	for _, test := range []struct {
 		id, provider, toolName string
 	}{
@@ -262,10 +287,19 @@ func TestUpstreamContractForwardedRemoteEvents(t *testing.T) {
 	if end < 0 {
 		t.Fatal("upstream forwarded remote event allowlist is not closed")
 	}
+	arrayBlock := block[:end]
 	upstream := make([]string, 0)
-	for _, match := range upstreamStringItemPattern.FindAllStringSubmatch(block[:end], -1) {
+	// alpha.1 stores event names in object entries, with the session-controller
+	// family intentionally expanded from its own declaration array.
+	eventPattern := regexp.MustCompile(`\bevent:\s*'([^']+)'`)
+	for _, match := range eventPattern.FindAllStringSubmatch(arrayBlock, -1) {
 		upstream = append(upstream, match[1])
 	}
+	if !strings.Contains(arrayBlock, "...SESSION_CONTROLLER_REMOTE_EVENTS.map(") {
+		t.Fatal("upstream forwarded remote event allowlist no longer expands SESSION_CONTROLLER_REMOTE_EVENTS")
+	}
+	sessionData := string(readTestFile(t, filepath.Join(root, "deepseek-harness/packages/api/session-controller/src/remote-events.ts")))
+	upstream = append(upstream, quotedArrayItems(t, sessionData, "SESSION_CONTROLLER_REMOTE_EVENTS")...)
 	if len(upstream) == 0 {
 		t.Fatal("upstream forwarded remote event allowlist is empty")
 	}
@@ -278,15 +312,39 @@ func TestUpstreamContractForwardedRemoteEvents(t *testing.T) {
 	assertStringSet(t, "forwarded remote events", got, upstream)
 }
 
+func quotedArrayItems(t *testing.T, source, declaration string) []string {
+	t.Helper()
+	start := strings.Index(source, "const "+declaration+" = [")
+	if start < 0 {
+		t.Fatalf("upstream %s declaration not found", declaration)
+	}
+	block := source[start:]
+	end := strings.Index(block, "] as const")
+	if end < 0 {
+		t.Fatalf("upstream %s declaration is not closed", declaration)
+	}
+	items := make([]string, 0)
+	for _, match := range upstreamStringItemPattern.FindAllStringSubmatch(block[:end], -1) {
+		items = append(items, match[1])
+	}
+	if len(items) == 0 {
+		t.Fatalf("upstream %s declaration is empty", declaration)
+	}
+	return items
+}
+
 func TestUpstreamContractDefaultProfiles(t *testing.T) {
 	root := repositoryRoot(t)
-	upstream := upstreamProfileTemplates(t, filepath.Join(root, "deepseek-harness/packages/boot/app-boot/src/profile.ts"))
-	got := goProfileTemplates(t, filepath.Join(root, "cmd/dsh/profile.go"))
-	if !reflect.DeepEqual(got, upstream) {
-		t.Fatalf("default profile bundles differ\nGo:       %#v\nupstream: %#v", got, upstream)
+	upstreamBundles, upstreamReload := upstreamProfileTemplates(t, filepath.Join(root, "deepseek-harness/packages/boot/app-boot/src/profile.ts"))
+	gotBundles, gotReload := goProfileTemplates(t, filepath.Join(root, "cmd/dsh/profile.go"))
+	if !reflect.DeepEqual(gotBundles, upstreamBundles) {
+		t.Fatalf("default profile bundles differ\nGo:       %#v\nupstream: %#v", gotBundles, upstreamBundles)
+	}
+	if !reflect.DeepEqual(gotReload, upstreamReload) {
+		t.Fatalf("default profile patch reload policies differ\nGo:       %#v\nupstream: %#v", gotReload, upstreamReload)
 	}
 
-	sources := backendPluginSources(t, root, upstream)
+	sources := backendPluginSources(t, root, upstreamBundles)
 	if !reflect.DeepEqual(sources, backendPluginContract) {
 		t.Fatalf("default profile backend plugin contract differs\nGo contract:\n%s\nupstream:\n%s", formatContract(backendPluginContract), formatContract(sources))
 	}
@@ -323,12 +381,16 @@ func TestUpstreamContractSessionTelemetryConfig(t *testing.T) {
 			t.Fatalf("telemetry %s = %#v, want %q", dotted, current, expected)
 		}
 	}
-	if mode := yamlMapValueNode(config, "mode"); mode == nil || !strings.Contains(mode.Value, "DSH_TELEMETRY_MODE") || !strings.Contains(mode.Value, "DISABLED") {
+	if mode := yamlMapValueNode(config, "mode"); mode == nil || !isJSTag(mode) || mode.Value != "process.env.DSH_TELEMETRY_MODE || 'FEEDBACK_ONLY'" {
 		t.Fatalf("telemetry mode expression = %#v", mode)
 	}
-	if endpoint := yamlMapValueNode(yamlMapValueNode(config, "exporter"), "url"); endpoint == nil || !strings.Contains(endpoint.Value, "DSH_TELEMETRY_OTLP_URL") || !strings.Contains(endpoint.Value, "/v1/logs") {
+	if endpoint := yamlMapValueNode(yamlMapValueNode(config, "exporter"), "url"); endpoint == nil || !isJSTag(endpoint) || endpoint.Value != "process.env.DSH_TELEMETRY_OTLP_URL ?? 'https://harness-telemetry.deepseeksvc.com/v1/logs'" {
 		t.Fatalf("telemetry endpoint expression = %#v", endpoint)
 	}
+}
+
+func isJSTag(node *yaml.Node) bool {
+	return node != nil && node.Kind == yaml.ScalarNode && (node.Tag == "!!js" || node.Tag == "tag:yaml.org,2002:js")
 }
 
 func repositoryRoot(t *testing.T) string {
@@ -367,50 +429,6 @@ func readTestFile(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
-}
-
-func dispatchMethods(t *testing.T, path string) []string {
-	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var methods []string
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "dispatch" || fn.Body == nil {
-			continue
-		}
-		for _, statement := range fn.Body.List {
-			switchStatement, ok := statement.(*ast.SwitchStmt)
-			if !ok {
-				continue
-			}
-			identifier, ok := switchStatement.Tag.(*ast.Ident)
-			if !ok || identifier.Name != "method" {
-				continue
-			}
-			for _, statement := range switchStatement.Body.List {
-				clause := statement.(*ast.CaseClause)
-				for _, expression := range clause.List {
-					literal, ok := expression.(*ast.BasicLit)
-					if !ok || literal.Kind != token.STRING {
-						t.Fatalf("dispatch method case is not a string literal: %T", expression)
-					}
-					method, err := strconv.Unquote(literal.Value)
-					if err != nil {
-						t.Fatal(err)
-					}
-					methods = append(methods, method)
-				}
-			}
-		}
-	}
-	if len(methods) == 0 {
-		t.Fatal("dispatch method switch not found")
-	}
-	sort.Strings(methods)
-	return methods
 }
 
 func assertStringSet(t *testing.T, label string, got, want []string) {
@@ -622,35 +640,34 @@ func formatRemoteContract(endpoint string, fields []typertWireField) string {
 	return endpoint + "(" + strings.Join(values, ",") + ")"
 }
 
-func upstreamProfileTemplates(t *testing.T, path string) map[string][]string {
+func upstreamProfileTemplates(t *testing.T, path string) (map[string][]string, map[string]string) {
 	t.Helper()
 	data := string(readTestFile(t, path))
 	profiles := map[string][]string{}
-	block := regexp.MustCompile(`(?s)export const PROFILE_TEMPLATES[^=]*=\s*\{(.*?)\n\}`).FindStringSubmatch(data)
-	if len(block) != 2 {
+	reload := map[string]string{}
+	start := strings.Index(data, "export const PROFILE_TEMPLATES")
+	if start < 0 {
 		t.Fatal("upstream PROFILE_TEMPLATES not found")
 	}
-	rowPattern := regexp.MustCompile(`(?m)^\s*([A-Za-z0-9_-]+):\s*\[([^\]]*)\]`)
+	block, ok := balancedTSObject(data[start:])
+	if !ok {
+		t.Fatal("upstream PROFILE_TEMPLATES object is not closed")
+	}
+	rowPattern := regexp.MustCompile(`(?ms)^\s*['\"]?([A-Za-z0-9_-]+)['\"]?\s*:\s*\{\s*bundles\s*:\s*\[([^\]]*)\]\s*,\s*patchReload\s*:\s*'([^']+)'\s*,?\s*\}`)
 	stringPattern := regexp.MustCompile(`'([^']+)'`)
-	for _, row := range rowPattern.FindAllStringSubmatch(block[1], -1) {
-		if row[1] != "web" && row[1] != "headless" {
-			continue
-		}
+	for _, row := range rowPattern.FindAllStringSubmatch(block, -1) {
 		for _, value := range stringPattern.FindAllStringSubmatch(row[2], -1) {
 			profiles[row[1]] = append(profiles[row[1]], value[1])
 		}
+		reload[row[1]] = row[3]
 	}
-	defaultRow := regexp.MustCompile(`export const DEFAULT_PROFILE_BUNDLES[^=]*=\s*\[([^\]]*)\]`).FindStringSubmatch(data)
-	if len(defaultRow) != 2 {
-		t.Fatal("upstream DEFAULT_PROFILE_BUNDLES not found")
+	if len(profiles) == 0 || len(profiles) != len(reload) {
+		t.Fatal("upstream PROFILE_TEMPLATES rows were not parsed")
 	}
-	for _, value := range stringPattern.FindAllStringSubmatch(defaultRow[1], -1) {
-		profiles["base"] = append(profiles["base"], value[1])
-	}
-	return profiles
+	return profiles, reload
 }
 
-func goProfileTemplates(t *testing.T, path string) map[string][]string {
+func goProfileTemplates(t *testing.T, path string) (map[string][]string, map[string]string) {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
@@ -658,6 +675,7 @@ func goProfileTemplates(t *testing.T, path string) map[string][]string {
 	}
 	constants := map[string]string{}
 	profiles := map[string][]string{}
+	reload := map[string]string{}
 	for _, decl := range file.Decls {
 		general, ok := decl.(*ast.GenDecl)
 		if !ok {
@@ -679,29 +697,132 @@ func goProfileTemplates(t *testing.T, path string) map[string][]string {
 				}
 				continue
 			}
-			if len(value.Names) != 1 || value.Names[0].Name != "profileTemplates" || len(value.Values) != 1 {
+			if len(value.Names) != 1 || len(value.Values) != 1 {
 				continue
 			}
-			outer := value.Values[0].(*ast.CompositeLit)
-			for _, element := range outer.Elts {
-				pair := element.(*ast.KeyValueExpr)
-				key, _ := strconv.Unquote(pair.Key.(*ast.BasicLit).Value)
-				if key != "web" && key != "headless" {
-					continue
+			name := value.Names[0].Name
+			outer, ok := value.Values[0].(*ast.CompositeLit)
+			if !ok {
+				continue
+			}
+			switch name {
+			case "profileTemplates":
+				for _, element := range outer.Elts {
+					pair, ok := element.(*ast.KeyValueExpr)
+					if !ok {
+						t.Fatalf("profileTemplates entry is %T, want key-value", element)
+					}
+					key := goStringExpr(t, path, pair.Key)
+					inner, ok := pair.Value.(*ast.CompositeLit)
+					if !ok {
+						t.Fatalf("profileTemplates[%q] is %T, want string slice", key, pair.Value)
+					}
+					for _, item := range inner.Elts {
+						identifier, ok := item.(*ast.Ident)
+						if !ok || constants[identifier.Name] == "" {
+							t.Fatalf("profileTemplates[%q] has unresolved bundle %T", key, item)
+						}
+						profiles[key] = append(profiles[key], constants[identifier.Name])
+					}
 				}
-				inner := pair.Value.(*ast.CompositeLit)
-				for _, item := range inner.Elts {
-					name := item.(*ast.Ident).Name
-					profiles[key] = append(profiles[key], constants[name])
+			case "profilePatchReload":
+				for _, element := range outer.Elts {
+					pair, ok := element.(*ast.KeyValueExpr)
+					if !ok {
+						t.Fatalf("profilePatchReload entry is %T, want key-value", element)
+					}
+					reload[goStringExpr(t, path, pair.Key)] = goStringExpr(t, path, pair.Value)
 				}
 			}
 		}
 	}
-	if constants["baseBundle"] == "" || len(profiles) == 0 {
+	if len(profiles) == 0 || len(profiles) != len(reload) {
 		t.Fatal("Go profile templates not found")
 	}
-	profiles["base"] = []string{constants["baseBundle"]}
-	return profiles
+	return profiles, reload
+}
+
+func goStringExpr(t *testing.T, path string, expression ast.Expr) string {
+	t.Helper()
+	literal, ok := expression.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		t.Fatalf("%s: expected string literal, got %T", path, expression)
+	}
+	value, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		t.Fatalf("%s: invalid string literal: %v", path, err)
+	}
+	return value
+}
+
+// balancedTSObject returns the contents between the first top-level braces of
+// a TypeScript object declaration. It handles quoted strings and comments so
+// nested profile objects do not terminate the scan early.
+func balancedTSObject(source string) (string, bool) {
+	open := strings.IndexByte(source, '{')
+	if open < 0 {
+		return "", false
+	}
+	depth := 0
+	inSingle, inDouble, inTemplate, lineComment, blockComment, escaped := false, false, false, false, false, false
+	for index := open; index < len(source); index++ {
+		current := source[index]
+		if lineComment {
+			if current == '\n' {
+				lineComment = false
+			}
+			continue
+		}
+		if blockComment {
+			if current == '*' && index+1 < len(source) && source[index+1] == '/' {
+				blockComment = false
+				index++
+			}
+			continue
+		}
+		if inSingle || inDouble || inTemplate {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if current == '\\' {
+				escaped = true
+				continue
+			}
+			if (inSingle && current == '\'') || (inDouble && current == '"') || (inTemplate && current == '`') {
+				inSingle, inDouble, inTemplate = false, false, false
+			}
+			continue
+		}
+		if current == '/' && index+1 < len(source) {
+			switch source[index+1] {
+			case '/':
+				lineComment = true
+				index++
+				continue
+			case '*':
+				blockComment = true
+				index++
+				continue
+			}
+		}
+		switch current {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inTemplate = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return source[open+1 : index], true
+			}
+		}
+	}
+	return "", false
 }
 
 type bundleManifest struct {
@@ -744,7 +865,7 @@ func backendPluginSources(t *testing.T, root string, profiles map[string][]strin
 	if defaultPreset == "" {
 		t.Fatal("web default agent preset not found")
 	}
-	presetPath := filepath.Join(upstream, "apps", "cli", "config", "agent-presets", defaultPreset, "agent.cordis.yml")
+	presetPath := filepath.Join(upstream, "packages", "preset", "agent-presets", "presets", defaultPreset, "agent.cordis.yml")
 	sources["preset:"+defaultPreset] = backendRows(t, presetPath, packageDirs)
 	return sources
 }

@@ -494,12 +494,27 @@ func deepSeekCatalog(value any) []ModelInfo {
 			ID: id, Name: name, Description: stringSetting(row["description"]), InputModalities: deepSeekModalities(row["inputModalities"]),
 			ContextWindow: positiveIntSetting(row["contextWindow"], defaultContext),
 			MaxTokens:     positiveIntSetting(row["maxTokens"], defaultMaxTokens),
+			Reasoning:     deepSeekReasoningInfo(settings),
 		})
 	}
 	if len(out) == 0 && !exists {
-		return []ModelInfo{{ID: "deepseek-v4-flash", Name: "DeepSeek-V4-Flash", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens}, {ID: "deepseek-v4-pro", Name: "DeepSeek-V4-Pro", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens}, {ID: "deepseek-v4-flash-vision-exp", Name: "DeepSeek-V4-Flash-Vision-Exp", InputModalities: []string{"text", "image"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens}}
+		return []ModelInfo{{ID: "deepseek-v4-flash", Name: "DeepSeek-V4-Flash", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens, Reasoning: deepSeekReasoningInfo(settings)}, {ID: "deepseek-v4-pro", Name: "DeepSeek-V4-Pro", InputModalities: []string{"text"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens, Reasoning: deepSeekReasoningInfo(settings)}, {ID: "deepseek-v4-flash-vision-exp", Name: "DeepSeek-V4-Flash-Vision-Exp", InputModalities: []string{"text", "image"}, ContextWindow: deepSeekDefaultContext, MaxTokens: deepSeekDefaultMaxTokens, Reasoning: deepSeekReasoningInfo(settings)}}
 	}
 	return out
+}
+
+func deepSeekReasoningInfo(settings map[string]any) *ModelReasoningInfo {
+	if stringSetting(settings["thinking"]) == "disabled" {
+		return &ModelReasoningInfo{Efforts: []ReasoningEffortInfo{{ID: "off", Name: "Off"}}, DefaultEffort: "off"}
+	}
+	defaultEffort := stringSetting(settings["reasoningEffort"])
+	if defaultEffort == "" {
+		defaultEffort = "high"
+	}
+	return &ModelReasoningInfo{
+		Efforts:       []ReasoningEffortInfo{{ID: "off", Name: "Off"}, {ID: "low", Name: "Low"}, {ID: "high", Name: "High"}, {ID: "max", Name: "Max"}},
+		DefaultEffort: defaultEffort,
+	}
 }
 
 func deepSeekImagePolicies(value map[string]any) map[string]ImageRequestPolicy {
@@ -732,6 +747,7 @@ func (p *managedDeepSeekProvider) snapshot(settings map[string]any) (*OpenAIProv
 		model = "deepseek-chat"
 	}
 	provider := NewOpenAIProvider("deepseek-official", baseURL, apiKey, model)
+	provider.deepSeekExtensions = p.engine
 	provider.deepSeekFiles = p.engine.deepSeekFileStoreFor(cfg)
 	provider.deepSeekFileConnection = DeepSeekFileConnection{BaseURL: baseURL, APIKey: apiKey}
 	provider.deepSeekFilePolicy = DeepSeekFilePolicy{ExpiresAfterSeconds: DeepSeekFileExpirySeconds, RefreshMargin: DeepSeekFileRefreshSeconds * time.Second, QuotaCleanupBatch: DeepSeekQuotaCleanupBatch, APITimeout: time.Minute}

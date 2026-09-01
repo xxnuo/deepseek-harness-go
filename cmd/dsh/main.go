@@ -166,49 +166,101 @@ func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 		switch composed.surface() {
 		case "web":
-			watch := &webProfileWatch{
-				paths: newProfileWatchPaths(
-					filepath.Join(composed.profileDir, profilePatchFile),
-					filepath.Join(loader.home, profilePatchFile),
-				),
-				load: func() (*composition, harness.Config, error) {
-					next, cfg, err := loadConfig()
-					if err != nil {
-						return nil, harness.Config{}, err
-					}
-					if next.surface() != "web" {
-						return nil, harness.Config{}, fmt.Errorf("dsh: profile %q no longer composes a Go web surface", inv.profile)
-					}
-					return next, cfg, nil
-				},
+			var watch *webProfileWatch
+			if composed.patchReload == "live" {
+				watch = &webProfileWatch{
+					paths: newProfileWatchPaths(
+						filepath.Join(composed.profileDir, profilePatchFile),
+						filepath.Join(loader.home, profilePatchFile),
+					),
+					load: func() (*composition, harness.Config, error) {
+						next, cfg, err := loadConfig()
+						if err != nil {
+							return nil, harness.Config{}, err
+						}
+						if next.surface() != "web" {
+							return nil, harness.Config{}, fmt.Errorf("dsh: profile %q no longer composes a Go web surface", inv.profile)
+						}
+						return next, cfg, nil
+					},
+				}
 			}
 			return runWeb(inv.args, composed, cfg, stdout, stderr, watch)
 		case "headless":
 			return runHeadless(inv.args, composed, cfg, stdout, stderr)
+		case "acp":
+			return runACP(inv.args, composed, cfg, stdin, stdout, stderr)
+		case "sdk":
+			return runSDK(inv.args, composed, cfg, stdin, stdout, stderr)
 		case "custom":
-			watch := &customProfileWatch{
-				paths: newProfileWatchPaths(
-					filepath.Join(composed.profileDir, profilePatchFile),
-					filepath.Join(loader.home, profilePatchFile),
-				),
-				load: func() (*composition, harness.Config, error) {
-					next, cfg, err := loadConfig()
-					if err != nil {
-						return nil, harness.Config{}, err
-					}
-					if next.surface() != "custom" {
-						return nil, harness.Config{}, fmt.Errorf("dsh: profile %q no longer composes a custom app surface", inv.profile)
-					}
-					return next, cfg, nil
-				},
+			var watch *customProfileWatch
+			if composed.patchReload == "live" {
+				watch = &customProfileWatch{
+					paths: newProfileWatchPaths(
+						filepath.Join(composed.profileDir, profilePatchFile),
+						filepath.Join(loader.home, profilePatchFile),
+					),
+					load: func() (*composition, harness.Config, error) {
+						next, cfg, err := loadConfig()
+						if err != nil {
+							return nil, harness.Config{}, err
+						}
+						if next.surface() != "custom" {
+							return nil, harness.Config{}, fmt.Errorf("dsh: profile %q no longer composes a custom app surface", inv.profile)
+						}
+						return next, cfg, nil
+					},
+				}
 			}
 			return runCustomProfile(inv.args, composed, cfg, stdout, stderr, watch)
 		default:
-			return fmt.Errorf("dsh: profile %q does not compose a Go web, headless, or custom app surface", inv.profile)
+			return fmt.Errorf("dsh: profile %q does not compose a Go web, headless, ACP, SDK, or custom app surface", inv.profile)
 		}
 	default:
 		return fmt.Errorf("dsh: unsupported invocation mode %q", inv.mode)
 	}
+}
+
+func runACP(args []string, composed *composition, cfg harness.Config, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) != 0 {
+		return fmt.Errorf("error: ACP profile takes no app arguments, got %s", quoteArgs(args))
+	}
+	e, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	if _, err := mountProfileRuntimePlugins(e, composed, args); err != nil {
+		return err
+	}
+	return e.ServeACP(context.Background(), stdin, stdout)
+}
+
+func runSDK(args []string, composed *composition, cfg harness.Config, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		profile := "sdk"
+		if composed != nil {
+			if configured, ok := composed.configString("sdk-app-startup", "profile"); ok {
+				profile = configured
+			}
+		}
+		printSDKHelp(stdout, profile)
+		return nil
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("error: SDK profile takes no app arguments, got %s", quoteArgs(args))
+	}
+	signals := newProcessSignals()
+	defer signals.stop()
+	e, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	if _, err := mountProfileRuntimePlugins(e, composed, args); err != nil {
+		return err
+	}
+	return signals.translate(e.ServeJSONRPCWithOptions(signals, stdin, stdout, composed.sdkServer))
 }
 
 func attachSessionTelemetryWarnings(cfg *harness.Config, stderr io.Writer) {
@@ -820,4 +872,17 @@ Arguments:
 Options:
   -h, --help                        show this help
 `)
+}
+
+func printSDKHelp(w io.Writer, profile string) {
+	fmt.Fprintf(w, `Usage: dsh --profile %s [options]
+
+Serve DeepSeek Harness SDK clients over stdio JSON-RPC.
+
+Options:
+  -h, --help                        show this help
+
+Example:
+  dsh --profile %s                 serve one SDK runtime until its client disconnects
+`, profile, profile)
 }

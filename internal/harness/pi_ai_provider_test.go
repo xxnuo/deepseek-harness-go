@@ -98,6 +98,42 @@ func TestPiAIProviderAppliesConfiguredImageBudget(t *testing.T) {
 	}
 }
 
+func TestPiAIProviderForwardsThinkingBudgetToCompletions(t *testing.T) {
+	t.Setenv("LOCAL_GATEWAY_KEY", "budget-key")
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	profile := piAITestProfile(server.URL)
+	profile["reasoning"] = "high"
+	profile["thinkingBudgets"] = map[string]any{"high": 777}
+	model := profile["models"].([]any)[0].(map[string]any)
+	model["reasoningEfforts"] = map[string]any{"off": "off", "high": "high"}
+	model["compat"] = map[string]any{
+		"supportsReasoningEffort": true, "supportsThinkingTokenBudget": true,
+	}
+	resolved, err := resolvePiAIProfile("local-gateway", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &managedPiAIProvider{engine: newIntegrationEngine(t), profile: resolved, websockets: newOpenAIResponsesWebSocketPool()}
+	completion, err := provider.Complete(t.Context(), ChatRequest{
+		Model: "local-model", Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+	}, func(Delta) error { return nil })
+	if err != nil || completion.Text != "ok" {
+		t.Fatalf("Complete = %#v, %v", completion, err)
+	}
+	if request["reasoning_effort"] != "high" || request["thinking_token_budget"] != float64(777) {
+		t.Fatalf("reasoning request = %#v", request)
+	}
+}
+
 func TestPiAIProfileUsesRC8CatalogFallbacksAndConfiguredRequestCap(t *testing.T) {
 	profile, err := resolvePiAIProfile("openai", map[string]any{
 		"models":         []any{},
@@ -177,7 +213,8 @@ func TestPiAISettingsSchemaExposesRC8CompatAndImageLimit(t *testing.T) {
 	}
 	for _, field := range []string{
 		"supportsDeveloperRole", "requiresToolResultName", "requiresAssistantAfterToolResult",
-		"requiresThinkingAsText", "chatTemplateKwargs", "supportsStrictMode",
+		"requiresThinkingAsText", "chatTemplateKwargs", "chatTemplateArgs", "supportsFinishReason",
+		"supportsThinkingTokenBudget", "supportsStrictMode",
 		"supportsEagerToolInputStreaming", "supportsStrictTools",
 	} {
 		if compat[field] == nil {

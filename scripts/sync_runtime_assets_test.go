@@ -77,10 +77,13 @@ func TestCollectRuntimeAssetsIncludesPythonProtocolMirror(t *testing.T) {
 	root := t.TempDir()
 	for _, path := range []string{
 		"apps/web/dist/index.html",
-		"apps/cli/config/agent-presets/standard/agent.cordis.yml",
+		"packages/preset/agent-presets/presets/standard/agent.cordis.yml",
+		"packages/preset/agent-presets/presets/standard/preset.yml",
+		"packages/bundle/sdk-minimal/cordis.patch.yml",
 		"packages/code-runtime/code-runtime-python/py/protocol.py",
 		"packages/skill/skill-badge/assets/badge.txt",
 		"packages/subagent/subagent-codex/cordis.patch.yml",
+		"vendor/timer/package.json",
 	} {
 		absolute := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
@@ -95,8 +98,13 @@ func TestCollectRuntimeAssetsIncludesPythonProtocolMirror(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		filepath.FromSlash("packages/code-runtime/code-runtime-python/py/protocol.py"): true,
-		filepath.FromSlash("packages/subagent/subagent-codex/cordis.patch.yml"):        true,
+		filepath.FromSlash("apps/web/dist/index.html"):                                        true,
+		filepath.FromSlash("packages/preset/agent-presets/presets/standard/agent.cordis.yml"): true,
+		filepath.FromSlash("packages/preset/agent-presets/presets/standard/preset.yml"):       true,
+		filepath.FromSlash("packages/code-runtime/code-runtime-python/py/protocol.py"):        true,
+		filepath.FromSlash("packages/bundle/sdk-minimal/cordis.patch.yml"):                    true,
+		filepath.FromSlash("packages/subagent/subagent-codex/cordis.patch.yml"):               true,
+		filepath.FromSlash("vendor/timer/package.json"):                                       true,
 	}
 	for _, asset := range assets {
 		delete(want, asset.relative)

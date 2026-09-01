@@ -247,7 +247,7 @@ func TestCodexSubagentProviderReturnsSafeFailureDiagnostic(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Product subagent failure (product: Codex; stage: turn; category: unauthorized)",
-		"Codex unattended decision (mode: never; request: command execution; decision: denied): Codex rejected an escalation because the selected policy never asks for approval",
+		"Codex unattended decision (mode: never; request: command approval; decision: cancelled): the provider does not grant interactive approval",
 	} {
 		if !strings.Contains(result.Diagnostic, want) {
 			t.Fatalf("Codex diagnostic %q missing %q", result.Diagnostic, want)
@@ -582,12 +582,57 @@ func TestDSHSDKSubagentProviderRealProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("sdk|%s|fixture-provider|fixture-model|123|sdk prompt", cwd)
+	want := fmt.Sprintf("sdk|%s|fixture-provider|fixture-model|<nil>|123|sdk prompt", cwd)
 	if result.StopReason != SubagentCompleted || contentValueText(result.Output) != want {
 		t.Fatalf("result = %#v, want text %q", result, want)
 	}
 	if err := run.Dispose(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDSHSDKSubagentProviderMergesPerRunAgentOptionsIndependently(t *testing.T) {
+	cwd := t.TempDir()
+	provider, err := NewDSHSDKSubagentProvider(DSHSDKSubagentConfig{
+		Command: helperExecutable(t), Args: helperArgs("sdk"), Provider: "fixture-provider", Model: "fixture-model", MaxTokens: 123,
+		Env:             map[string]string{subagentHelperEnv: "1"},
+		ShutdownTimeout: time.Second, DisposeEOFGrace: time.Second, DisposeGrace: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(request SubagentStartRequest) string {
+		t.Helper()
+		request.CWD = cwd
+		request.Prompt = []ContentBlock{{Type: "text", Text: "sdk prompt"}}
+		handle, startErr := provider.Start(context.Background(), request)
+		if startErr != nil {
+			t.Fatal(startErr)
+		}
+		result, waitErr := handle.Wait(testContext(t))
+		if waitErr != nil {
+			t.Fatal(waitErr)
+		}
+		if disposeErr := handle.Dispose(); disposeErr != nil {
+			t.Fatal(disposeErr)
+		}
+		if result.StopReason != SubagentCompleted {
+			t.Fatalf("result = %#v", result)
+		}
+		return contentValueText(result.Output)
+	}
+
+	overridden := run(SubagentStartRequest{AgentOptions: &SubagentAgentOptions{
+		Provider: "override-provider", Model: "override-model", ReasoningEffort: "high", MaxTokens: 456,
+	}})
+	wantOverride := fmt.Sprintf("sdk|%s|override-provider|override-model|high|456|sdk prompt", cwd)
+	if overridden != wantOverride {
+		t.Fatalf("overridden run = %q, want %q", overridden, wantOverride)
+	}
+	defaults := run(SubagentStartRequest{})
+	wantDefaults := fmt.Sprintf("sdk|%s|fixture-provider|fixture-model|<nil>|123|sdk prompt", cwd)
+	if defaults != wantDefaults {
+		t.Fatalf("default run = %q, want %q", defaults, wantDefaults)
 	}
 }
 
@@ -1191,7 +1236,7 @@ func runSDKHelper() {
 				helperReply(frame, map[string]any{"messageId": "message-1"})
 				continue
 			}
-			text := fmt.Sprintf("sdk|%s|%s|%s|%v|%s", initialize["cwd"], initialize["provider"], initialize["model"], initialize["maxTokens"], block["text"])
+			text := fmt.Sprintf("sdk|%s|%s|%s|%v|%v|%s", initialize["cwd"], initialize["provider"], initialize["model"], initialize["reasoningEffort"], initialize["maxTokens"], block["text"])
 			helperWrite(map[string]any{"jsonrpc": "2.0", "method": "session.event", "params": map[string]any{"sessionId": sessionID, "event": map[string]any{"type": "agent/inbox/spliced", "data": map[string]any{"inserted": []map[string]any{{"id": "message-1"}}}}}})
 			helperWrite(map[string]any{"jsonrpc": "2.0", "method": "session.event", "params": map[string]any{"sessionId": sessionID, "event": map[string]any{"type": "assistant/message", "data": map[string]any{"message": map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}}}}})
 			helperWrite(map[string]any{"jsonrpc": "2.0", "method": "session.event", "params": map[string]any{"sessionId": sessionID, "event": map[string]any{"type": "turn/end", "data": map[string]any{"reason": map[string]any{"kind": "completed"}}}}})
