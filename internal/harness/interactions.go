@@ -48,39 +48,50 @@ func (e *Engine) RequestInteraction(ctx context.Context, sessionID, method strin
 		}
 		return result.value, nil
 	case <-ctx.Done():
+		removed := false
 		e.pendingMu.Lock()
 		if current := e.pending[pending.id]; current == pending {
 			delete(e.pending, pending.id)
+			e.clearRemoteEventDeliveriesLocked(pending.id)
+			removed = true
 		}
 		e.pendingMu.Unlock()
+		if removed {
+			e.emitHost(map[string]any{"type": "host/pending-cancelled", "rpcId": pending.id})
+		}
 		return nil, ctx.Err()
 	}
 }
 
 // ResolveInteraction is the library equivalent of /api/respond.
 func (e *Engine) ResolveInteraction(rpcID string, result map[string]any) bool {
+	ok, _ := result["ok"].(bool)
+	if ok {
+		return e.settleInteraction(rpcID, interactionResult{ok: true, value: result["value"]})
+	}
+	errValue, _ := result["error"].(map[string]any)
+	err := rpcError("cancelled", "interaction cancelled", nil)
+	if errValue != nil {
+		err.Code, _ = errValue["code"].(string)
+		err.Message, _ = errValue["message"].(string)
+		err.Details = errValue["details"]
+	}
+	return e.settleInteraction(rpcID, interactionResult{err: err})
+}
+
+func (e *Engine) settleInteraction(rpcID string, result interactionResult) bool {
 	e.pendingMu.Lock()
 	pending := e.pending[rpcID]
 	if pending != nil {
 		delete(e.pending, rpcID)
+		e.clearRemoteEventDeliveriesLocked(rpcID)
 	}
 	e.pendingMu.Unlock()
 	if pending == nil {
 		return false
 	}
-	ok, _ := result["ok"].(bool)
-	if ok {
-		pending.done <- interactionResult{ok: true, value: result["value"]}
-	} else {
-		errValue, _ := result["error"].(map[string]any)
-		err := &RPCError{Code: "cancelled", Message: "interaction cancelled", Details: map[string]any{}}
-		if errValue != nil {
-			err.Code, _ = errValue["code"].(string)
-			err.Message, _ = errValue["message"].(string)
-			err.Details = errValue["details"]
-		}
-		pending.done <- interactionResult{err: err}
-	}
+	pending.done <- result
+	e.emitHost(map[string]any{"type": "host/pending-cancelled", "rpcId": rpcID})
 	return true
 }
 

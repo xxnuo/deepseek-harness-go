@@ -65,6 +65,24 @@ func TestCreateWorkspaceCanonicalizesSymlinkPath(t *testing.T) {
 	}
 }
 
+func TestRenameWorkspaceTitlesAreCaseSensitive(t *testing.T) {
+	e := newPersistentDomainEngine(t)
+	first, _, err := e.CreateWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := e.CreateWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RenameWorkspace(first.WorkspaceID, "Work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RenameWorkspace(second.WorkspaceID, "work"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionSummaryUsesTurnBlanknessAndHumanPromptRecency(t *testing.T) {
 	e := newIntegrationEngine(t)
 	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "summary-semantics", "")
@@ -188,7 +206,7 @@ func TestWorkspaceMutationsRollbackWhenStatePersistenceFails(t *testing.T) {
 	if _, rpcErr := e.reorderWorkspace(map[string]any{
 		"workspaceId":       second.WorkspaceID,
 		"beforeWorkspaceId": first.WorkspaceID,
-	}); rpcErr == nil || rpcErr.Code != "workspace-persist-failed" {
+	}); rpcErr == nil || rpcErr.Code != "gateway/internal" {
 		t.Fatalf("reorderWorkspace error = %#v, want persistence failure", rpcErr)
 	}
 	if got := e.workspaceOrder; len(got) != len(beforeOrder) || got[0] != beforeOrder[0] || got[1] != beforeOrder[1] {
@@ -198,7 +216,7 @@ func TestWorkspaceMutationsRollbackWhenStatePersistenceFails(t *testing.T) {
 		"workspaceId":     first.WorkspaceID,
 		"sessionId":       sessionOne,
 		"beforeSessionId": sessionTwo,
-	}); rpcErr == nil || rpcErr.Code != "workspace-persist-failed" {
+	}); rpcErr == nil || rpcErr.Code != "gateway/internal" {
 		t.Fatalf("reorderSession error = %#v, want persistence failure", rpcErr)
 	}
 	if got := e.workspaces[first.WorkspaceID].SessionIDs; len(got) != len(beforeIDs) || got[0] != beforeIDs[0] || got[1] != beforeIDs[1] {

@@ -211,7 +211,7 @@ func (e *Engine) clientPluginComposed(name string) bool {
 	return e.cfg.ClientPlugins != nil && e.clientPluginActive(name)
 }
 
-// buildBootGraph derives the alpha.1 client boot wire and the package paths
+// buildBootGraph derives the alpha.4 client boot wire and the package paths
 // used by the HMR watcher.
 func (e *Engine) buildBootGraph() (BootGraph, map[string]string, error) {
 	snapshot, err := e.buildBootSnapshot()

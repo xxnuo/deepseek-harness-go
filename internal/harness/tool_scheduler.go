@@ -160,7 +160,7 @@ func (e *Engine) prepareToolCall(ctx context.Context, s *Session, turn, step int
 	if err != nil {
 		return nil, err
 	}
-	prepared := &preparedToolCall{call: call, callSeq: event.Seq}
+	prepared := &preparedToolCall{call: call, callSeq: int(event.Seq)}
 	visible, visibilityErr := e.toolVisibleForSession(s, call.Name)
 	if visibilityErr != nil {
 		prepared.result = toolFailureResult("TOOL_CATALOG", visibilityErr.Error())
@@ -537,7 +537,7 @@ func (e *Engine) appendSkippedCalls(s *Session, turn, step int, calls []ToolCall
 		}
 		result := abortedBeforeDispatchResult()
 		data := map[string]any{"turn": turn, "step": step, "message": toolResultMessage(call.ID, result.Content, true), "error": result.Error}
-		if _, err := e.appendEvent(s, "tool/result", data, event.Seq); err != nil {
+		if _, err := e.appendEvent(s, "tool/result", data, int(event.Seq)); err != nil {
 			return err
 		}
 	}

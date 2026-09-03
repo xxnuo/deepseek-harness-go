@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -25,10 +26,12 @@ type presetRecord struct {
 	description string
 	content     string
 	broken      string
+	order       float64
+	hasOrder    bool
 }
 
 func (e *Engine) presetRoots() [][2]string {
-	roots := make([][2]string, 0, 3)
+	roots := make([][2]string, 0, 2)
 	add := func(path, trust string) {
 		if path == "" {
 			return
@@ -41,40 +44,44 @@ func (e *Engine) presetRoots() [][2]string {
 				return
 			}
 		}
-		if st, err := os.Stat(path); err == nil && st.IsDir() {
-			roots = append(roots, [2]string{path, trust})
-		}
+		roots = append(roots, [2]string{path, trust})
 	}
 	add(e.cfg.PresetDir, "system")
-	if home, err := os.UserHomeDir(); err == nil {
-		add(filepath.Join(home, ".dsh", ".agent-presets"), "user")
-		add(filepath.Join(home, ".deepseek-harness", ".agent-presets"), "user")
-	}
-	add(filepath.Join(e.cfg.DataDir, ".agent-presets"), "user")
-	// Locate the fixed checkout when the library is used from this repository.
-	if _, file, _, ok := runtime.Caller(0); ok {
-		root := filepath.Dir(file)
-		add(filepath.Join(root, "deepseek-harness", "packages", "preset", "agent-presets", "presets"), "system")
+	if e.cfg.DataDir != "" {
+		add(filepath.Join(e.cfg.DataDir, ".agent-presets"), "user")
 	}
 	return roots
 }
 
-func parsePresetMetadata(dir string) (name, description string, err error) {
+func (e *Engine) writablePresetRoot(id string) (string, *RPCError) {
+	for _, root := range e.presetRoots() {
+		if root[1] == "user" {
+			return root[0], nil
+		}
+	}
+	return "", agentPresetReadOnly(id, "this deployment configures no user-writable preset root")
+}
+
+func parsePresetMetadata(dir string) (name, description string, order float64, hasOrder bool, err error) {
 	data, readErr := os.ReadFile(filepath.Join(dir, "preset.yml"))
 	if errors.Is(readErr, os.ErrNotExist) {
-		return "", "", nil
+		return "", "", 0, false, nil
 	}
 	if readErr != nil {
-		return "", "", readErr
+		return "", "", 0, false, readErr
 	}
 	var doc struct {
-		Name        string `yaml:"name"`
-		Description string `yaml:"description"`
+		Name        string   `yaml:"name"`
+		Description string   `yaml:"description"`
+		Order       *float64 `yaml:"order"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return "", "", err
+		return "", "", 0, false, err
 	}
-	return strings.TrimSpace(doc.Name), strings.TrimSpace(doc.Description), nil
+	if doc.Order == nil || math.IsNaN(*doc.Order) || math.IsInf(*doc.Order, 0) {
+		return strings.TrimSpace(doc.Name), strings.TrimSpace(doc.Description), 0, false, nil
+	}
+	return strings.TrimSpace(doc.Name), strings.TrimSpace(doc.Description), *doc.Order, true, nil
 }
 
 func scanPresets(e *Engine) []presetRecord {
@@ -91,12 +98,11 @@ func scanPresets(e *Engine) []presetRecord {
 			}
 			dir := filepath.Join(root[0], entry.Name())
 			composition := filepath.Join(dir, "agent.cordis.yml")
+			row := presetRecord{id: entry.Name(), trust: root[1], dir: dir}
 			data, readErr := os.ReadFile(composition)
 			if errors.Is(readErr, os.ErrNotExist) {
-				continue
-			}
-			row := presetRecord{id: entry.Name(), trust: root[1], dir: dir}
-			if readErr != nil {
+				row.broken = "the composition file agent.cordis.yml is missing"
+			} else if readErr != nil {
 				row.broken = readErr.Error()
 			} else {
 				row.content = string(data)
@@ -104,21 +110,29 @@ func scanPresets(e *Engine) []presetRecord {
 					row.broken = "composition is empty"
 				}
 			}
-			row.name, row.description, _ = parsePresetMetadata(dir)
+			row.name, row.description, row.order, row.hasOrder, _ = parsePresetMetadata(dir)
 			rows = append(rows, row)
 			seen[row.id] = true
 		}
 	}
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].hasOrder != rows[j].hasOrder {
+			return rows[i].hasOrder
+		}
+		if rows[i].hasOrder && rows[i].order != rows[j].order {
+			return rows[i].order < rows[j].order
+		}
+		return rows[i].id < rows[j].id
+	})
 	return rows
 }
 
 func validPresetID(id string) bool {
-	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\\`) {
+	if id == "" {
 		return false
 	}
-	for _, r := range id {
-		if !(r == '-' || r == '_' || r == '.' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+	for index, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || index > 0 && r == '-') {
 			return false
 		}
 	}
@@ -167,7 +181,7 @@ func (e *Engine) findPreset(id string) (presetRecord, bool) {
 			return row, true
 		}
 	}
-	// dsh-v0.1.2-alpha.1 renamed the shipped Code Mode preset to `ptc`.
+	// dsh-v0.1.2-alpha.4 retains the shipped Code Mode preset as `ptc`.
 	// Keep the old id as a read/runtime alias for persisted Go sessions and
 	// callers, while the discovered roster exposes only the canonical id.
 	if id == "code" {
@@ -180,7 +194,7 @@ func (e *Engine) findPreset(id string) (presetRecord, bool) {
 	return presetRecord{}, false
 }
 
-// canonicalPresetID is the runtime compatibility boundary for the alpha.1
+// canonicalPresetID is the runtime compatibility boundary for the alpha.4
 // rename of the shipped Code Mode preset. New headers and selection events
 // must use `ptc`; only old persisted values may still arrive as `code`.
 func canonicalPresetID(id string) string {
@@ -192,11 +206,51 @@ func canonicalPresetID(id string) string {
 
 func (e *Engine) presetEntries() []map[string]any { return e.presetRows() }
 
+func presetIDs(rows []presetRecord) []string {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.id)
+	}
+	return ids
+}
+
+func agentPresetNotFound(id string, rows []presetRecord) *RPCError {
+	available := presetIDs(rows)
+	label := strings.Join(available, ", ")
+	if label == "" {
+		label = "none"
+	}
+	return rpcError("agent-preset-not-found", fmt.Sprintf("agent-presets: preset %q not found (available: %s)", id, label), map[string]any{
+		"agentPreset": id,
+		"available":   available,
+	})
+}
+
+func (e *Engine) presetNotFound(id string) *RPCError {
+	return agentPresetNotFound(id, scanPresets(e))
+}
+
+func agentPresetInvalid(id, reason string) *RPCError {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "preset operation failed"
+	}
+	return rpcError("agent-preset-invalid", reason, map[string]any{"agentPreset": id, "reason": reason})
+}
+
+func agentPresetReadOnly(id, reason string) *RPCError {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "preset is read-only"
+	}
+	return rpcError("agent-preset-read-only", reason, map[string]any{"agentPreset": id, "reason": reason})
+}
+
 func (e *Engine) resolvePreset(id string) (string, *RPCError) {
 	rows := scanPresets(e)
 	if len(rows) == 0 {
 		if id != "" {
-			return "", rpcError("agent-preset-not-found", "preset roster is empty", map[string]any{"agentPreset": id})
+			return "", agentPresetNotFound(id, rows)
 		}
 		return "", nil
 	}
@@ -211,10 +265,10 @@ func (e *Engine) resolvePreset(id string) (string, *RPCError) {
 	id = canonicalPresetID(id)
 	row, ok := e.findPreset(id)
 	if !ok {
-		return "", rpcError("agent-preset-not-found", "preset not found", map[string]any{"agentPreset": id})
+		return "", agentPresetNotFound(id, rows)
 	}
 	if row.broken != "" {
-		return "", rpcError("agent-preset-invalid", row.broken, map[string]any{"agentPreset": id})
+		return "", agentPresetInvalid(id, row.broken)
 	}
 	return id, nil
 }
@@ -222,10 +276,10 @@ func (e *Engine) resolvePreset(id string) (string, *RPCError) {
 func (e *Engine) readPresetContent(id string) (any, *RPCError) {
 	row, ok := e.findPreset(id)
 	if !ok {
-		return nil, rpcError("agent-preset-not-found", "preset not found", map[string]any{"agentPreset": id})
+		return nil, e.presetNotFound(id)
 	}
 	if row.broken != "" {
-		return nil, rpcError("agent-preset-invalid", row.broken, map[string]any{"agentPreset": id})
+		return nil, agentPresetInvalid(id, row.broken)
 	}
 	out := map[string]any{"agentPreset": id, "trust": row.trust, "content": row.content}
 	if row.name != "" {
@@ -238,59 +292,133 @@ func (e *Engine) readPresetContent(id string) (any, *RPCError) {
 }
 
 func (e *Engine) copyPreset(from, id, name string) (map[string]any, *RPCError) {
-	if !validPresetID(id) || id == "standard" || id == "minimal" {
-		return nil, rpcError("agent-preset-invalid", "invalid or reserved preset id", map[string]any{"agentPreset": id})
-	}
 	source, ok := e.findPreset(from)
 	if !ok {
-		return nil, rpcError("agent-preset-not-found", "source preset not found", map[string]any{"agentPreset": from})
+		return nil, e.presetNotFound(from)
 	}
-	if source.broken != "" {
-		return nil, rpcError("agent-preset-invalid", source.broken, map[string]any{"agentPreset": from})
+	if !validPresetID(id) {
+		return nil, agentPresetInvalid(id, fmt.Sprintf("preset id %q must match ^[a-z0-9][a-z0-9-]*$", id))
 	}
-	root := filepath.Join(e.cfg.DataDir, ".agent-presets")
+	for _, preset := range scanPresets(e) {
+		if preset.id == id {
+			return nil, agentPresetInvalid(id, fmt.Sprintf("preset %q already exists", id))
+		}
+	}
+	root, rootErr := e.writablePresetRoot(id)
+	if rootErr != nil {
+		return nil, rootErr
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, rpcError("agent-preset-invalid", err.Error(), nil)
+		return nil, agentPresetInvalid(id, err.Error())
 	}
 	dir := filepath.Join(root, id)
-	if _, err := os.Stat(dir); err == nil {
-		return nil, rpcError("agent-preset-invalid", "preset already exists", map[string]any{"agentPreset": id})
+	if _, err := os.Lstat(dir); err == nil {
+		return nil, agentPresetInvalid(id, fmt.Sprintf("preset %q already exists", id))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, agentPresetInvalid(id, err.Error())
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		return nil, rpcError("agent-preset-invalid", err.Error(), nil)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "agent.cordis.yml"), []byte(source.content), 0o600); err != nil {
+	if err := copyPresetDirectory(source.dir, dir); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, rpcError("agent-preset-invalid", err.Error(), nil)
+		return nil, agentPresetInvalid(id, err.Error())
 	}
-	if name = strings.TrimSpace(name); name != "" || source.name != "" || source.description != "" {
-		meta := fmt.Sprintf("name: %s\ndescription: %s\n", yamlQuote(name), yamlQuote(source.description))
-		if name == "" {
-			meta = fmt.Sprintf("description: %s\n", yamlQuote(source.description))
-		}
-		if err := os.WriteFile(filepath.Join(dir, "preset.yml"), []byte(meta), 0o600); err != nil {
+	metadata := struct {
+		Name        string `yaml:"name,omitempty"`
+		Description string `yaml:"description,omitempty"`
+	}{Name: strings.TrimSpace(name), Description: source.description}
+	metadataPath := filepath.Join(dir, "preset.yml")
+	if metadata.Name == "" && metadata.Description == "" {
+		if err := os.Remove(metadataPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			_ = os.RemoveAll(dir)
-			return nil, rpcError("agent-preset-invalid", err.Error(), nil)
+			return nil, agentPresetInvalid(id, err.Error())
+		}
+	} else {
+		data, err := yaml.Marshal(metadata)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, agentPresetInvalid(id, err.Error())
+		}
+		if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, agentPresetInvalid(id, err.Error())
 		}
 	}
 	return map[string]any{"agentPreset": id}, nil
 }
 
-func yamlQuote(value string) string {
-	data, _ := yaml.Marshal(value)
-	return strings.TrimSpace(string(data))
+func copyPresetDirectory(source, destination string) error {
+	return copyPresetPath(source, destination, map[string]bool{})
+}
+
+func copyPresetPath(source, destination string, ancestors map[string]bool) error {
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return err
+		}
+		if ancestors[resolved] {
+			return fmt.Errorf("preset copy encountered a symbolic-link cycle at %s", source)
+		}
+		ancestors[resolved] = true
+		defer delete(ancestors, resolved)
+		if err := os.Mkdir(destination, 0o700); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(resolved)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := copyPresetPath(filepath.Join(resolved, entry.Name()), filepath.Join(destination, entry.Name()), ancestors); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("preset copy does not support %s", info.Mode().Type())
+	}
+	input, err := os.Open(resolved)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	mode := os.FileMode(0o600)
+	if info.Mode().Perm()&0o100 != 0 {
+		mode = 0o700
+	}
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	return errors.Join(copyErr, output.Close())
 }
 
 func (e *Engine) removePreset(id string) *RPCError {
 	row, ok := e.findPreset(id)
 	if !ok {
-		return rpcError("agent-preset-not-found", "preset not found", map[string]any{"agentPreset": id})
+		return e.presetNotFound(id)
 	}
 	if row.trust != "user" {
-		return rpcError("agent-preset-read-only", "shipped presets are read-only", map[string]any{"agentPreset": id})
+		return agentPresetReadOnly(id, "it ships with the deployment")
+	}
+	root, rootErr := e.writablePresetRoot(id)
+	if rootErr != nil {
+		return rootErr
+	}
+	if filepath.Clean(row.dir) != filepath.Join(root, id) {
+		return agentPresetReadOnly(id, "it does not live under the writable preset root")
 	}
 	if err := os.RemoveAll(row.dir); err != nil {
-		return rpcError("agent-preset-invalid", err.Error(), map[string]any{"agentPreset": id})
+		return agentPresetInvalid(id, err.Error())
 	}
 	return nil
 }

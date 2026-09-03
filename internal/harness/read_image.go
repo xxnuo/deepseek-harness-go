@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,7 +28,34 @@ var readImageMediaTypes = map[string]string{
 var errImageRouteUnresolved = errors.New("image model route could not be resolved")
 
 func imageMediaTypeForPath(path string) string {
-	return readImageMediaTypes[strings.ToLower(filepath.Ext(path))]
+	return readImageMediaTypes[imagePathExtension(path)]
+}
+
+// imagePathExtension follows node:path.extname for dotfiles: a leading dot
+// alone is a filename, while a trailing dot still declares an unsupported
+// extension and is rejected before reading.
+func imagePathExtension(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	base := filepath.Base(path)
+	if base == "." || base == ".." || ext == base && strings.HasPrefix(base, ".") {
+		return ""
+	}
+	return ext
+}
+
+func sniffImageMediaType(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}):
+		return "image/png"
+	case bytes.HasPrefix(data, []byte{0xff, 0xd8, 0xff}):
+		return "image/jpeg"
+	case bytes.HasPrefix(data, []byte("GIF87a")), bytes.HasPrefix(data, []byte("GIF89a")):
+		return "image/gif"
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+		return "image/webp"
+	default:
+		return ""
+	}
 }
 
 func formatImageReadOutput(path string, image ImageAttachmentRef) string {
@@ -59,8 +87,13 @@ func readImageAttachmentError(path, mediaType string, err error) error {
 	case strings.Contains(strings.ToLower(message), "16-bit png"):
 		return fmt.Errorf("cannot read %q: the 16-bit PNG could not be converted to the normalized 8-bit sRGB form; convert it to an 8-bit PNG/JPEG/WebP and retry", path)
 	case strings.Contains(message, "declared image media type does not match the data"):
+		if imagePathExtension(path) == "" {
+			return fmt.Errorf("cannot read %q: the file signature claims %s, but the bytes decode as a different image format; the file may be corrupt", path, mediaType)
+		}
 		extension := strings.ToLower(filepath.Ext(path))
 		return fmt.Errorf("cannot read %q: the %s extension declares %s, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats", path, extension, mediaType)
+	case strings.Contains(message, "image data is malformed") && imagePathExtension(path) == "":
+		return fmt.Errorf("cannot read %q: the bytes do not decode as a supported PNG/JPEG/WebP/GIF image; the file may be truncated or corrupt", path)
 	default:
 		return err
 	}
@@ -153,7 +186,7 @@ func builtinReadImageTool(e *Engine) Tool {
 	return Tool{
 		Schema: ToolSchema{
 			Name:        "read_image",
-			Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. Harness validates and downscales large supported images before the next model request, so use this tool directly instead of installing image libraries or creating thumbnails merely to inspect an image. Independent files may be read concurrently in small batches. Requires the current model to accept image input.",
+			Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. A path without a file extension is accepted; the format is detected from the file content, so normalized attachment paths can be passed directly without copying or renaming. Harness validates and downscales large supported images before the next model request, so use this tool directly instead of installing image libraries or creating thumbnails merely to inspect an image. Independent files may be read concurrently in small batches. Requires the current model to accept image input.",
 			Parameters: objectSchema(map[string]any{
 				"file_path": map[string]any{"type": "string", "description": "Path to the image file, resolved relative to the session workspace."},
 			}, "file_path"),
@@ -173,9 +206,10 @@ func builtinReadImageTool(e *Engine) Tool {
 			if strings.TrimSpace(in.FilePath) == "" {
 				return ToolResult{}, errors.New("file_path must be a non-empty string")
 			}
-			mediaType := imageMediaTypeForPath(in.FilePath)
-			if mediaType == "" {
-				return ToolResult{}, fmt.Errorf("cannot read %q: read_image only accepts PNG/JPEG/WebP/GIF paths", in.FilePath)
+			extension := imagePathExtension(in.FilePath)
+			declaredMediaType := imageMediaTypeForPath(in.FilePath)
+			if declaredMediaType == "" && extension != "" {
+				return ToolResult{}, fmt.Errorf("cannot read %q: the %s extension does not declare a supported image format; read_image accepts PNG/JPEG/WebP/GIF files, including extension-less files in those formats", in.FilePath, extension)
 			}
 			if err := imageModelSupportsInput(ctx, e, call, in.FilePath); err != nil {
 				return ToolResult{}, err
@@ -187,7 +221,8 @@ func builtinReadImageTool(e *Engine) Tool {
 			if err != nil {
 				return ToolResult{}, err
 			}
-			data, version, _, err := readVersionedFile(target.targetKey)
+			byteCap := int64(min(maxImageBytes, maxMessageImageBytes))
+			data, version, _, err := readVersionedFileWithin(target.targetKey, byteCap)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
 					e.fsState.observe(call.SessionID, target, fsObservation{})
@@ -195,8 +230,12 @@ func builtinReadImageTool(e *Engine) Tool {
 				}
 				return ToolResult{}, err
 			}
-			if len(data) > min(maxImageBytes, maxMessageImageBytes) {
-				return ToolResult{}, fmt.Errorf("cannot read %q: the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy", target.displayPath)
+			mediaType := declaredMediaType
+			if mediaType == "" {
+				mediaType = sniffImageMediaType(data)
+				if mediaType == "" {
+					return ToolResult{}, fmt.Errorf("cannot read %q: the file content is not a supported image format; read_image accepts PNG/JPEG/WebP/GIF", target.displayPath)
+				}
 			}
 			prepared, err := e.prepareImageContext(ctx, decodedImageInput{mediaType: mediaType, data: data, name: filepath.Base(target.displayPath)})
 			if err != nil {

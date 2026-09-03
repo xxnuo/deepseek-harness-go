@@ -598,7 +598,7 @@ func retainSessionReference(snapshot sessionQuerySessionSnapshot, label string, 
 	}
 	items := make([]sessionReferenceProjectedItem, 0)
 	for _, event := range snapshot.events {
-		if !analysis.current[event.Seq] {
+		if !analysis.current[int(event.Seq)] {
 			continue
 		}
 		data, _ := event.Data.(map[string]any)
@@ -635,7 +635,7 @@ func retainSessionReference(snapshot sessionQuerySessionSnapshot, label string, 
 		}
 		var captured *int
 		if len(snapshot.events) > 0 {
-			value := snapshot.events[len(snapshot.events)-1].Seq
+			value := int(snapshot.events[len(snapshot.events)-1].Seq)
 			captured = &value
 		}
 		return sessionReferenceData{SessionID: snapshot.header.ID, Label: label, CWD: cwd, CapturedThroughSeq: captured, Conversation: conversation}

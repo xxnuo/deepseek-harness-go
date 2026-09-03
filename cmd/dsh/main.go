@@ -488,6 +488,7 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	}
 	cfg.MCPServers = append([]harness.MCPConfig(nil), composed.mcpConfigs...)
 	cfg.Jobs = composed.jobs
+	cfg.RuntimeInvariants = composed.runtimeInvariants
 	cfg.Hooks = append([]harness.HookBridgeConfig(nil), composed.hooks...)
 	cfg.LSPServers = composed.lspServers
 	cfg.LSPTool = composed.lspTool
@@ -496,9 +497,6 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	cfg.SessionTelemetry = composed.sessionTelemetry
 	cfg.SubagentProviders = append([]harness.SubagentProvider(nil), composed.subagentProviders...)
 	cfg.SubagentTools = append([]harness.SubagentToolConfig(nil), composed.subagentTools...)
-	if composed.subagentReportDelivery != "" {
-		cfg.SubagentReportDelivery = composed.subagentReportDelivery
-	}
 	if composed.e2b != nil {
 		config := *composed.e2b
 		cfg.E2B = &config
@@ -539,7 +537,6 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	cfg.PresetDir = loader.presetsDir()
 	cfg.BundledBadgeSkill = composed.enabled("skill-badge")
 	cfg.Persist = composed.persist || composed.enabled("session-persistence-jsonl")
-	cfg.SessionStore = composed.sessionStore
 	cfg.Storage = composed.storage
 	if composed.fileReference != nil {
 		cfg.FileReference = *composed.fileReference

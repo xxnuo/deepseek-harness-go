@@ -481,7 +481,7 @@ func TestToolLoopExecutesAndReplaysToolResult(t *testing.T) {
 				t.Fatalf("assistant provenance = %#v", event.SourceEventSeqs)
 			}
 		case "tool/call":
-			toolCallSeq = event.Seq
+			toolCallSeq = int(event.Seq)
 			sequence = append(sequence, event.Type)
 		case "tool/result":
 			sequence = append(sequence, event.Type)

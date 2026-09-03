@@ -118,58 +118,73 @@ func (e *Engine) startContinuableModelSubagentWithID(ctx context.Context, parent
 		return "", "", err
 	}
 	unlock := e.lockModelSubagent(childID)
-	defer unlock()
+	release := func() {
+		if unlock != nil {
+			unlock()
+			unlock = nil
+		}
+	}
 
 	childID, err := e.createModelSubagentWithIDLocked(ctx, parentID, childID, label, fork, "continuable", config, nil)
 	if err != nil {
+		release()
 		return "", "", err
 	}
 	child, _ := e.getSession(childID)
-	if err := e.prepareModelSubagentActivationSetup(child); err != nil {
-		e.rollbackCreatedModelSubagent(childID, child)
-		return "", "", err
-	}
 	activation, err := e.registerModelSubagentActivation(child, parentID)
 	if err != nil {
+		release()
 		e.rollbackCreatedModelSubagent(childID, child)
 		return "", "", err
 	}
 	if err := ctx.Err(); err != nil {
-		e.removeModelSubagentActivation(activation)
+		release()
+		_ = e.disposeModelSubagentActivation(activation)
 		e.rollbackCreatedModelSubagent(childID, child)
 		return "", "", err
 	}
 	messageID, err := e.enqueueTeamPrompt(child, cloneContentBlocks(content), map[string]any{"kind": "user"}, "next-turn", true)
 	if err != nil {
-		e.removeModelSubagentActivation(activation)
+		release()
+		_ = e.disposeModelSubagentActivation(activation)
 		e.rollbackCreatedModelSubagent(childID, child)
 		return "", "", err
 	}
 	e.markModelSubagentAnnounced(activation)
 	e.watchModelSubagentActivation(activation)
+	release()
 	return childID, messageID, nil
 }
 
 func (e *Engine) removeModelSubagentActivation(activation *modelSubagentActivation) {
-	e.modelSubagentMu.Lock()
-	if e.modelSubagentActivations[activation.childID] == activation {
-		delete(e.modelSubagentActivations, activation.childID)
-		close(activation.done)
-	}
-	e.modelSubagentMu.Unlock()
-	e.releaseModelSubagentOwnership(activation)
-	e.emitModelSubagentActivationEnd(activation, "error", nil)
+	_ = e.disposeModelSubagentActivation(activation)
 }
 
 func (e *Engine) promptContinuableModelSubagent(ctx context.Context, parentID, childID string, content []ContentBlock, source map[string]any) (string, error) {
+	return e.deliverContinuableModelSubagent(ctx, parentID, childID, content, source, "next-turn")
+}
+
+// deliverContinuableModelSubagent admits a direct-child delivery with an
+// explicit Agent inbox target. Host/browser prompts remain distinct turns;
+// model-authored adjacent-Agent messages use next-step steering.
+func (e *Engine) deliverContinuableModelSubagent(ctx context.Context, parentID, childID string, content []ContentBlock, source map[string]any, target string) (string, error) {
 	if err := e.requireContinuablePersistence(); err != nil {
 		return "", err
 	}
+	if target != "next-turn" && target != "next-step" {
+		return "", fmt.Errorf("subagent delivery target must be next-turn or next-step, got %q", target)
+	}
 	for {
 		unlock := e.lockModelSubagent(childID)
+		release := func() {
+			if unlock != nil {
+				unlock()
+				unlock = nil
+			}
+		}
 		child, err := e.childFor(parentID, childID)
 		if err != nil {
-			unlock()
+			release()
 			return "", err
 		}
 
@@ -178,7 +193,7 @@ func (e *Engine) promptContinuableModelSubagent(ctx context.Context, parentID, c
 		if activation != nil && activation.disposing {
 			done := activation.done
 			e.modelSubagentMu.Unlock()
-			unlock()
+			release()
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
@@ -196,17 +211,17 @@ func (e *Engine) promptContinuableModelSubagent(ctx context.Context, parentID, c
 			events := append([]Event(nil), child.Events...)
 			child.mu.Unlock()
 			if header.SeedLength < 0 || header.SeedLength > len(events) {
-				unlock()
+				release()
 				return "", errors.New("subagent-not-resumable: child has invalid continuation lineage")
 			}
 			descriptor, descriptorErr := FoldSubagentDescriptor(events[header.SeedLength:])
 			if descriptorErr != nil || descriptor == nil || descriptor.Mode != "continuable" {
-				unlock()
+				release()
 				return "", errors.New("subagent-not-resumable: child has no supported continuation state")
 			}
 			if !attached {
 				if _, err := e.createSession(ctx, header, false); err != nil {
-					unlock()
+					release()
 					return "", fmt.Errorf("subagent-not-resumable: %w", err)
 				}
 				attachedNow = true
@@ -214,54 +229,60 @@ func (e *Engine) promptContinuableModelSubagent(ctx context.Context, parentID, c
 			if attachedNow {
 				if err := e.restoreContinuableSubagentComposition(child, descriptor); err != nil {
 					_ = detachSDKSession(e, childID)
-					unlock()
+					release()
 					return "", fmt.Errorf("subagent-not-resumable: %w", err)
 				}
-			}
-			if err := e.prepareModelSubagentActivationSetup(child); err != nil {
-				if attachedNow {
-					_ = detachSDKSession(e, childID)
-				}
-				unlock()
-				return "", fmt.Errorf("subagent-not-resumable: %w", err)
 			}
 			var activationErr error
 			activation, activationErr = e.registerModelSubagentActivation(child, parentID)
 			if activationErr != nil {
 				if attachedNow {
 					_ = detachSDKSession(e, childID)
-				} else {
-					_ = e.subagentActivationSetups.releaseChild(child)
 				}
-				unlock()
+				release()
 				return "", activationErr
 			}
 			newActivation = true
 		}
+		rollback := func() {
+			release()
+			if newActivation {
+				_ = e.disposeModelSubagentActivation(activation)
+			}
+		}
 
 		if enqueueErr := ctx.Err(); enqueueErr != nil {
-			if newActivation {
-				e.removeModelSubagentActivation(activation)
-				if attachedNow {
-					_ = detachSDKSession(e, childID)
-				} else {
-					_ = e.subagentActivationSetups.releaseChild(child)
-				}
-			}
-			unlock()
+			rollback()
 			return "", enqueueErr
 		}
-		messageID, enqueueErr := e.enqueueTeamPrompt(child, cloneContentBlocks(content), cloneJSON(source).(map[string]any), "next-turn", true)
-		if enqueueErr != nil {
-			if newActivation {
-				e.removeModelSubagentActivation(activation)
-				if attachedNow {
-					_ = detachSDKSession(e, childID)
-				} else {
-					_ = e.subagentActivationSetups.releaseChild(child)
-				}
+		if contentBlocksHaveImage(content) {
+			if capabilityErr := e.ensureSubagentImageCapability(ctx, child); capabilityErr != nil {
+				rollback()
+				return "", capabilityErr
 			}
-			unlock()
+			e.modelSubagentMu.Lock()
+			disposing := activation.disposing
+			e.modelSubagentMu.Unlock()
+			if disposing {
+				if newActivation {
+					rollback()
+					return "", subagentServiceError(
+						"ACTIVATION_CLOSING",
+						fmt.Sprintf("subagent %q activation is closing", childID),
+						nil,
+					)
+				}
+				release()
+				return "", subagentServiceError(
+					"DRAINING",
+					fmt.Sprintf("subagent %q is draining", childID),
+					nil,
+				)
+			}
+		}
+		messageID, enqueueErr := e.enqueueTeamPrompt(child, cloneContentBlocks(content), cloneJSON(source).(map[string]any), target, true)
+		if enqueueErr != nil {
+			rollback()
 			return "", enqueueErr
 		}
 		e.markModelSubagentAnnounced(activation)
@@ -271,21 +292,31 @@ func (e *Engine) promptContinuableModelSubagent(ctx context.Context, parentID, c
 		if newActivation {
 			e.watchModelSubagentActivation(activation)
 		}
-		unlock()
+		release()
 		return messageID, nil
 	}
 }
 
-func (e *Engine) prepareModelSubagentActivationSetup(child *Session) error {
-	transaction, err := e.subagentActivationSetups.apply(child)
+func (e *Engine) ensureSubagentImageCapability(ctx context.Context, child *Session) error {
+	child.mu.Lock()
+	selection := cloneModelSelection(child.Model)
+	events := append([]Event(nil), child.Events...)
+	child.mu.Unlock()
+	if latest, ok := latestLoggedModel(events); ok {
+		selection = latest
+	}
+	model, err := resolveExactModelInfo(ctx, e, selection)
 	if err != nil {
 		return err
 	}
-	if err := transaction.commit(); err != nil {
-		_ = e.subagentActivationSetups.releaseChild(child)
-		return err
+	if containsString(model.InputModalities, "image") {
+		return nil
 	}
-	return nil
+	return subagentServiceError(
+		"MODEL_DOES_NOT_SUPPORT_IMAGES",
+		fmt.Sprintf("model %q does not support image input", selection.Model),
+		nil,
+	)
 }
 
 func (e *Engine) watchModelSubagentActivation(activation *modelSubagentActivation) {
@@ -325,8 +356,6 @@ func (e *Engine) watchModelSubagentActivation(activation *modelSubagentActivatio
 }
 
 func (e *Engine) beginModelSubagentDisposal(activation *modelSubagentActivation) (bool, <-chan struct{}) {
-	unlock := e.lockModelSubagent(activation.childID)
-	defer unlock()
 	e.modelSubagentMu.Lock()
 	defer e.modelSubagentMu.Unlock()
 	if e.modelSubagentActivations[activation.childID] != activation {
@@ -338,6 +367,21 @@ func (e *Engine) beginModelSubagentDisposal(activation *modelSubagentActivation)
 	activation.disposing = true
 	signalModelSubagentActivationLocked(activation)
 	return true, activation.done
+}
+
+func (e *Engine) disposeModelSubagentActivation(activation *modelSubagentActivation) error {
+	if activation == nil {
+		return nil
+	}
+	owner, done := e.beginModelSubagentDisposal(activation)
+	if owner {
+		return e.finishModelSubagentActivation(activation)
+	}
+	<-done
+	e.modelSubagentMu.Lock()
+	err := activation.finishErr
+	e.modelSubagentMu.Unlock()
+	return err
 }
 
 func (e *Engine) finishModelSubagentActivation(activation *modelSubagentActivation) error {

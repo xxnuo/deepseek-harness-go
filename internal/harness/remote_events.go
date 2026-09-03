@@ -33,9 +33,51 @@ func (e *Engine) emitRemoteEventFrom(origin *dynamicCordisRun, event string, arg
 		return
 	}
 	_ = e.emitDynamicCordisEventFrom(origin, event, args...)
-	e.emitHost(map[string]any{
+	e.emitHostRaw(map[string]any{
 		"type":  "host/remote-event",
 		"event": event,
 		"args":  args,
 	})
+}
+
+func (e *Engine) emitRemoteEventMux(event string, args ...any) {
+	if _, ok := forwardedRemoteEvents[event]; !ok {
+		return
+	}
+	e.emitMux(map[string]any{
+		"type":  "host/remote-event",
+		"event": event,
+		"args":  args,
+	})
+}
+
+func (e *Engine) remoteSessionSummary(id string) (map[string]any, bool) {
+	s, err := e.getSession(id)
+	if err != nil {
+		return nil, false
+	}
+	row, ok := e.sessionSummary(s)
+	e.mu.RLock()
+	archived := e.archived[id]
+	e.mu.RUnlock()
+	if !ok || archived {
+		return nil, false
+	}
+	value := map[string]any{
+		"sessionId": row.SessionID, "updatedAt": row.UpdatedAt,
+		"running": row.Running, "blank": row.Blank,
+	}
+	if row.ParentSessionID != "" {
+		value["parentSessionId"] = row.ParentSessionID
+	}
+	if row.Origin != "" {
+		value["origin"] = row.Origin
+	}
+	if row.CWD != "" {
+		value["cwd"] = row.CWD
+	}
+	if row.Projections != nil {
+		value["projections"] = row.Projections
+	}
+	return value, true
 }

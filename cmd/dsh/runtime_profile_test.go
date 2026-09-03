@@ -221,68 +221,6 @@ func TestAgentTeamProfileConfigMapsLimitsAndProviders(t *testing.T) {
 	}
 }
 
-func TestSQLiteSessionProfilePersistsAcrossRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sessions.sqlite")
-	source := fmt.Sprintf("- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: %q, journalMode: delete, busyTimeoutMs: 77, preparedSessionCacheSize: 9, writeBatchMaxDelayMs: 123}\n", path)
-	newConfig := func() harness.Config {
-		composed := testComposition(t, source)
-		if err := composed.validate(); err != nil {
-			t.Fatal(err)
-		}
-		cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
-		store, ok := cfg.SessionStore.(*harness.SQLiteSessionStore)
-		if !ok || store.Options().BusyTimeout != 77*time.Millisecond || !store.Options().BusyTimeoutSet || store.Options().PreparedSessionCacheSize != 9 || store.Options().WriteBatchMaxDelay != 123*time.Millisecond {
-			t.Fatalf("SQLite coordinator options = %#v", cfg.SessionStore)
-		}
-		cfg.Provider, cfg.Model = "echo", "echo"
-		cfg.Workspace = t.TempDir()
-		cfg.SessionTitleLLM.Enabled = false
-		return cfg
-	}
-
-	cfg := newConfig()
-	if !cfg.Persist || cfg.SessionStore == nil {
-		t.Fatalf("SQLite persistence config = %#v", cfg)
-	}
-	engine, err := harness.New(harness.WithConfig(cfg))
-	if err != nil {
-		_ = cfg.SessionStore.Close()
-		t.Fatal(err)
-	}
-	id, err := engine.CreateSession(context.Background(), cfg.Workspace, "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if text, err := engine.Run(context.Background(), id, harness.PromptRequest{Mode: "queue", Content: []harness.PromptContentPart{{Type: "text", Text: "persist me"}}, Literal: true}); err != nil || text != "persist me" {
-		t.Fatalf("Run() = %q, %v", text, err)
-	}
-	if err := engine.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopenedConfig := newConfig()
-	reopened, err := harness.New(harness.WithConfig(reopenedConfig))
-	if err != nil {
-		_ = reopenedConfig.SessionStore.Close()
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	history, _, err := reopened.History(id, -1, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, entry := range history {
-		if entry.Event.Type == "user/message" && strings.Contains(fmt.Sprint(entry.Event.Data), "persist me") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("reopened history = %#v", history)
-	}
-}
-
 func TestSQLiteStorageProfileMountsAndPersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "storage.sqlite")
 	source := fmt.Sprintf(`
@@ -366,9 +304,6 @@ func TestRuntimeProfileRejectsUnsupportedOrIncompleteConfig(t *testing.T) {
 		{"e2b adapter without owner", "- id: fs\n  name: '@deepseek-ai/dsh-fs-e2b'\n", "require an enabled"},
 		{"hook path", "- id: hooks\n  name: '@deepseek-ai/dsh-hooks-codex'\n", "configPath is required"},
 		{"title route pair", "- id: title\n  name: '@deepseek-ai/dsh-session-title-all-prompts-llm'\n  config: {targetWords: 5, targetCjkCharacters: 10, maxInputBytes: 1024, maxOutputTokens: 32, timeoutMs: 1000, provider: only-provider}\n", "supplied together"},
-		{"SQLite tuning", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', preparedSessionCacheSize: 0}\n", "must be a positive integer"},
-		{"SQLite busy timeout", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', busyTimeoutMs: -1}\n", "must be between 0 and 2147483647"},
-		{"SQLite batch delay", "- id: sqlite\n  name: '@deepseek-ai/dsh-session-persistence-sqlite'\n  config: {path: ':memory:', writeBatchMaxDelayMs: 0}\n", "must be between 1 and 2147483647"},
 		{"storage service", "- id: sqlite\n  name: '@deepseek-ai/dsh-storage-sqlite'\n  config: {path: ':memory:'}\n", "require an enabled"},
 		{"storage route", "- id: storage\n  name: '@deepseek-ai/dsh-storage'\n- id: domain\n  name: '@deepseek-ai/dsh-storage-domain'\n  config: {backend: sqlite}\n", "is not mounted"},
 		{"HTTP limits", "- id: fetch\n  name: '@deepseek-ai/dsh-web-fetch-http'\n  config: {timeoutMs: 0}\n", "must be positive"},

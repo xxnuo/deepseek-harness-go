@@ -279,7 +279,7 @@ func (c *sessionTelemetryCoordinator) captureEvent(session *Session, event Event
 	}
 	if c.mode == SessionTelemetryModeFeedbackOnly {
 		if event.Type == "feedback/record" {
-			c.captureSession(session, event.Seq)
+			c.captureSession(session, int(event.Seq))
 		}
 		return
 	}
@@ -299,10 +299,10 @@ func (c *sessionTelemetryCoordinator) captureSession(session *Session, throughSe
 	}
 	var errs []error
 	for _, event := range events {
-		if event.Seq > throughSeq {
+		if int(event.Seq) > throughSeq {
 			break
 		}
-		if event.Seq <= cursor {
+		if int(event.Seq) <= cursor {
 			c.trackChunkLocked(header.ID, event)
 			continue
 		}
@@ -374,7 +374,7 @@ func (c *sessionTelemetryCoordinator) captureEventLocked(header SessionHeader, e
 	if err := safeSessionTelemetryEmit(c.sink, context.Background(), record); err != nil {
 		return fmt.Errorf("telemetry: emit event %s/%d: %w", event.Type, event.Seq, err)
 	}
-	c.cursor[header.ID] = event.Seq
+	c.cursor[header.ID] = int(event.Seq)
 	return nil
 }
 

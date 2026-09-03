@@ -51,7 +51,7 @@ func TestSettingsRegistryMergeRevisionAndRootMutation(t *testing.T) {
 	}
 
 	_, conflict := e.settingsUpdate("ui-onboarding", map[string]any{"x": true}, intPtr(0), false)
-	if conflict == nil || conflict.Code != "settings-conflict" {
+	if conflict == nil || conflict.Code != "settings/conflict" {
 		t.Fatalf("conflict = %#v", conflict)
 	}
 	details := conflict.Details.(map[string]any)
@@ -71,7 +71,7 @@ func TestSettingsRegistryMergeRevisionAndRootMutation(t *testing.T) {
 	}
 
 	_, rejected := e.settingsUpdate("not-registered", map[string]any{}, nil, false)
-	if rejected == nil || rejected.Code != "settings-rejected" {
+	if rejected == nil || rejected.Code != "settings/rejected" {
 		t.Fatalf("unknown namespace error = %#v", rejected)
 	}
 }
@@ -105,7 +105,7 @@ func TestClientHostSettingsSchemasDefaultsAndValidation(t *testing.T) {
 		"ui-onboarding":   {"welcomeNoticeVersion": true},
 		"ui-theme":        {"preference": "sepia"},
 	} {
-		if _, rpcErr := e.settingsUpdate(ns, patch, nil, false); rpcErr == nil || rpcErr.Code != "settings-rejected" {
+		if _, rpcErr := e.settingsUpdate(ns, patch, nil, false); rpcErr == nil || rpcErr.Code != "settings/rejected" {
 			t.Fatalf("%s invalid write = %#v", ns, rpcErr)
 		}
 	}
@@ -196,7 +196,7 @@ func TestPermissionSettingsDriveOnlyFutureSessions(t *testing.T) {
 
 	if _, rejected := e.settingsMutate("permission", []any{map[string]any{
 		"op": "set", "path": []any{"defaultPreset"}, "value": "unknown",
-	}}, nil); rejected == nil || rejected.Code != "settings-rejected" {
+	}}, nil); rejected == nil || rejected.Code != "settings/rejected" {
 		t.Fatalf("invalid permission default = %#v", rejected)
 	}
 }
@@ -322,7 +322,7 @@ func TestCredentialLaunchEnvironmentPrecedence(t *testing.T) {
 	if value, source, ok := e.resolveCredential(ref); !ok || value != "process" || source != "env" {
 		t.Fatalf("process credential = %q, %q, %v", value, source, ok)
 	}
-	if rpcErr := e.setCredential(ref, "blocked"); rpcErr == nil || rpcErr.Code != "credential-rejected" {
+	if rpcErr := e.setCredential(ref, "blocked"); rpcErr == nil || rpcErr.Code != "credential/rejected" {
 		t.Fatalf("process-shadowed write = %#v", rpcErr)
 	}
 }
@@ -594,7 +594,7 @@ func TestCredentialsRejectInvalidWirePayload(t *testing.T) {
 		t.Fatalf("status = %d", status)
 	}
 	result := rpcResult(t, envelope)
-	if result["ok"] != false || result["error"].(map[string]any)["code"] != "bad-request" {
+	if result["ok"] != false || result["error"].(map[string]any)["code"] != "gateway/bad-request" {
 		t.Fatalf("invalid credentials response = %#v", result)
 	}
 }

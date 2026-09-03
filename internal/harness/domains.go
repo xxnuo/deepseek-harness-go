@@ -109,11 +109,12 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 		}
 	}
 	if strings.TrimSpace(baseURL) != "" {
-		if apiKey == "" && ns == piAISettingsNamespace && providerID != "" {
+		var configured *managedPiAIProvider
+		if ns == piAISettingsNamespace && providerID != "" {
 			e.mu.RLock()
-			configured := e.piAIProviders[providerID]
+			configured = e.piAIProviders[providerID]
 			e.mu.RUnlock()
-			if configured != nil && configured.profile.apiKeyEnv != "" {
+			if apiKey == "" && configured != nil && configured.profile.apiKeyEnv != "" {
 				var credentialErr error
 				apiKey, credentialErr = e.resolvePiAICredential(providerID, configured.profile.apiKeyEnv)
 				if credentialErr != nil {
@@ -122,6 +123,9 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 			}
 		}
 		probe := NewOpenAIProvider(providerID, baseURL, apiKey, "")
+		if configured != nil {
+			probe.headers = clonePIAIHeaders(configured.profile.headers)
+		}
 		models, err := probe.Models(ctx)
 		if err != nil {
 			return nil, rpcError("model-discovery-failed", err.Error(), map[string]any{"settingsNs": ns, "baseURL": baseURL})
@@ -249,7 +253,7 @@ func (e *Engine) RenameWorkspace(id, title string) (Workspace, error) {
 		return Workspace{}, errors.New("workspace-not-found")
 	}
 	for otherID, other := range e.workspaces {
-		if otherID != id && strings.EqualFold(other.Title, title) {
+		if otherID != id && other.Title == title {
 			e.mu.Unlock()
 			return Workspace{}, errors.New("workspace-name-conflict")
 		}

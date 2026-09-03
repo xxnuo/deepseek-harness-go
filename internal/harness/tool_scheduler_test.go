@@ -351,7 +351,7 @@ func TestToolSchedulerCancellationDrainsAndSynthesizesSkippedCalls(t *testing.T)
 		case "tool/call":
 			data, _ := event.Data.(map[string]any)
 			callID := stringValue(data["callId"])
-			callSeqs[callID] = event.Seq
+			callSeqs[callID] = int(event.Seq)
 			callOrder = append(callOrder, callID)
 		case "tool/result":
 			callID := toolResultCallID(event)

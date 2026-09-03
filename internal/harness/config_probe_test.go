@@ -46,6 +46,60 @@ func TestDiscoverModelsUsesDraftEndpointAndDoesNotEchoKey(t *testing.T) {
 	}
 }
 
+func TestDiscoverModelsInheritsProfileHeadersAndCredential(t *testing.T) {
+	t.Setenv("DISCOVERY_PROFILE_KEY", "stored-secret")
+	requests := make(chan http.Header, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Header.Clone()
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"custom-model"}]}`))
+	}))
+	defer server.Close()
+	e := newIntegrationEngine(t)
+	e.mu.Lock()
+	e.piAIProviders["custom"] = &managedPiAIProvider{engine: e, profile: piAIProviderProfile{
+		route: "custom", apiKeyEnv: "DISCOVERY_PROFILE_KEY",
+		headers: map[string]string{"X-Profile": "configured", "Authorization": "Bearer profile-value"},
+	}}
+	e.mu.Unlock()
+
+	for _, test := range []struct {
+		name, draftKey, wantAuth string
+	}{
+		{name: "stored credential", wantAuth: "Bearer stored-secret"},
+		{name: "draft credential wins", draftKey: "draft-secret", wantAuth: "Bearer draft-secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, rpcErr := e.discoverModels(t.Context(), map[string]any{
+				"settingsNs": "llm-pi-ai", "provider": "custom",
+				"baseURL": server.URL, "apiKey": test.draftKey,
+			})
+			if rpcErr != nil {
+				t.Fatal(rpcErr)
+			}
+			header := <-requests
+			if header.Get("X-Profile") != "configured" || header.Get("Authorization") != test.wantAuth {
+				t.Fatalf("discovery headers = %#v", header)
+			}
+		})
+	}
+}
+
+func TestPiAIProfileRejectsInvalidHTTPHeaders(t *testing.T) {
+	for _, headers := range []map[string]any{
+		{"Bad Header": "value"},
+		{"X-Test": "value\nsmuggled"},
+	} {
+		_, err := resolvePiAIProfile("custom", map[string]any{
+			"api": "openai-completions", "baseURL": "https://example.invalid/v1",
+			"headers": headers, "models": []any{map[string]any{"id": "custom-model"}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid HTTP header") {
+			t.Fatalf("resolvePiAIProfile(%#v) = %v", headers, err)
+		}
+	}
+}
+
 func TestDiscoverModelsSupportsOpenAIResponsesListing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {

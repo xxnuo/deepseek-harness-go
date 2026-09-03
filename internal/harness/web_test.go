@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -310,6 +311,9 @@ func TestDeepSeekWebSearchMissingCredentialIsExecutionError(t *testing.T) {
 	if !ok || webErr.Code != "WEB_PROVIDER_CREDENTIAL_MISSING" || !strings.Contains(webErr.Message, "web Models page") {
 		t.Fatalf("missing credential error = %#v", err)
 	}
+	if strings.Contains(webErr.Message, "Search endpoint configuration") {
+		t.Fatalf("pre-dispatch credential error included endpoint recovery guidance: %q", webErr.Message)
+	}
 }
 
 func TestDeepSeekWebSearchProviderErrorsAndRequestEvent(t *testing.T) {
@@ -346,6 +350,11 @@ func TestDeepSeekWebSearchProviderErrorsAndRequestEvent(t *testing.T) {
 			webErr, ok := err.(*WebError)
 			if !ok || webErr.Code != test.wantCode || test.wantErrSub != "" && !strings.Contains(webErr.Message, test.wantErrSub) {
 				t.Fatalf("search error = %#v", err)
+			}
+			for _, want := range []string{strconv.Quote(server.URL + "/messages"), "Settings > Plugins > Plugin configuration > Web search", "DEEPSEEK_SEARCH_BASE_URL", "web-search-deepseek.baseURL"} {
+				if !strings.Contains(webErr.Message, want) {
+					t.Fatalf("search error omits endpoint recovery %q: %q", want, webErr.Message)
+				}
 			}
 		})
 	}
@@ -702,7 +711,7 @@ func TestHostWebProviderWaitsForActivePluginFiber(t *testing.T) {
 	if settingsDescribeContains(e, "web-search-deepseek") {
 		t.Fatal("pending provider exposed its settings namespace")
 	}
-	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "pending"}, nil, false); rpcErr == nil || rpcErr.Code != "settings-rejected" {
+	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "pending"}, nil, false); rpcErr == nil || rpcErr.Code != "settings/rejected" {
 		t.Fatalf("pending provider settings update = %#v", rpcErr)
 	}
 	active := "active"
@@ -745,7 +754,7 @@ func TestDeepSeekWebSettingsNamespaceFollowsPluginLifecycle(t *testing.T) {
 	if settingsDescribeContains(e, "web-search-deepseek") {
 		t.Fatal("disposed DeepSeek provider kept its settings namespace visible")
 	}
-	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "hidden"}, nil, false); rpcErr == nil || rpcErr.Code != "settings-rejected" {
+	if _, rpcErr := e.settingsUpdate("web-search-deepseek", map[string]any{"model": "hidden"}, nil, false); rpcErr == nil || rpcErr.Code != "settings/rejected" {
 		t.Fatalf("disposed provider settings update = %#v", rpcErr)
 	}
 	next = e.Config()

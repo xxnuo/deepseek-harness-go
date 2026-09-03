@@ -187,7 +187,7 @@ func collectRuntimeAssets(upstream string) ([]asset, error) {
 	for _, tree := range []string{
 		"apps/web/dist",
 		"packages/preset/agent-presets/presets",
-		"packages/code-runtime/code-runtime-python/py",
+		"packages/experimental/code-runtime-python/py",
 		"packages/skill/skill-badge/assets",
 	} {
 		if err := addTree(tree); err != nil {

@@ -111,14 +111,14 @@ func dynamicCordisAgentValidateOptions(vm *goja.Runtime, value goja.Value, resum
 	if resume {
 		dynamicCordisAgentRejectUnknownFields(vm, value, "agents resume options", "resumeSessionId", "agentOptions", "setup", "signal")
 	} else {
-		dynamicCordisAgentRejectUnknownFields(vm, value, "agents create options", "sessionId", "meta", "seed", "agentOptions", "setup", "signal")
+		dynamicCordisAgentRejectUnknownFields(vm, value, "agents create options", "sessionId", "meta", "inheritedEventCount", "seed", "agentOptions", "setup", "signal")
 	}
 	object, ok := value.(*goja.Object)
 	if !ok {
 		return
 	}
 	if meta := object.Get("meta"); meta != nil && !goja.IsUndefined(meta) && !goja.IsNull(meta) {
-		dynamicCordisAgentRejectUnknownFields(vm, meta, "agents create options meta", "cwd", "parentSession", "seedLength", "origin", "delegationDepth", "agentPreset")
+		dynamicCordisAgentRejectUnknownFields(vm, meta, "agents create options meta", "cwd", "parentSession", "isSeeded", "origin", "delegationDepth", "agentPreset")
 	}
 	if options := object.Get("agentOptions"); options != nil && !goja.IsUndefined(options) && !goja.IsNull(options) {
 		dynamicCordisAgentRejectUnknownFields(vm, options, "agents create options agentOptions", "provider", "model", "maxTokens")
@@ -1139,12 +1139,13 @@ func (e *Engine) dynamicCordisAgentsFacade(run *dynamicCordisRun) *goja.Object {
 }
 
 type dynamicCordisAgentCreationInput struct {
-	id      string
-	meta    goja.Value
-	seed    goja.Value
-	signal  *goja.Object
-	setup   goja.Callable
-	options struct {
+	id                  string
+	meta                goja.Value
+	inheritedEventCount goja.Value
+	seed                goja.Value
+	signal              *goja.Object
+	setup               goja.Callable
+	options             struct {
 		Provider  string `json:"provider"`
 		Model     string `json:"model"`
 		MaxTokens *int   `json:"maxTokens"`
@@ -1190,6 +1191,7 @@ func dynamicCordisAgentCreationOptions(vm *goja.Runtime, value goja.Value, resum
 	}
 	if !resume {
 		input.meta = object.Get("meta")
+		input.inheritedEventCount = object.Get("inheritedEventCount")
 		input.seed = object.Get("seed")
 	}
 	return input
@@ -1238,6 +1240,7 @@ func (e *Engine) dynamicCordisPrepareAgentSession(run *dynamicCordisRun, input d
 				return nil, fmt.Errorf("agent %q is already live", input.id)
 			}
 			inspection.Meta = existing.Header
+			inspection.InheritedEventCount = existing.InheritedEventCount
 			inspection.Events = append([]Event(nil), existing.Events...)
 			existing.mu.Unlock()
 		} else {
@@ -1255,11 +1258,15 @@ func (e *Engine) dynamicCordisPrepareAgentSession(run *dynamicCordisRun, input d
 			}
 		}
 		_ = options.Set("meta", inspection.Meta)
+		_ = options.Set("inheritedEventCount", inspection.InheritedEventCount)
 		_ = options.Set("seed", inspection.Events)
 		_ = options.Set("seedSource", "persistence")
 	} else {
 		if input.meta != nil && !goja.IsUndefined(input.meta) {
 			_ = options.Set("meta", input.meta)
+		}
+		if input.inheritedEventCount != nil && !goja.IsUndefined(input.inheritedEventCount) {
+			_ = options.Set("inheritedEventCount", input.inheritedEventCount)
 		}
 		if input.seed != nil && !goja.IsUndefined(input.seed) {
 			_ = options.Set("seed", input.seed)

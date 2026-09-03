@@ -243,11 +243,11 @@ func TestExitPlanModeApprovalAppliesOnNextProductionStep(t *testing.T) {
 		if event.Type == "plan/mode" {
 			data, _ := event.Data.(map[string]any)
 			if data["active"] == false {
-				planSeq = event.Seq
+				planSeq = int(event.Seq)
 			}
 		}
-		if planSeq >= 0 && event.Type == "step/start" && event.Seq > planSeq {
-			nextStepSeq = event.Seq
+		if planSeq >= 0 && event.Type == "step/start" && int(event.Seq) > planSeq {
+			nextStepSeq = int(event.Seq)
 			break
 		}
 	}

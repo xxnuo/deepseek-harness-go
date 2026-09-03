@@ -262,6 +262,36 @@ func (e *Engine) ensurePresetRuntime(preset string) (*presetRuntimeGeneration, e
 }
 
 func compilePresetPluginInventory(content, moduleBase, barePackageBase string) ([]PluginInventoryEntry, error) {
+	rows, err := compilePresetCompositionRows(content, true, true)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]PluginInventoryEntry, 0, len(rows))
+	for _, row := range rows {
+		enabled, _ := row.enabled.(bool)
+		entries = append(entries, PluginInventoryEntry{
+			EntryID: row.entryID, ModuleName: row.moduleName, ModuleBase: moduleBase,
+			BarePackageBase: barePackageBase, Enabled: enabled, FiberPhase: row.fiberPhase,
+			condition: row.condition, conditional: row.enabled == "conditional",
+		})
+	}
+	return entries, nil
+}
+
+// presetCompositionRow is the wire-neutral form shared by mounted and file
+// inventory projections. Empty entryID becomes JSON null at the boundary.
+type presetCompositionRow struct {
+	entryID    string
+	moduleName string
+	enabled    any
+	condition  string
+	fiberPhase *string
+}
+
+// compilePresetCompositionRows parses the Loader entry-list dialect once.
+// prefixIDs matches mounted Loader ids; file projections pass false because a
+// cold composition reports the ids declared by the file itself.
+func compilePresetCompositionRows(content string, prefixIDs, live bool) ([]presetCompositionRow, error) {
 	var document yaml.Node
 	if err := yaml.Unmarshal([]byte(content), &document); err != nil {
 		return nil, fmt.Errorf("agent-preset-invalid: %w", err)
@@ -269,30 +299,34 @@ func compilePresetPluginInventory(content, moduleBase, barePackageBase string) (
 	if len(document.Content) != 1 || document.Content[0].Kind != yaml.SequenceNode {
 		return nil, errors.New("agent-preset-invalid: composition must be a YAML array")
 	}
-	entries := make([]PluginInventoryEntry, 0)
-	var walk func(*yaml.Node, bool, string)
-	walk = func(node *yaml.Node, inheritedDisabled bool, parentID string) {
+	entries := make([]presetCompositionRow, 0)
+	var walk func(*yaml.Node, int, string)
+	walk = func(node *yaml.Node, inheritedDisabled int, parentID string) {
 		if node == nil || node.Kind != yaml.MappingNode {
 			return
 		}
 		id := yamlScalar(yamlMapValue(node, "id"))
 		entryID := id
-		if parentID != "" && id != "" {
+		if prefixIDs && parentID != "" && id != "" {
 			entryID = parentID + ":" + id
 		}
 		name := yamlScalar(yamlMapValue(node, "name"))
 		group := yamlNodeBool(yamlMapValue(node, "group"), false)
-		disabled := inheritedDisabled || presetRowDisabled(yamlMapValue(node, "disabled"))
+		disabled, condition := presetDisabledState(yamlMapValue(node, "disabled"))
+		disabled = combinePresetDisabled(inheritedDisabled, disabled)
 		if name != "" && !group {
 			var phase *string
-			if !disabled {
+			if live && disabled == 0 {
 				active := "active"
 				phase = &active
 			}
-			entries = append(entries, PluginInventoryEntry{
-				EntryID: entryID, ModuleName: name, ModuleBase: moduleBase,
-				BarePackageBase: barePackageBase, Enabled: !disabled, FiberPhase: phase,
-			})
+			enabled := any(true)
+			if disabled == 1 {
+				enabled = false
+			} else if disabled == 2 {
+				enabled = "conditional"
+			}
+			entries = append(entries, presetCompositionRow{entryID: entryID, moduleName: name, enabled: enabled, condition: condition, fiberPhase: phase})
 		}
 		if group {
 			children := yamlMapValue(node, "config")
@@ -304,9 +338,47 @@ func compilePresetPluginInventory(content, moduleBase, barePackageBase string) (
 		}
 	}
 	for _, node := range document.Content[0].Content {
-		walk(node, false, "")
+		walk(node, 0, "")
 	}
 	return entries, nil
+}
+
+// disabled state: 0 enabled, 1 disabled, 2 conditional (unresolved !!js).
+func presetDisabledState(node *yaml.Node) (int, string) {
+	if node == nil {
+		return 0, ""
+	}
+	if node.Tag == "!!js" || node.Tag == "tag:yaml.org,2002:js" {
+		expression := strings.TrimSpace(node.Value)
+		switch expression {
+		case "process.platform === 'win32'", `process.platform === "win32"`:
+			if runtime.GOOS == "windows" {
+				return 1, expression
+			}
+			return 0, expression
+		case "process.platform !== 'win32'", `process.platform !== "win32"`:
+			if runtime.GOOS != "windows" {
+				return 1, expression
+			}
+			return 0, expression
+		default:
+			return 2, expression
+		}
+	}
+	if yamlNodeBool(node, false) {
+		return 1, ""
+	}
+	return 0, ""
+}
+
+func combinePresetDisabled(outer, own int) int {
+	if outer == 1 || own == 1 {
+		return 1
+	}
+	if outer == 2 || own == 2 {
+		return 2
+	}
+	return 0
 }
 
 func (e *Engine) compilePresetRuntime(row presetRecord) (agentRuntime, error) {
@@ -848,8 +920,6 @@ func presetToolNames(plugin string, config *yaml.Node) []string {
 		return []string{"send_message", "interrupt_agent"}
 	case "@deepseek-ai/dsh-tool-subagent-control/list-agents":
 		return []string{"list_agents"}
-	case "@deepseek-ai/dsh-tool-subagent-report":
-		return []string{"report"}
 	case "@deepseek-ai/dsh-experimental-tool-agent-team":
 		return []string{
 			"spawn_teammate", "send_message", "followup_task", "list_agents", "wait_agent", "interrupt_agent",
@@ -1258,8 +1328,6 @@ func (e *Engine) resolvedSystemPromptSections(s *Session, selection ModelSelecti
 func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelection, agent agentRuntime, caller *dynamicCordisRun, assemblyContext map[string]any) ([]resolvedPromptSection, map[string]any, error) {
 	s.mu.Lock()
 	cwd, sessionID := s.Header.CWD, s.Header.ID
-	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached &&
-		s.toolRestriction.allows("report")
 	s.mu.Unlock()
 	if assemblyContext == nil {
 		assemblyContext = map[string]any{"provider": selection.Provider, "model": selection.Model, "cwd": cwd}
@@ -1305,9 +1373,6 @@ func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelecti
 	}
 	if agent.toolNames["ralph"] {
 		add("tool:ralph", 101, "Use the ralph tool ONLY when the direct human explicitly asks for a Ralph loop or fresh-agent iterative execution. Completion and blockers are worker reports, not independent evaluation.")
-	}
-	if reportVisible && (agent.toolNames == nil || agent.toolNames["report"]) {
-		add("tool:report", 117, "Deliver your result with the report tool before you finish: call it once with a self-contained answer. The agent that started you shares your workspace but does not automatically receive your transcript, tool output, or reasoning. Report earlier as well whenever a partial finding changes what that agent should do next; reporting never ends your turn.")
 	}
 	webSearchVisible := e.hasRegisteredTool("web_search") && (agent.toolNames == nil || agent.toolNames["web_search"]) && (agent.webTools == nil || agent.webTools.SearchEnabled)
 	webFetchVisible := e.hasRegisteredTool("web_fetch") && (agent.toolNames == nil || agent.toolNames["web_fetch"]) && (agent.webTools == nil || agent.webTools.FetchEnabled)
@@ -1645,7 +1710,7 @@ func (e *Engine) skillInvocationMessages(s *Session, turn int) []ChatMessage {
 		}
 		data, _ := events[index].Data.(map[string]any)
 		if eventInt(data["turn"]) == turn {
-			start = events[index].Seq
+			start = int(events[index].Seq)
 			break
 		}
 	}
@@ -1665,7 +1730,7 @@ func (e *Engine) skillInvocationMessages(s *Session, turn int) []ChatMessage {
 	seen := map[string]bool{}
 	var out []ChatMessage
 	for _, event := range events {
-		if event.Seq <= start || event.Type != "user/message" || eventSourceKind(event.Data) != "user" {
+		if int(event.Seq) <= start || event.Type != "user/message" || eventSourceKind(event.Data) != "user" {
 			continue
 		}
 		data, _ := event.Data.(map[string]any)

@@ -471,10 +471,10 @@ func requireInvariantOpenStep(trace sessionInvariantTrace, event Event) error {
 func validateSessionRelations(events []Event) error {
 	trace := newSessionInvariantTrace()
 	for _, event := range events {
-		if event.Seq <= trace.lastSeq {
+		if int(event.Seq) <= trace.lastSeq {
 			return fmt.Errorf("seq must strictly increase: saw %d after %d", event.Seq, trace.lastSeq)
 		}
-		trace.lastSeq = event.Seq
+		trace.lastSeq = int(event.Seq)
 		switch event.Type {
 		case "turn/start":
 			turn, ok := eventFieldInt(event.Data, "turn")
@@ -767,7 +767,7 @@ func installGoalInvariant(scope *InvariantScope, fail InvariantFailure) error {
 		if _, _, err := foldGoalState(events); err != nil {
 			seq := -1
 			if len(events) > 0 {
-				seq = events[len(events)-1].Seq
+				seq = int(events[len(events)-1].Seq)
 			}
 			return fail(fmt.Sprintf("session event %d violates the durable goal stream: %s", seq, err))
 		}
@@ -781,7 +781,7 @@ func installTeamInvariant(scope *InvariantScope, fail InvariantFailure) error {
 		if _, err := foldTeam(header.ID, events); err != nil {
 			seq := -1
 			if len(events) > 0 {
-				seq = events[len(events)-1].Seq
+				seq = int(events[len(events)-1].Seq)
 			}
 			return fail(fmt.Sprintf("session event %d violates the Agent Teams stream: %s", seq, err))
 		}

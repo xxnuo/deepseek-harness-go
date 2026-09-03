@@ -108,12 +108,6 @@ const DefaultHookTimeout = core.DefaultHookTimeout
 
 const DefaultMaxRequestImageBytes = core.DefaultMaxRequestImageBytes
 
-const DefaultSQLiteBusyTimeout = core.DefaultSQLiteBusyTimeout
-
-const DefaultSQLitePreparedSessionCacheSize = core.DefaultSQLitePreparedSessionCacheSize
-
-const DefaultSQLiteWriteBatchMaxDelay = core.DefaultSQLiteWriteBatchMaxDelay
-
 const DefaultSessionReferenceBytes = core.DefaultSessionReferenceBytes
 
 const DefaultSessionReferenceCandidates = core.DefaultSessionReferenceCandidates
@@ -170,10 +164,6 @@ const MCPTransportStdio = core.MCPTransportStdio
 
 const MCPTransportStreamableHTTP = core.MCPTransportStreamableHTTP
 
-const MaxSQLiteBusyTimeout = core.MaxSQLiteBusyTimeout
-
-const MaxSQLiteWriteBatchDelay = core.MaxSQLiteWriteBatchDelay
-
 const MaxSessionReferences = core.MaxSessionReferences
 
 const OffloadedImageText = core.OffloadedImageText
@@ -209,10 +199,6 @@ const SessionReferenceScheme = core.SessionReferenceScheme
 const SessionReferenceSelfReference = core.SessionReferenceSelfReference
 
 const SessionReferenceTooMany = core.SessionReferenceTooMany
-
-const SessionSQLiteApplicationID = core.SessionSQLiteApplicationID
-
-const SessionSQLiteSchemaVersion = core.SessionSQLiteSchemaVersion
 
 const SessionTelemetryChannelLedger = core.SessionTelemetryChannelLedger
 
@@ -267,10 +253,6 @@ const SubagentError = core.SubagentError
 const SubagentMaxTokens = core.SubagentMaxTokens
 
 const SubagentRefusal = core.SubagentRefusal
-
-const SubagentReportNextStep = core.SubagentReportNextStep
-
-const SubagentReportQuiet = core.SubagentReportQuiet
 
 const TerminalShellDialectBash = core.TerminalShellDialectBash
 
@@ -395,8 +377,6 @@ type Completion = core.Completion
 type Config = core.Config
 
 type ContentBlock = core.ContentBlock
-
-type ContinuableSubagentSetup = core.ContinuableSubagentSetup
 
 type CordisInspectMethodManifest = core.CordisInspectMethodManifest
 
@@ -790,10 +770,6 @@ type SDKServerOptions = core.SDKServerOptions
 
 type SQLiteJournalMode = core.SQLiteJournalMode
 
-type SQLiteSessionStore = core.SQLiteSessionStore
-
-type SQLiteSessionStoreOptions = core.SQLiteSessionStoreOptions
-
 type SQLiteStorageBackend = core.SQLiteStorageBackend
 
 type SQLiteStorageConfig = core.SQLiteStorageConfig
@@ -815,6 +791,8 @@ type SessionInspection = core.SessionInspection
 type SessionInvariant = core.SessionInvariant
 
 type SessionLocation = core.SessionLocation
+
+type SessionLogOffset = core.SessionLogOffset
 
 type SessionPersistenceFlusher = core.SessionPersistenceFlusher
 
@@ -841,6 +819,8 @@ type SessionReferenceErrorCode = core.SessionReferenceErrorCode
 type SessionReferenceInput = core.SessionReferenceInput
 
 type SessionReferenceMentionCandidate = core.SessionReferenceMentionCandidate
+
+type SessionSeq = core.SessionSeq
 
 type SessionStore = core.SessionStore
 
@@ -1296,14 +1276,6 @@ func NewPerplexitySearchProvider(options PerplexitySearchProviderOptions) *Perpl
 	return core.NewPerplexitySearchProvider(options)
 }
 
-func NewSQLiteSessionStore(path string, journalMode SQLiteJournalMode) (*SQLiteSessionStore, error) {
-	return core.NewSQLiteSessionStore(path, journalMode)
-}
-
-func NewSQLiteSessionStoreWithOptions(options SQLiteSessionStoreOptions) (*SQLiteSessionStore, error) {
-	return core.NewSQLiteSessionStoreWithOptions(options)
-}
-
 func NewSQLiteStorageBackend(path string, journalMode SQLiteJournalMode) (*SQLiteStorageBackend, error) {
 	return core.NewSQLiteStorageBackend(path, journalMode)
 }
@@ -1542,10 +1514,6 @@ func WithStorageRuntime(v StorageRuntimeConfig) Option {
 
 func WithSubagentProviders(v ...SubagentProvider) Option {
 	return core.WithSubagentProviders(v...)
-}
-
-func WithSubagentReportDelivery(v string) Option {
-	return core.WithSubagentReportDelivery(v)
 }
 
 func WithSubagentTools(v ...SubagentToolConfig) Option {

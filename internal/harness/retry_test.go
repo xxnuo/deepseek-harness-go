@@ -183,7 +183,7 @@ func TestRetryRecoversWithinOneStepAndLinksOnlySuccessfulChunks(t *testing.T) {
 		data, _ := event.Data.(map[string]any)
 		chunk, _ := data["chunk"].(map[string]any)
 		text, _ := chunk["text"].(string)
-		if text == "discarded" && containsInt(refs, event.Seq) {
+		if text == "discarded" && containsInt(refs, int(event.Seq)) {
 			t.Fatalf("failed chunk linked to assistant message: %#v", event)
 		}
 	}

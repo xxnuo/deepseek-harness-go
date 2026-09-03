@@ -27,8 +27,9 @@ type SessionPersistenceSnapshot struct {
 }
 
 type SessionInspection struct {
-	Meta   SessionHeader
-	Events []Event
+	Meta                SessionHeader
+	InheritedEventCount SessionLogOffset
+	Events              []Event
 }
 
 type SessionLocation struct {
@@ -37,20 +38,21 @@ type SessionLocation struct {
 }
 
 type SessionRawArtifact struct {
-	Meta     SessionHeader
-	Filename string
-	Content  string
+	Meta                SessionHeader
+	InheritedEventCount SessionLogOffset
+	Filename            string
+	Content             string
 }
 
 type SessionStore interface {
 	Locate(SessionHeader) (SessionLocation, bool)
 	SupportsRawArtifacts() bool
 	ReadRaw(context.Context, string) (SessionRawArtifact, bool, error)
-	Create(context.Context, SessionHeader) error
+	Create(context.Context, SessionHeader, SessionLogOffset) error
 	Append(context.Context, string, []Event) error
 	Load(context.Context, string) (SessionInspection, error)
 	Inspect(context.Context, string) (SessionInspection, error)
-	ReadFrom(context.Context, string, int) (SessionInspection, error)
+	ReadFrom(context.Context, string, SessionLogOffset) (SessionInspection, error)
 	List(context.Context) ([]SessionHeader, error)
 	ListSnapshots(context.Context) ([]SessionPersistenceSnapshot, error)
 	Close() error
@@ -86,9 +88,10 @@ type JSONLSessionStore struct {
 }
 
 type jsonlSessionState struct {
-	meta         SessionHeader
-	cursor       int
-	materialized bool
+	meta                SessionHeader
+	inheritedEventCount SessionLogOffset
+	cursor              int
+	materialized        bool
 }
 
 func NewJSONLSessionStore(root string) (*JSONLSessionStore, error) {
@@ -129,9 +132,22 @@ func (s *JSONLSessionStore) Flush(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader) error {
+func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) error {
+	if meta.SeedLength != 0 && inheritedEventCount == 0 {
+		inheritedEventCount = SessionLogOffset(meta.SeedLength)
+	}
+	if inheritedEventCount != 0 {
+		meta.IsSeeded = true
+	}
+	meta.SeedLength = int(inheritedEventCount)
 	if err := validateSessionHeader(meta); err != nil {
 		return err
+	}
+	if err := validateSessionLogOffset(inheritedEventCount); err != nil {
+		return err
+	}
+	if !meta.IsSeeded && inheritedEventCount != 0 {
+		return errors.New("unseeded session cannot have inherited events")
 	}
 	unlock, err := s.begin(ctx, meta.ID)
 	if err != nil {
@@ -148,7 +164,7 @@ func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader) erro
 	if _, exists := s.states[meta.ID]; exists {
 		return fmt.Errorf("session %q is already registered in persistence", meta.ID)
 	}
-	s.states[meta.ID] = jsonlSessionState{meta: meta}
+	s.states[meta.ID] = jsonlSessionState{meta: meta, inheritedEventCount: inheritedEventCount}
 	return nil
 }
 
@@ -193,7 +209,7 @@ func (s *JSONLSessionStore) Append(ctx context.Context, id string, events []Even
 		}
 		if !state.materialized {
 			path := s.pathFor(state.meta)
-			if err := s.materialize(path, state.meta, events); err != nil {
+			if err := s.materialize(path, state.meta, state.inheritedEventCount, events); err != nil {
 				return err
 			}
 			state.materialized = true
@@ -244,7 +260,7 @@ func (s *JSONLSessionStore) Append(ctx context.Context, id string, events []Even
 		return err
 	}
 	s.mu.Lock()
-	s.states[id] = jsonlSessionState{meta: meta, cursor: expected + len(events), materialized: true}
+	s.states[id] = jsonlSessionState{meta: meta, inheritedEventCount: SessionLogOffset(meta.SeedLength), cursor: expected + len(events), materialized: true}
 	s.mu.Unlock()
 	return nil
 }
@@ -274,13 +290,13 @@ func (s *JSONLSessionStore) Load(ctx context.Context, id string) (SessionInspect
 		if scan.committedBytes != len(scan.raw) || len(closers) > 0 {
 			return SessionInspection{}, fmt.Errorf("cannot crash-repair live session %q", id)
 		}
-		return SessionInspection{Meta: scan.meta, Events: append([]Event(nil), scan.events...)}, nil
+		return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: append([]Event(nil), scan.events...)}, nil
 	}
 	if err := s.repair(path, scan, closers); err != nil {
 		return SessionInspection{}, err
 	}
 	events := append(append([]Event(nil), scan.events...), closers...)
-	return SessionInspection{Meta: scan.meta, Events: events}, nil
+	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: events}, nil
 }
 
 func (s *JSONLSessionStore) Inspect(ctx context.Context, id string) (SessionInspection, error) {
@@ -307,10 +323,10 @@ func (s *JSONLSessionStore) Inspect(ctx context.Context, id string) (SessionInsp
 	if !live || !state.materialized {
 		events = append(events, interruptedSessionClosers(scan.events)...)
 	}
-	return SessionInspection{Meta: scan.meta, Events: events}, nil
+	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: events}, nil
 }
 
-func (s *JSONLSessionStore) ReadFrom(ctx context.Context, id string, fromSeq int) (SessionInspection, error) {
+func (s *JSONLSessionStore) ReadFrom(ctx context.Context, id string, fromSeq SessionLogOffset) (SessionInspection, error) {
 	if fromSeq < 0 {
 		return SessionInspection{}, errors.New("fromSeq must be non-negative")
 	}
@@ -330,10 +346,10 @@ func (s *JSONLSessionStore) ReadFrom(ctx context.Context, id string, fromSeq int
 	if err != nil {
 		return SessionInspection{}, err
 	}
-	if fromSeq >= len(scan.events) {
-		return SessionInspection{Meta: scan.meta, Events: []Event{}}, nil
+	if int(fromSeq) >= len(scan.events) {
+		return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: []Event{}}, nil
 	}
-	return SessionInspection{Meta: scan.meta, Events: append([]Event(nil), scan.events[fromSeq:]...)}, nil
+	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: append([]Event(nil), scan.events[int(fromSeq):]...)}, nil
 }
 
 func (s *JSONLSessionStore) ReadRaw(ctx context.Context, id string) (SessionRawArtifact, bool, error) {
@@ -351,7 +367,8 @@ func (s *JSONLSessionStore) ReadRaw(ctx context.Context, id string) (SessionRawA
 		return SessionRawArtifact{}, false, err
 	}
 	return SessionRawArtifact{
-		Meta: scan.meta, Filename: "session.jsonl", Content: string(scan.raw[:scan.committedBytes]),
+		Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount,
+		Filename: "session.jsonl", Content: string(scan.raw[:scan.committedBytes]),
 	}, true, nil
 }
 
@@ -595,11 +612,11 @@ func SessionProjectKey(cwd string) string {
 	return "--" + slug + "--"
 }
 
-func (s *JSONLSessionStore) materialize(path string, meta SessionHeader, events []Event) error {
+func (s *JSONLSessionStore) materialize(path string, meta SessionHeader, inheritedEventCount SessionLogOffset, events []Event) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	header, err := marshalSessionHeader(meta)
+	header, err := marshalSessionHeader(meta, inheritedEventCount)
 	if err != nil {
 		return err
 	}
@@ -715,10 +732,11 @@ func rollbackJSONLAppend(path string, size int64, appendErr error) error {
 }
 
 type jsonlSessionScan struct {
-	meta           SessionHeader
-	events         []Event
-	raw            []byte
-	committedBytes int
+	meta                SessionHeader
+	inheritedEventCount SessionLogOffset
+	events              []Event
+	raw                 []byte
+	committedBytes      int
 }
 
 func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
@@ -773,7 +791,7 @@ func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
 		}
 		rowStart := len(events)
 		for _, event := range decoded {
-			if event.Seq != len(events) {
+			if int(event.Seq) != len(events) {
 				events = events[:rowStart]
 				issue = fmt.Errorf("corrupt session log: seq gap in committed region at line %d (expected %d, got %d)", line, len(events), event.Seq)
 				if containsTurnEnd {
@@ -791,7 +809,7 @@ func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
 	if _, err := foldSurfaceEvents(events, true); err != nil {
 		return jsonlSessionScan{}, err
 	}
-	return jsonlSessionScan{meta: meta, events: events, raw: data, committedBytes: committed}, nil
+	return jsonlSessionScan{meta: meta, inheritedEventCount: SessionLogOffset(meta.SeedLength), events: events, raw: data, committedBytes: committed}, nil
 }
 
 func readJSONLHeader(path string) (SessionHeader, bool, error) {
@@ -829,17 +847,22 @@ type sessionHeaderLine struct {
 	CreatedAt       int64  `json:"createdAt"`
 	CWD             string `json:"cwd,omitempty"`
 	ParentSession   string `json:"parentSession,omitempty"`
-	SeedLength      int    `json:"seedLength,omitempty"`
+	SeedLength      *int   `json:"seedLength,omitempty"`
 	Origin          string `json:"origin,omitempty"`
 	DelegationDepth int    `json:"delegationDepth"`
 	AgentPreset     string `json:"agentPreset,omitempty"`
 	Mode            string `json:"mode,omitempty"`
 }
 
-func marshalSessionHeader(meta SessionHeader) ([]byte, error) {
+func marshalSessionHeader(meta SessionHeader, inheritedEventCount SessionLogOffset) ([]byte, error) {
+	var seedLength *int
+	if meta.IsSeeded {
+		value := int(inheritedEventCount)
+		seedLength = &value
+	}
 	return json.Marshal(sessionHeaderLine{
 		Type: "session", Version: meta.Version, ID: meta.ID, CreatedAt: meta.CreatedAt,
-		CWD: meta.CWD, ParentSession: meta.ParentSession, SeedLength: meta.SeedLength,
+		CWD: meta.CWD, ParentSession: meta.ParentSession, SeedLength: seedLength,
 		Origin: meta.Origin, DelegationDepth: meta.DelegationDepth,
 		AgentPreset: meta.AgentPreset, Mode: meta.Mode,
 	})
@@ -858,8 +881,11 @@ func parseSessionHeader(line []byte) (SessionHeader, bool, error) {
 	}
 	meta := SessionHeader{
 		Version: header.Version, ID: header.ID, CreatedAt: header.CreatedAt, CWD: header.CWD,
-		ParentSession: header.ParentSession, SeedLength: header.SeedLength, Origin: header.Origin,
+		ParentSession: header.ParentSession, IsSeeded: header.SeedLength != nil, Origin: header.Origin,
 		DelegationDepth: header.DelegationDepth, AgentPreset: header.AgentPreset, Mode: header.Mode,
+	}
+	if header.SeedLength != nil {
+		meta.SeedLength = *header.SeedLength
 	}
 	if err := validateSessionHeader(meta); err != nil {
 		return SessionHeader{}, false, err
@@ -883,6 +909,9 @@ func validateSessionHeader(meta SessionHeader) error {
 	if meta.SeedLength < 0 || int64(meta.SeedLength) > maxJSONSafeInteger {
 		return errors.New("session seedLength must be a non-negative safe integer")
 	}
+	if !meta.IsSeeded && meta.SeedLength != 0 {
+		return errors.New("unseeded session cannot have inherited events")
+	}
 	if meta.Origin != "" && meta.Origin != "subagent" {
 		return fmt.Errorf("unsupported session origin %q", meta.Origin)
 	}
@@ -894,7 +923,7 @@ func validateSessionHeader(meta SessionHeader) error {
 
 func validateSessionEventBatch(events []Event, expected int) error {
 	for index, event := range events {
-		if event.Seq != expected+index {
+		if int(event.Seq) != expected+index {
 			return fmt.Errorf("session append expected seq %d, got %d", expected+index, event.Seq)
 		}
 		encoded, err := json.Marshal(event)
@@ -965,7 +994,7 @@ func interruptedSessionClosers(events []Event) []Event {
 		case "tool/call":
 			data, _ := event.Data.(map[string]any)
 			if call := pending[stringValue(data["callId"])]; call != nil {
-				call.callSeq, call.started = event.Seq, true
+				call.callSeq, call.started = int(event.Seq), true
 			}
 		case "tool/result":
 			source, _ := nestedMessage(event.Data)["source"].(map[string]any)

@@ -22,38 +22,6 @@ type SubagentToolConfig struct {
 	MaxDepth               *int
 }
 
-func subagentReportTool(e *Engine) Tool {
-	type input struct {
-		Output string `json:"output"`
-	}
-	return Tool{
-		Schema: ToolSchema{
-			Name:        "report",
-			Description: "Report selected content to the agent that started you. Reporting does not end your turn, and only your direct parent receives it.",
-			Parameters: objectSchema(map[string]any{
-				"output": map[string]any{"type": "string", "description": "Actionable content for your parent; summarize conclusions and reference relevant shared paths."},
-			}, "output"),
-			Output: objectSchema(map[string]any{"messageId": map[string]any{"type": "string"}}, "messageId"),
-		},
-		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
-			var in input
-			if err := decodeToolArguments(call, &in); err != nil {
-				return ToolResult{}, err
-			}
-			if err := ctx.Err(); err != nil {
-				return ToolResult{}, err
-			}
-			messageID, err := e.ReportFromSubagent(ctx, call.SessionID, []ContentBlock{{Type: "text", Text: in.Output}}, "")
-			if err != nil {
-				return ToolResult{}, err
-			}
-			result := textToolResult("report accepted by the agent that started you as message " + messageID)
-			result.Value = map[string]any{"messageId": messageID}
-			return result, nil
-		},
-	}
-}
-
 func subagentToolOutputSchema() map[string]any {
 	return map[string]any{"oneOf": []any{
 		objectSchema(map[string]any{"kind": map[string]any{"type": "string", "const": "background"}, "jobId": map[string]any{"type": "string"}}, "kind", "jobId"),

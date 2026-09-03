@@ -5,11 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-)
-
-const (
-	SubagentReportQuiet    = "quiet"
-	SubagentReportNextStep = "next-step"
+	"strings"
 )
 
 func (e *Engine) childFor(parentID, childID string) (*Session, *RPCError) {
@@ -289,49 +285,55 @@ func (e *Engine) beginSubagentDrain(session *Session) error {
 	return nil
 }
 
-// ReportFromSubagent delivers selected content from one resident continuable
-// child to its direct parent. next-step wakes an idle parent; quiet does not.
-func (e *Engine) ReportFromSubagent(ctx context.Context, childID string, content []ContentBlock, delivery string) (string, error) {
+// SendAdjacentAgentMessage steers a model-authored message across one exact
+// continuable parent-child edge. Direct children may be cold-resumed; a child
+// sender must be the resident activation and its direct parent must be live.
+func (e *Engine) SendAdjacentAgentMessage(ctx context.Context, senderID, targetID string, content []ContentBlock) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if delivery == "" {
-		delivery = e.cfg.SubagentReportDelivery
+	if senderID == "" || targetID == "" || senderID == targetID {
+		return "", errors.New("subagent-unauthorized: send_message requires two distinct adjacent agents")
 	}
-	if delivery != SubagentReportQuiet && delivery != SubagentReportNextStep {
-		return "", fmt.Errorf("subagent report delivery must be quiet or next-step, got %q", delivery)
-	}
-	child, err := e.getSession(childID)
+	sender, err := e.getSession(senderID)
 	if err != nil {
-		return "", err
+		return "", errors.New("subagent-unauthorized: send_message requires an exact live sender")
 	}
-	child.mu.Lock()
-	header, attached, draining := child.Header, child.attached, child.draining
-	child.mu.Unlock()
-	if !attached || draining || header.Origin != "subagent" || header.Mode != "continuable" || header.ParentSession == "" {
-		return "", errors.New("subagent-unauthorized: reporting requires a resident continuable child")
+	sender.mu.Lock()
+	header, attached, draining := sender.Header, sender.attached, sender.draining
+	sender.mu.Unlock()
+	if !attached || draining {
+		return "", errors.New("subagent-unauthorized: send_message requires an exact live sender")
+	}
+	framed := append([]ContentBlock{{Type: "text", Text: "Agent " + senderID + " sent a message:"}}, cloneContentBlocks(content)...)
+	source := map[string]any{"kind": "agent-message", "form": "relay", "senderSessionId": senderID}
+
+	if _, rpcErr := e.childFor(senderID, targetID); rpcErr == nil {
+		return e.deliverContinuableModelSubagent(ctx, senderID, targetID, framed, source, "next-step")
+	}
+	if header.Origin != "subagent" || header.Mode != "continuable" || header.ParentSession != targetID {
+		return "", errors.New("subagent-unauthorized: target is not the sender's direct parent or direct continuable child")
 	}
 	e.modelSubagentMu.Lock()
-	activation := e.modelSubagentActivations[childID]
-	authorized := activation != nil && activation.session == child && !activation.disposing
+	activation := e.modelSubagentActivations[senderID]
+	authorized := activation != nil && activation.session == sender && !activation.disposing
+	targetActivation := e.modelSubagentActivations[targetID]
+	targetDisposing := targetActivation != nil && targetActivation.disposing
 	e.modelSubagentMu.Unlock()
 	if !authorized {
-		return "", errors.New("subagent-unauthorized: reporting requires the exact resident continuable activation")
+		return "", errors.New("subagent-unauthorized: parent delivery requires the exact resident continuable child")
 	}
-	parent, err := e.getSession(header.ParentSession)
-	if err != nil {
+	parent, parentErr := e.getSession(targetID)
+	if parentErr != nil || targetDisposing {
 		return "", errors.New("subagent-parent-unavailable: direct parent is not live")
 	}
 	parent.mu.Lock()
-	parentAttached := parent.attached
+	parentAvailable := parent.attached && !parent.draining
 	parent.mu.Unlock()
-	if !parentAttached {
+	if !parentAvailable {
 		return "", errors.New("subagent-parent-unavailable: direct parent is not live")
 	}
-	framed := append([]ContentBlock{{Type: "text", Text: "Background subagent " + childID + " reported:"}}, cloneContentBlocks(content)...)
-	return e.enqueueTeamPrompt(parent, framed, map[string]any{
-		"kind": "subagent-report", "form": "relay", "senderSessionId": childID,
-	}, "next-step", delivery == SubagentReportNextStep)
+	return e.enqueueTeamPrompt(parent, framed, source, "next-step", true)
 }
 
 func (e *Engine) subagentHistory(p map[string]any) (any, *RPCError) {
@@ -363,6 +365,13 @@ func (e *Engine) subagentHistory(p map[string]any) (any, *RPCError) {
 }
 
 func (e *Engine) subagentPrompt(ctx context.Context, p map[string]any, rpcIDs ...string) (any, *RPCError) {
+	return e.subagentPromptWithSource(ctx, p, "coordinator", rpcIDs...)
+}
+
+// subagentPromptWithSource is shared by the trusted model-facing primitive and
+// the browser Remote adapter. The adapter supplies the durable source kind;
+// the model-facing path remains coordinator/relay for compatibility.
+func (e *Engine) subagentPromptWithSource(ctx context.Context, p map[string]any, sourceKind string, rpcIDs ...string) (any, *RPCError) {
 	parentID, _ := p["parentSessionId"].(string)
 	childID, _ := p["childSessionId"].(string)
 	child, err := e.childFor(parentID, childID)
@@ -402,15 +411,19 @@ func (e *Engine) subagentPrompt(ctx context.Context, p map[string]any, rpcIDs ..
 		}
 		canonical, ok := canonicalClientTimeZone(value)
 		if !ok {
-			return nil, errorToRPC(&ClientTimeZoneError{Value: value})
+			return nil, rpcError("subagent/invalid-time-zone", (&ClientTimeZoneError{Value: value}).Error(), map[string]any{"value": value})
 		}
 		clientTimeZone = canonical
 	}
 	prepared, prepareErr := e.durablePromptContentContext(ctx, content)
 	if prepareErr != nil {
-		return nil, errorToRPC(prepareErr)
+		return nil, subagentPromptError(prepareErr, parentID, childID)
 	}
-	source := map[string]any{"kind": "coordinator", "form": "relay", "senderSessionId": parentID}
+	source := map[string]any{"kind": sourceKind}
+	if sourceKind == "coordinator" {
+		source["form"] = "relay"
+		source["senderSessionId"] = parentID
+	}
 	if clientTimeZone != "" {
 		source["clientTimeZone"] = clientTimeZone
 	}
@@ -419,14 +432,69 @@ func (e *Engine) subagentPrompt(ctx context.Context, p map[string]any, rpcIDs ..
 	}
 	messageID, enqueueErr := e.promptContinuableModelSubagent(ctx, parentID, childID, prepared, source)
 	if enqueueErr != nil {
-		return nil, errorToRPC(enqueueErr)
+		return nil, subagentPromptError(enqueueErr, parentID, childID)
 	}
 	return map[string]any{"messageId": messageID}, nil
+}
+
+func subagentPromptError(err error, parentID, childID string) *RPCError {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return rpcError("cancelled", "subagent prompt was cancelled", nil)
+	}
+	var imageErr *imageAdmissionFailure
+	if errors.As(err, &imageErr) {
+		reason := imageErr.reason
+		if reason == "" {
+			reason = imageAdmissionReason(err)
+		}
+		return rpcError("subagent-attachment-invalid", imageErr.Error(), map[string]any{"reason": reason})
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) && providerErr.Code == "UNSUPPORTED_CONTENT" && strings.Contains(strings.ToLower(providerErr.Error()), "image") {
+		return rpcError("subagent-attachment-invalid", providerErr.Error(), map[string]any{"reason": "MODEL_DOES_NOT_SUPPORT_IMAGES"})
+	}
+	mapped := errorToRPC(err)
+	switch mapped.Code {
+	case "subagent/not-resumable", "subagent/unauthorized", "subagent/not-found", "subagent/catalog-diagnostic", "subagent/parent-unavailable", "subagent/delivery-unavailable":
+		mapped = withSubagentAddressDetails(mapped, parentID, childID)
+	case "subagent/attachment-invalid":
+		if details, ok := mapped.Details.(map[string]any); !ok || details["reason"] == nil {
+			mapped = rpcWithDetails(mapped, map[string]any{"reason": imageAdmissionReason(err)})
+		}
+	}
+	return mapped
+}
+
+func imageAdmissionReason(err error) string {
+	var marked *imageAdmissionFailure
+	if errors.As(err, &marked) && marked.reason != "" {
+		return marked.reason
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "canonical base64"):
+		return "INVALID_IMAGE_BASE64"
+	case strings.Contains(message, "image-count limit"):
+		return "TOO_MANY_IMAGES"
+	case strings.Contains(message, "does not support image"), strings.Contains(message, "accept image"):
+		return "MODEL_DOES_NOT_SUPPORT_IMAGES"
+	default:
+		return "IMAGE_INVALID"
+	}
 }
 
 func (e *Engine) subagentInterrupt(p map[string]any) (any, *RPCError) {
 	parentID, _ := p["parentSessionId"].(string)
 	childID, _ := p["childSessionId"].(string)
+	if rawMode, present := p["mode"]; present {
+		mode, ok := rawMode.(string)
+		if !ok || mode != "continuable" {
+			return nil, rpcError("bad-request", "invalid payload for subagent.interrupt", map[string]any{})
+		}
+	}
 	e.modelSubagentMu.Lock()
 	activation := e.modelSubagentActivations[childID]
 	e.modelSubagentMu.Unlock()
@@ -449,10 +517,9 @@ func isSubagentSession(s *Session) bool {
 }
 
 func ordinarySessionError(s *Session) *RPCError {
-	s.mu.Lock()
-	id := s.Header.ID
-	s.mu.Unlock()
-	return rpcError("agent-busy", "use subagent delivery for this child session", map[string]any{"sessionId": id})
+	return rpcError("agent-busy", "use subagent delivery for this child session", map[string]any{
+		"reason": "use subagent delivery for this child session",
+	})
 }
 
 func (e *Engine) requireOrdinary(id string) (*Session, *RPCError) {

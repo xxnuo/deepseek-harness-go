@@ -2,7 +2,7 @@ package harness
 
 import (
 	"context"
-	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,108 +90,80 @@ func TestCreateSubagentPublicAPI(t *testing.T) {
 	}
 }
 
-func TestSubagentReportQuietAndNextStep(t *testing.T) {
-	e := newIntegrationEngine(t)
-	create := func(parentID, childID string) (*Session, *Session) {
-		t.Helper()
-		parent, err := e.CreateSession(context.Background(), e.Config().Workspace, parentID, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := e.SelectModel(parent, ModelSelection{Provider: "echo", Model: "echo"}); err != nil {
-			t.Fatal(err)
-		}
-		child, err := e.CreateSubagent(context.Background(), parent, childID, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		childSession := mustSession(t, e, child)
-		activation, err := e.registerModelSubagentActivation(childSession, parent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			e.removeModelSubagentActivation(activation)
-			_ = detachSDKSession(e, child)
-		})
-		return mustSession(t, e, parent), childSession
+func TestSubagentPromptErrorDetailsUseStableAddressShape(t *testing.T) {
+	const parentID, childID = "parent-address", "child-address"
+	cases := []struct {
+		name       string
+		err        error
+		code       string
+		message    string
+		wantDetail map[string]any
+	}{
+		{
+			name:       "parent unavailable",
+			err:        subagentServiceError("PARENT_UNAVAILABLE", "private parent detail", nil),
+			code:       "subagent/parent-unavailable",
+			message:    "private parent detail",
+			wantDetail: map[string]any{"parentSessionId": parentID},
+		},
+		{
+			name:       "not found",
+			err:        rpcError("subagent-not-found", "private missing detail", nil),
+			code:       "subagent/not-found",
+			message:    "private missing detail",
+			wantDetail: map[string]any{"parentSessionId": parentID, "childSessionId": childID},
+		},
+		{
+			name:       "not resumable",
+			err:        subagentServiceError("NOT_RESUMABLE", "private child detail", nil),
+			code:       "subagent/not-resumable",
+			message:    "subagent cannot be resumed",
+			wantDetail: map[string]any{"childSessionId": childID},
+		},
+		{
+			name:       "unauthorized",
+			err:        subagentServiceError("UNAUTHORIZED", "private ownership detail", nil),
+			code:       "subagent/unauthorized",
+			message:    "subagent does not belong to this parent",
+			wantDetail: map[string]any{"childSessionId": childID},
+		},
+		{
+			name:       "delivery unavailable",
+			err:        subagentServiceError("DRAINING", "private drain detail", nil),
+			code:       "subagent/delivery-unavailable",
+			message:    "subagent follow-up is temporarily unavailable",
+			wantDetail: map[string]any{"childSessionId": childID},
+		},
 	}
-	hasReport := func(session *Session) bool {
-		t.Helper()
-		tools, err := e.toolsForSession(session)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, tool := range tools {
-			if tool.Name == "report" {
-				return true
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := subagentPromptError(tc.err, parentID, childID)
+			if got == nil || got.Code != tc.code || got.Message != tc.message {
+				t.Fatalf("error = %#v, want %s/%q", got, tc.code, tc.message)
 			}
-		}
-		return false
-	}
-
-	quietParent, quietChild := create("report-quiet-parent", "report-quiet-child")
-	if hasReport(quietParent) || !hasReport(quietChild) {
-		t.Fatalf("report visibility parent=%v child=%v", hasReport(quietParent), hasReport(quietChild))
-	}
-	messageID, err := e.ReportFromSubagent(context.Background(), quietChild.Header.ID, []ContentBlock{{Type: "text", Text: "quiet finding"}}, SubagentReportQuiet)
-	if err != nil {
-		t.Fatal(err)
-	}
-	quietParent.mu.Lock()
-	if quietParent.Running || len(quietParent.steering) != 1 {
-		quietParent.mu.Unlock()
-		t.Fatalf("quiet report state running=%v steering=%d", quietParent.Running, len(quietParent.steering))
-	}
-	queued := quietParent.steering[0]
-	quietParent.mu.Unlock()
-	if queued.id != messageID || queued.source["kind"] != "subagent-report" || queued.source["form"] != "relay" ||
-		queued.source["senderSessionId"] != quietChild.Header.ID {
-		t.Fatalf("quiet report = %#v", queued.message())
-	}
-
-	wakingParent, wakingChild := create("report-waking-parent", "report-waking-child")
-	tool := e.tools["report"]
-	result, err := tool.Execute(context.Background(), ToolCall{
-		Name: "report", SessionID: wakingChild.Header.ID,
-		Arguments: json.RawMessage(`{"output":"wake finding"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	value, _ := result.Value.(map[string]any)
-	wakingMessageID, _ := value["messageId"].(string)
-	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := e.WaitForIdle(waitCtx, wakingParent.Header.ID); err != nil {
-		t.Fatal(err)
-	}
-	wakingParent.mu.Lock()
-	events := append([]Event(nil), wakingParent.Events...)
-	wakingParent.mu.Unlock()
-	found := false
-	for _, event := range events {
-		if event.Type != "user/message" {
-			continue
-		}
-		data, _ := event.Data.(map[string]any)
-		source, _ := data["source"].(map[string]any)
-		if data["id"] == wakingMessageID && source["kind"] == "subagent-report" && source["form"] == "relay" &&
-			source["senderSessionId"] == wakingChild.Header.ID && strings.Contains(contentValueText(data), "wake finding") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("waking report %q missing from events %#v", wakingMessageID, events)
+			if details, ok := got.Details.(map[string]any); !ok || !reflect.DeepEqual(details, tc.wantDetail) {
+				t.Fatalf("details = %#v, want %#v", got.Details, tc.wantDetail)
+			}
+		})
 	}
 }
 
-func TestSubagentReportRejectsLegacyWakeup(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Persist = false
-	cfg.SubagentReportDelivery = "wakeup"
-	if _, err := New(WithConfig(cfg)); err == nil || !strings.Contains(err.Error(), "quiet or next-step") {
-		t.Fatalf("New(reportDelivery=wakeup) = %v", err)
+func TestOrdinarySessionFenceIncludesBusyReason(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	parent, err := e.CreateSession(t.Context(), e.Config().Workspace, "ordinary-fence-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := e.CreateSubagent(t.Context(), parent, "ordinary-fence-child", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rpcErr := dispatchTestRPC(t, e, "session.history", map[string]any{"sessionId": child})
+	if rpcErr == nil || rpcErr.Code != "session/agent-busy" {
+		t.Fatalf("ordinary child history error = %#v", rpcErr)
+	}
+	if details, ok := rpcErr.Details.(map[string]any); !ok || details["reason"] != "use subagent delivery for this child session" {
+		t.Fatalf("ordinary child history details = %#v", rpcErr.Details)
 	}
 }
 

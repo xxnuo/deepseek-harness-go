@@ -251,7 +251,7 @@ func TestTokenMeasurementUsesProviderAnchorAndSignedSurfaceDelta(t *testing.T) {
 		"turn": 1, "step": 1,
 		"message": map[string]any{"id": newID("msg"), "role": "assistant", "content": []ContentBlock{{Type: "text", Text: "listener expanded durable output"}}},
 		"usage":   map[string]any{"inputTokens": 900, "outputTokens": 10},
-	}, textChunk.Seq, usageChunk.Seq); err != nil {
+	}, int(textChunk.Seq), int(usageChunk.Seq)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.appendEvent(s, "step/end", map[string]any{"turn": 1, "step": 1}); err != nil {
@@ -268,7 +268,7 @@ func TestTokenMeasurementUsesProviderAnchorAndSignedSurfaceDelta(t *testing.T) {
 		"id": newID("msg"), "role": "user", "content": []ContentBlock{{Type: "text", Text: "x"}},
 		"source": map[string]any{"kind": "plugin", "plugin": "test"},
 	}
-	if _, err := e.appendEventWithMetadata(s, "user/message", replacement, map[string]any{"op": "replace", "start": user.Seq, "end": user.Seq}, []int{user.Seq}, false); err != nil {
+	if _, err := e.appendEventWithMetadata(s, "user/message", replacement, map[string]any{"op": "replace", "start": user.Seq, "end": user.Seq}, []int{int(user.Seq)}, false); err != nil {
 		t.Fatal(err)
 	}
 	shrunken, err := measureSessionTokens(s)
@@ -535,11 +535,11 @@ func TestToolResultPrunerPreservesRichBlockAndEventData(t *testing.T) {
 	if replacement.Type != "tool/result" || replacement.Seq != price.Seq+1 || price.Type != "compaction/prune" {
 		t.Fatalf("prune pair = %#v, %#v", price, replacement)
 	}
-	if len(replacement.SourceEventSeqs) != 1 || replacement.SourceEventSeqs[0] != original.Seq {
+	if len(replacement.SourceEventSeqs) != 1 || replacement.SourceEventSeqs[0] != int(original.Seq) {
 		t.Fatalf("replacement sources = %v", replacement.SourceEventSeqs)
 	}
 	start, end, ok := surfaceReplaceBounds(replacement.SurfaceOp)
-	if !ok || start != original.Seq || end != original.Seq {
+	if !ok || start != int(original.Seq) || end != int(original.Seq) {
 		t.Fatalf("replacement surface op = %#v", replacement.SurfaceOp)
 	}
 	priceData := price.Data.(map[string]any)
@@ -666,7 +666,7 @@ func TestToolResultPrunerKeepsCommittedPrefixWhenLaterReplacementFails(t *testin
 		t.Fatalf("committed suffix = %#v", events[base:])
 	}
 	shadowedSeqs, _ := events[base+2].Data.(map[string]any)["shadowedSeqs"].([]int)
-	if events[base+1].SourceEventSeqs[0] != first.Seq || len(shadowedSeqs) != 1 || shadowedSeqs[0] != second.Seq {
+	if events[base+1].SourceEventSeqs[0] != int(first.Seq) || len(shadowedSeqs) != 1 || shadowedSeqs[0] != int(second.Seq) {
 		t.Fatalf("committed provenance = %#v", events[base:])
 	}
 	surface, err := foldSurfaceEvents(events, true)
@@ -756,7 +756,7 @@ func TestToolResultPrunerCommitsPriceAndReplacementAdjacently(t *testing.T) {
 	s.mu.Lock()
 	events := append([]Event(nil), s.Events...)
 	s.mu.Unlock()
-	if len(events) != base+3 || events[base].Type != "compaction/prune" || events[base+1].Type != "tool/result" || events[base+2].Type != "request/context" || events[base+1].SourceEventSeqs[0] != original.Seq {
+	if len(events) != base+3 || events[base].Type != "compaction/prune" || events[base+1].Type != "tool/result" || events[base+2].Type != "request/context" || events[base+1].SourceEventSeqs[0] != int(original.Seq) {
 		t.Fatalf("concurrent suffix = %#v", events[base:])
 	}
 }

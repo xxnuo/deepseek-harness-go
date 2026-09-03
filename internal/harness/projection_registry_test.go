@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,6 +51,201 @@ func TestSessionProjectionRegistryUsesExplicitChangedResultAndRefCounts(t *testi
 	second()
 	if snapshot, err := registry.Snapshot(session); err != nil || len(snapshot.Values) != 0 {
 		t.Fatalf("snapshot after final dispose = %#v, %v", snapshot, err)
+	}
+}
+
+func TestSessionProjectionRegistrySuppressesDeepEqualWireViewAndPublishesLaterChange(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	type state struct {
+		value  int
+		secret int
+	}
+	_, err := registry.Register(ProjectionDefinition{
+		Key: "test/view-gate", StateVersion: 1,
+		Init: func() any { return state{} },
+		Apply: func(current any, event Event) ProjectionResult {
+			next := current.(state)
+			switch event.Type {
+			case "test/value":
+				next.value++
+			case "test/secret":
+				next.secret++
+			default:
+				return ProjectionResult{State: current}
+			}
+			return ProjectionResult{State: next, Changed: true}
+		},
+		View: func(current any) any {
+			return map[string]any{"value": current.(state).value}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Header: SessionHeader{ID: "projection-view-gate"}}
+	var changes []ProjectionChange
+	registry.OnChanged(func(_ *Session, change ProjectionChange) { changes = append(changes, change) })
+	for seq, typ := range []string{"test/value", "test/secret", "test/value"} {
+		event := Event{Type: typ, Seq: SessionSeq(seq), Time: int64(seq + 1)}
+		session.Events = append(session.Events, event)
+		if _, err := registry.Drive(session, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(changes) != 2 {
+		t.Fatalf("changes = %#v, want first and final visible values only", changes)
+	}
+	if changes[0].Seq != 0 || changes[1].Seq != 2 {
+		t.Fatalf("change seqs = %d,%d, want 0,2", changes[0].Seq, changes[1].Seq)
+	}
+	if !reflect.DeepEqual(changes[0].Value, map[string]any{"value": 1}) ||
+		!reflect.DeepEqual(changes[1].Value, map[string]any{"value": 2}) {
+		t.Fatalf("change values = %#v, want value 1 then 2", changes)
+	}
+}
+
+func TestSessionProjectionRegistryRetriesAnApplyFailureWithoutSkippingTheEvent(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	attempts := 0
+	_, err := registry.Register(ProjectionDefinition{
+		Key: "test/retry", StateVersion: 1,
+		Init: func() any { return 0 },
+		Apply: func(state any, event Event) ProjectionResult {
+			if event.Type != "test/retry" {
+				return ProjectionResult{State: state}
+			}
+			attempts++
+			if attempts == 1 {
+				panic("transient projection failure")
+			}
+			return ProjectionResult{State: state.(int) + 1, Changed: true}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Header: SessionHeader{ID: "projection-retry"}}
+	event := Event{Type: "test/retry", Seq: 0, Time: 1}
+	session.Events = append(session.Events, event)
+	if _, err := registry.Drive(session, event); err == nil || !strings.Contains(err.Error(), "transient projection failure") {
+		t.Fatalf("first drive error = %v", err)
+	}
+	state, found, err := registry.StateOf(session, "test/retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || state.(int) != 1 || attempts != 2 {
+		t.Fatalf("retry state=%#v found=%t attempts=%d", state, found, attempts)
+	}
+}
+
+func TestSessionProjectionRegistryRetriesLateHistoryBeforeCurrentEvent(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	attempts := 0
+	_, err := registry.Register(ProjectionDefinition{
+		Key: "test/late-history-retry", StateVersion: 1,
+		Init: func() any { return 0 },
+		Apply: func(state any, event Event) ProjectionResult {
+			if event.Type == "test/history" {
+				attempts++
+				if attempts == 1 {
+					panic("transient history failure")
+				}
+			}
+			return ProjectionResult{State: state.(int) + 1, Changed: true}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Header: SessionHeader{ID: "projection-late-history-retry"}}
+	history := Event{Type: "test/history", Seq: 0, Time: 1}
+	current := Event{Type: "test/current", Seq: 1, Time: 2}
+	session.Events = append(session.Events, history, current)
+	if _, err := registry.Drive(session, current); err == nil || !strings.Contains(err.Error(), "transient history failure") {
+		t.Fatalf("first late drive error = %v", err)
+	}
+	if _, err := registry.Drive(session, current); err != nil {
+		t.Fatalf("retry late drive error = %v", err)
+	}
+	state, found, err := registry.StateOf(session, "test/late-history-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || state.(int) != 2 || attempts != 2 {
+		t.Fatalf("late history retry state=%#v found=%t attempts=%d, want 2/true/2", state, found, attempts)
+	}
+}
+
+func TestSessionProjectionRegistryRejectsGapWhenAdvancingCachedCell(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	_, err := registry.Register(ProjectionDefinition{
+		Key: "test/sparse-snapshot", StateVersion: 1,
+		Init: func() any { return 0 },
+		Apply: func(state any, _ Event) ProjectionResult {
+			return ProjectionResult{State: state.(int) + 1, Changed: true}
+		},
+		View: func(state any) any { return state },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Header: SessionHeader{ID: "projection-sparse-snapshot"}, Events: []Event{{Type: "test/one", Seq: 0, Time: 1}}}
+	if _, err := registry.Snapshot(session); err != nil {
+		t.Fatal(err)
+	}
+	session.Events = append(session.Events, Event{Type: "test/three", Seq: 2, Time: 3})
+	if _, err := registry.Snapshot(session); err == nil || !strings.Contains(err.Error(), "missing seq 1") {
+		t.Fatalf("sparse snapshot error = %v", err)
+	}
+	session.Events = []Event{
+		{Type: "test/one", Seq: 0, Time: 1},
+		{Type: "test/two", Seq: 1, Time: 2},
+		{Type: "test/three", Seq: 2, Time: 3},
+	}
+	snapshot, err := registry.Snapshot(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Values["test/sparse-snapshot"] != 3 {
+		t.Fatalf("recovered snapshot=%#v, want value 3", snapshot)
+	}
+}
+
+func TestSessionProjectionRegistryDriveRejectsGapBeforeCurrentEvent(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	_, err := registry.Register(ProjectionDefinition{
+		Key: "test/sparse-drive", StateVersion: 1,
+		Init: func() any { return 0 },
+		Apply: func(state any, _ Event) ProjectionResult {
+			return ProjectionResult{State: state.(int) + 1, Changed: true}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{Header: SessionHeader{ID: "projection-sparse-drive"}}
+	first := Event{Type: "test/one", Seq: 0, Time: 1}
+	session.Events = append(session.Events, first)
+	if _, err := registry.Drive(session, first); err != nil {
+		t.Fatal(err)
+	}
+	gap := Event{Type: "test/three", Seq: 2, Time: 3}
+	session.Events = append(session.Events, gap)
+	if _, err := registry.Drive(session, gap); err == nil || !strings.Contains(err.Error(), "missing seq 1") {
+		t.Fatalf("gap drive error = %v", err)
+	}
+	session.Events = []Event{
+		first,
+		{Type: "test/two", Seq: 1, Time: 2},
+		gap,
+	}
+	if _, err := registry.Drive(session, gap); err != nil {
+		t.Fatalf("repaired gap drive error = %v", err)
+	}
+	state, found, err := registry.StateOf(session, "test/sparse-drive")
+	if err != nil || !found || state.(int) != 3 {
+		t.Fatalf("state after repaired gap state=%#v found=%t err=%v", state, found, err)
 	}
 }
 

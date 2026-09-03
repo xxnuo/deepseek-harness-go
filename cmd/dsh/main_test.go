@@ -320,7 +320,7 @@ func TestCompositionPluginInventoryCarriesPackageProvenance(t *testing.T) {
 	composed := &composition{
 		entries: document.Content[0].Content, profileDir: profileDir,
 		packageIdentities: map[string]profilePackageIdentity{
-			"@deepseek-ai/dsh-builtin": {name: "@deepseek-ai/dsh-builtin", version: "0.1.2-alpha.1"},
+			"@deepseek-ai/dsh-builtin": {name: "@deepseek-ai/dsh-builtin", version: harness.Version()},
 		},
 	}
 	entries := composed.pluginInventoryEntries()
@@ -332,7 +332,7 @@ func TestCompositionPluginInventoryCarriesPackageProvenance(t *testing.T) {
 	}{
 		{"@example/active", "1.2.3"},
 		{"profile-relative", "4.5.6"},
-		{"@deepseek-ai/dsh-builtin", "0.1.2-alpha.1"},
+		{"@deepseek-ai/dsh-builtin", harness.Version()},
 		{"@example/active", "1.2.3"},
 	}
 	for index, expected := range want {
@@ -361,7 +361,7 @@ func TestScanPackageIdentitiesUsesWorkspaceAndVendorPackages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeManifest("tool/bash", "@deepseek-ai/dsh-tool-bash", "0.1.2-alpha.1")
+	writeManifest("tool/bash", "@deepseek-ai/dsh-tool-bash", harness.Version())
 	writeManifest("node_modules/shadow", "shadow", "9.9.9")
 	vendorDir := filepath.Join(upstream, "vendor", "timer")
 	if err := os.MkdirAll(vendorDir, 0o755); err != nil {
@@ -375,7 +375,7 @@ func TestScanPackageIdentitiesUsesWorkspaceAndVendorPackages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := identities["@deepseek-ai/dsh-tool-bash"]; got != (profilePackageIdentity{name: "@deepseek-ai/dsh-tool-bash", version: "0.1.2-alpha.1"}) {
+	if got := identities["@deepseek-ai/dsh-tool-bash"]; got != (profilePackageIdentity{name: "@deepseek-ai/dsh-tool-bash", version: harness.Version()}) {
 		t.Fatalf("workspace identity = %#v", got)
 	}
 	if _, ok := identities["shadow"]; ok {

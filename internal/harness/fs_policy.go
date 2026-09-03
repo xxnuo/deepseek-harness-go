@@ -120,6 +120,10 @@ func fsPolicyError(code, message string) error {
 }
 
 func readVersionedFile(path string) ([]byte, fsFileVersion, fs.FileMode, error) {
+	return readVersionedFileWithin(path, -1)
+}
+
+func readVersionedFileWithin(path string, maxBytes int64) ([]byte, fsFileVersion, fs.FileMode, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fsFileVersion{}, 0, err
@@ -132,9 +136,19 @@ func readVersionedFile(path string) ([]byte, fsFileVersion, fs.FileMode, error) 
 	if !info.Mode().IsRegular() {
 		return nil, fsFileVersion{}, info.Mode(), fsPolicyError("FS_NOT_REGULAR_FILE", fmt.Sprintf("cannot read %q: not a regular file", path))
 	}
-	data, err := io.ReadAll(file)
+	if maxBytes >= 0 && info.Size() > maxBytes {
+		return nil, fsFileVersion{}, info.Mode(), fsPolicyError("FS_TOO_LARGE", fmt.Sprintf("cannot read %q: %d bytes exceeds the %d-byte limit", path, info.Size(), maxBytes))
+	}
+	reader := io.Reader(file)
+	if maxBytes >= 0 {
+		reader = io.LimitReader(file, maxBytes+1)
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fsFileVersion{}, info.Mode(), err
+	}
+	if maxBytes >= 0 && int64(len(data)) > maxBytes {
+		return nil, fsFileVersion{}, info.Mode(), fsPolicyError("FS_TOO_LARGE", fmt.Sprintf("cannot read %q: content exceeds the %d-byte limit", path, maxBytes))
 	}
 	return data, fsFileVersion{info: info, digest: sha256.Sum256(data)}, info.Mode(), nil
 }

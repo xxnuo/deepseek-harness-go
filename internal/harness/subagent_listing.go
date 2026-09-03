@@ -341,6 +341,16 @@ func (e *Engine) resolveSubagentCandidates(ctx context.Context, runtime subagent
 }
 
 func (e *Engine) listSubagentEntries(ctx context.Context, rootID string, descendants bool) ([]subagentListingEntry, bool, error) {
+	// The projection is the sole identity classifier. Refuse before reading the
+	// store or touching a live candidate so a partially composed deployment
+	// reports a stable capability error instead of panicking on a nil registry.
+	if e.sessionProjections == nil {
+		return nil, false, subagentServiceError(
+			"SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE",
+			"listing subagents requires the sessionProjections registry",
+			nil,
+		)
+	}
 	runtime, err := e.prepareSubagentListing(ctx)
 	if err != nil {
 		return nil, false, err
@@ -363,6 +373,12 @@ func subagentListingError(err error) *RPCError {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return rpcError("cancelled", "subagent listing was cancelled", nil)
+	}
+	var serviceErr *SubagentServiceError
+	if errors.As(err, &serviceErr) {
+		if serviceErr.Code == "SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE" {
+			return rpcError("subagent-projections-unavailable", serviceErr.Message, nil)
+		}
 	}
 	return rpcError("subagent-list-failed", err.Error(), nil)
 }

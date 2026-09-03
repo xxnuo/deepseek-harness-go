@@ -90,7 +90,7 @@ func TestRPCPromptPersistsCanonicalRequestProvenanceAndTimeContext(t *testing.T)
 	userSeq, timeSeq, headerSeq := -1, -1, -1
 	for _, event := range events {
 		if event.Type == "request/header" {
-			headerSeq = event.Seq
+			headerSeq = int(event.Seq)
 		}
 		if event.Type != "user/message" {
 			continue
@@ -98,13 +98,13 @@ func TestRPCPromptPersistsCanonicalRequestProvenanceAndTimeContext(t *testing.T)
 		message := nestedMessage(event.Data)
 		source, _ := message["source"].(map[string]any)
 		if source["kind"] == "user" {
-			userSeq = event.Seq
+			userSeq = int(event.Seq)
 			if source["rpcId"] != "rpc-zone" || source["clientTimeZone"] != "America/Los_Angeles" {
 				t.Fatalf("user source = %#v", source)
 			}
 		}
 		if source["plugin"] == "time-context" {
-			timeSeq = event.Seq
+			timeSeq = int(event.Seq)
 			text := contentValueText(message["content"])
 			if !strings.Contains(text, "Browser time zone for this request: America/Los_Angeles.") || !strings.Contains(text, "turn 1, step 1") {
 				t.Fatalf("time context = %q", text)
@@ -123,7 +123,7 @@ func TestRPCPromptPersistsCanonicalRequestProvenanceAndTimeContext(t *testing.T)
 		"sessionId": id, "mode": "queue", "clientTimeZone": "",
 		"content": []map[string]any{{"type": "text", "text": "invalid"}},
 	})
-	if _, rpcErr := engine.dispatch(context.Background(), "session.prompt", invalid, "rpc-invalid"); rpcErr == nil || rpcErr.Code != "invalid-time-zone" {
+	if _, rpcErr := engine.dispatch(context.Background(), "session.prompt", invalid, "rpc-invalid"); rpcErr == nil || rpcErr.Code != "session/invalid-time-zone" {
 		t.Fatalf("invalid zone error = %#v", rpcErr)
 	}
 	session.mu.Lock()
@@ -271,12 +271,12 @@ func TestPromptSessionReferencesAreSnapshottedAndPersistedAfterMessage(t *testin
 		message := nestedMessage(event.Data)
 		source, _ := message["source"].(map[string]any)
 		if source["kind"] == "session-reference" {
-			referenceSeq = event.Seq
+			referenceSeq = int(event.Seq)
 			if !strings.Contains(contentValueText(message["content"]), "source fact") {
 				t.Fatalf("reference content = %#v", message["content"])
 			}
 		} else if source["kind"] == "user" {
-			userSeq = event.Seq
+			userSeq = int(event.Seq)
 		}
 	}
 	if userSeq < 0 || referenceSeq <= userSeq {

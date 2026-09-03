@@ -637,7 +637,7 @@ func containsPath(values []string, want string) bool {
 	return false
 }
 
-func TestRunCodeReceivesWorkflowCanonicalValueWithoutNestedPanel(t *testing.T) {
+func TestRunCodePTCOmitsWorkflowTool(t *testing.T) {
 	e, _ := newWorkflowEngine(t)
 	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "", "ptc")
 	if err != nil {
@@ -648,8 +648,8 @@ func TestRunCodeReceivesWorkflowCanonicalValueWithoutNestedPanel(t *testing.T) {
 		"code":"const out = await tools.workflow({meta:{name:'nested',description:'nested workflow'},script:\"const reply = await agent('one'); return {reply};\"}); return out.result.reply;"
 	}`
 	result := executeWorkflowTestTool(t, e, "run_code", id, arguments)
-	if len(result.Content) == 0 || result.Content[0].Text != "child:one" {
-		t.Fatalf("nested workflow result = %#v", result)
+	if !result.IsError || len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "Object has no member 'workflow'") {
+		t.Fatalf("PTC workflow omission result = %#v", result)
 	}
 	session, _ := e.getSession(id)
 	session.mu.Lock()

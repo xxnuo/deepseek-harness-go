@@ -167,7 +167,7 @@ func TestTypertRemoteMessageFeedbackRejectsInvalidWireValue(t *testing.T) {
 	})
 	result := rpcResult(t, envelope)
 	errValue := result["error"].(map[string]any)
-	if result["ok"] != false || errValue["code"] != "internal" || errValue["message"] != `typert gateway: messageFeedback/put: wire field "request" failed boundary validation` {
+	if result["ok"] != false || errValue["code"] != "gateway/internal" || errValue["message"] != `typert gateway: messageFeedback/put: wire field "request" failed boundary validation` {
 		t.Fatalf("invalid feedback wire response = %#v", result)
 	}
 }
@@ -252,7 +252,7 @@ func TestTypertRemoteKnownUnsupportedDynamicMethodIsNot404(t *testing.T) {
 	})
 	result := rpcResult(t, envelope)
 	errValue, _ := result["error"].(map[string]any)
-	if status != http.StatusOK || result["ok"] != false || errValue["code"] != "invocation-unavailable" {
+	if status != http.StatusOK || result["ok"] != false || errValue["code"] != "gateway/invocation-unavailable" {
 		t.Fatalf("dynamic invoke = %d %#v", status, envelope)
 	}
 
@@ -260,6 +260,26 @@ func TestTypertRemoteKnownUnsupportedDynamicMethodIsNot404(t *testing.T) {
 	inventory := remoteValue(t, envelope).(map[string]any)
 	if entries, ok := inventory["entries"].([]any); !ok || len(entries) == 0 {
 		t.Fatalf("plugin inventory = %#v", inventory)
+	}
+}
+
+func TestTypertRemoteSubagentInterruptValidatesMode(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	server := httptest.NewServer(e.Handler())
+	t.Cleanup(server.Close)
+	_, envelope := postRPC(t, server.Client(), server.URL, "", "subagents/interruptByParent", map[string]any{
+		"args": map[string]any{
+			"parentSessionId": "parent",
+			"childSessionId":  "child",
+			"mode":            "one-shot",
+		},
+	})
+	result := rpcResult(t, envelope)
+	if result["ok"] != false {
+		t.Fatalf("invalid interrupt mode = %#v", result)
+	}
+	if errValue, ok := result["error"].(map[string]any); !ok || errValue["code"] != "gateway/bad-request" {
+		t.Fatalf("invalid interrupt mode error = %#v", result["error"])
 	}
 }
 
@@ -299,5 +319,74 @@ func TestPluginInventoryUsesLiveHostEntries(t *testing.T) {
 	updatedRows := updated["entries"].([]map[string]any)
 	if len(updatedRows) != 1 || *updatedRows[0]["fiberPhase"].(*string) != next {
 		t.Fatalf("updated rows = %#v", updatedRows)
+	}
+}
+
+func TestPluginInventoryUsesAttachedPresetGenerationOnly(t *testing.T) {
+	presetRoot := t.TempDir()
+	presetDir := filepath.Join(presetRoot, "edited")
+	if err := os.MkdirAll(presetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composition := filepath.Join(presetDir, "agent.cordis.yml")
+	writeComposition := func(value string) {
+		t.Helper()
+		if err := os.WriteFile(composition, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeComposition("- id: old\n  name: '@deepseek-ai/dsh-tool-fs'\n")
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace, cfg.PresetDir = t.TempDir(), t.TempDir(), presetRoot
+	cfg.Provider, cfg.Model, cfg.Persist = "echo", "echo", false
+	cfg.SessionTitleLLM.Enabled = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	sessionID, err := e.CreateSession(t.Context(), cfg.Workspace, "preset-inventory-generation", "edited")
+	if err != nil {
+		t.Fatal(err)
+	}
+	findRows := func(value map[string]any) []map[string]any {
+		t.Helper()
+		groups, ok := value["agentPresets"].([]map[string]any)
+		if !ok || len(groups) != 1 {
+			t.Fatalf("preset groups = %#v", value["agentPresets"])
+		}
+		rows, ok := groups[0]["rows"].([]map[string]any)
+		if !ok {
+			t.Fatalf("preset rows = %#v", groups[0]["rows"])
+		}
+		return rows
+	}
+	value, rpcErr := e.remotePluginInventory()
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	rows := findRows(value)
+	if len(rows) != 1 || rows[0]["entryId"] != "old" || rows[0]["fiberPhase"] == (*string)(nil) {
+		t.Fatalf("attached generation rows = %#v", rows)
+	}
+	writeComposition("- id: new\n  name: '@deepseek-ai/dsh-tool-web'\n")
+	value, rpcErr = e.remotePluginInventory()
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	rows = findRows(value)
+	if len(rows) != 1 || rows[0]["entryId"] != "old" {
+		t.Fatalf("attached stale-file rows = %#v", rows)
+	}
+	if err := detachSDKSession(e, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	value, rpcErr = e.remotePluginInventory()
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	rows = findRows(value)
+	if len(rows) != 1 || rows[0]["entryId"] != "new" || rows[0]["fiberPhase"] != (*string)(nil) {
+		t.Fatalf("cold file rows = %#v", rows)
 	}
 }

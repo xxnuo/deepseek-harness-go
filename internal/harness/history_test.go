@@ -105,7 +105,7 @@ func TestHistorySkipsMarkerlessMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
-	s.Events = append(s.Events, Event{Type: "assistant/message", Seq: len(s.Events), Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "markerless"}}}})
+	s.Events = append(s.Events, Event{Type: "assistant/message", Seq: SessionSeq(len(s.Events)), Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "markerless"}}}})
 	s.mu.Unlock()
 	page, more, err := e.History(id, -1, 1)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 		t.Fatalf("upstream session = id %q, events %d", s.Header.ID, len(s.Events))
 	}
 	for seq, event := range s.Events {
-		if event.Seq != seq {
+		if int(event.Seq) != seq {
 			t.Fatalf("event %d has seq %d", seq, event.Seq)
 		}
 	}

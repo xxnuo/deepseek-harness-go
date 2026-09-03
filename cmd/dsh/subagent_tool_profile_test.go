@@ -171,35 +171,3 @@ func TestProductSubagentToolProfileRejectsUnsupportedMode(t *testing.T) {
 		t.Fatal("continuable external provider tool was accepted")
 	}
 }
-
-func TestSubagentReportProfileDelivery(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		config string
-		want   string
-	}{
-		{name: "default", want: harness.SubagentReportNextStep},
-		{name: "quiet", config: "config: {reportDelivery: quiet}", want: harness.SubagentReportQuiet},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			composed := mcpTestComposition(t, "\n- id: report\n  name: '@deepseek-ai/dsh-tool-subagent-report'\n  "+test.config+"\n")
-			if err := composed.validate(); err != nil {
-				t.Fatal(err)
-			}
-			if composed.subagentReportDelivery != test.want {
-				t.Fatalf("resolved report delivery = %q, want %q", composed.subagentReportDelivery, test.want)
-			}
-			if got := engineConfig(&profileLoader{home: t.TempDir()}, composed).SubagentReportDelivery; got != test.want {
-				t.Fatalf("engine report delivery = %q, want %q", got, test.want)
-			}
-		})
-	}
-	invalid := mcpTestComposition(t, `
-- id: report
-  name: '@deepseek-ai/dsh-tool-subagent-report'
-  config: {reportDelivery: wakeup}
-`)
-	if err := invalid.validate(); err == nil {
-		t.Fatal("legacy reportDelivery=wakeup was accepted")
-	}
-}

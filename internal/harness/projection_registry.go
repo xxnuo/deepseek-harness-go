@@ -21,11 +21,12 @@ type ProjectionResult struct {
 // ProjectionDefinition is one synchronous, JSON-state session projection.
 // A nil View makes the unit host-only.
 type ProjectionDefinition struct {
-	Key          string
-	StateVersion int
-	Init         func() any
-	Apply        func(state any, event Event) ProjectionResult
-	View         func(state any) any
+	Key            string
+	StateVersion   int
+	Init           func() any
+	InitWithHeader func(SessionHeader) any
+	Apply          func(state any, event Event) ProjectionResult
+	View           func(state any) any
 
 	dynamicRuntime bool
 }
@@ -43,6 +44,9 @@ type ProjectionChangeListener func(session *Session, change ProjectionChange)
 type projectionCell struct {
 	state       any
 	observedSeq int
+	// views keeps the previous and current wire values used to suppress
+	// notifications when a changed state leaves the client view unchanged.
+	views [2]any
 }
 
 type projectionRegistration struct {
@@ -182,10 +186,10 @@ func validateProjectionDefinition(definition ProjectionDefinition) error {
 	if definition.StateVersion < 0 {
 		return fmt.Errorf("session projection %q stateVersion must be non-negative", definition.Key)
 	}
-	if definition.Init == nil || definition.Apply == nil {
+	if definition.Init == nil && definition.InitWithHeader == nil || definition.Apply == nil {
 		return fmt.Errorf("session projection %q requires init and apply", definition.Key)
 	}
-	state, err := callProjectionInit(definition)
+	state, err := callProjectionInit(definition, SessionHeader{})
 	if err != nil {
 		return err
 	}
@@ -211,12 +215,15 @@ func validateProjectionJSON(name string, value any) error {
 	return nil
 }
 
-func callProjectionInit(definition ProjectionDefinition) (state any, err error) {
+func callProjectionInit(definition ProjectionDefinition, header SessionHeader) (state any, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("session projection %q init failed: %v", definition.Key, recovered)
 		}
 	}()
+	if definition.InitWithHeader != nil {
+		return definition.InitWithHeader(header), nil
+	}
 	return definition.Init(), nil
 }
 
@@ -368,16 +375,19 @@ func (r *SessionProjectionRegistry) snapshotDetachedNow(events []Event) (Project
 		if registration == nil || registration.definition.View == nil {
 			continue
 		}
-		state, err := callProjectionInit(registration.definition)
+		state, err := callProjectionInit(registration.definition, SessionHeader{})
 		if err == nil {
+			cell := &projectionCell{state: state, observedSeq: -1}
 			for _, event := range events {
-				result, applyErr := callProjectionApply(registration.definition, state, event)
+				result, applyErr := callProjectionApply(registration.definition, cell.state, event)
 				if applyErr != nil {
 					err = applyErr
 					break
 				}
-				state = result.State
+				cell.state = result.State
+				cell.observedSeq = int(event.Seq)
 			}
+			state = cell.state
 		}
 		if err != nil {
 			failures = append(failures, err)
@@ -440,23 +450,61 @@ func (r *SessionProjectionRegistry) stateOfNow(session *Session, events []Event,
 func (r *SessionProjectionRegistry) cellForLocked(registration *projectionRegistration, session *Session, events []Event) (*projectionCell, error) {
 	cell := registration.cells[session]
 	if cell == nil {
-		state, err := callProjectionInit(registration.definition)
+		var err error
+		cell, err = buildProjectionCellLocked(registration.definition, session.Header, events)
 		if err != nil {
 			return nil, err
 		}
-		cell = &projectionCell{state: state, observedSeq: -1}
 		registration.cells[session] = cell
+		return cell, nil
 	}
-	for _, event := range events {
-		if event.Seq <= cell.observedSeq {
-			continue
+	if err := advanceProjectionCellLocked(registration.definition, cell, events, len(events)-1); err != nil {
+		return nil, err
+	}
+	return cell, nil
+}
+
+// advanceProjectionCellLocked folds a contiguous event prefix through one
+// cell. The event slice is indexed by sequence, matching the session log
+// contract; accepting a sparse or reordered slice would silently skip state.
+func advanceProjectionCellLocked(definition ProjectionDefinition, cell *projectionCell, events []Event, throughSeq int) error {
+	if throughSeq <= cell.observedSeq {
+		return nil
+	}
+	for seq := cell.observedSeq + 1; seq <= throughSeq; seq++ {
+		if seq < 0 || seq >= len(events) || int(events[seq].Seq) != seq {
+			return fmt.Errorf("session projection %q cannot advance across missing seq %d", definition.Key, seq)
 		}
-		result, err := callProjectionApply(registration.definition, cell.state, event)
-		cell.observedSeq = event.Seq
+		result, err := callProjectionApply(definition, cell.state, events[seq])
+		if err != nil {
+			return err
+		}
+		if result.Changed {
+			cell.views[0] = cell.views[1]
+			cell.views[1] = nil
+		}
+		cell.state = result.State
+		cell.observedSeq = seq
+	}
+	return nil
+}
+
+// buildProjectionCellLocked mirrors the upstream lazy build path: the full
+// supplied history is folded in slice order, while contiguous-seq checking is
+// reserved for advancing an already-watermarked cell.
+func buildProjectionCellLocked(definition ProjectionDefinition, header SessionHeader, events []Event) (*projectionCell, error) {
+	state, err := callProjectionInit(definition, header)
+	if err != nil {
+		return nil, err
+	}
+	cell := &projectionCell{state: state, observedSeq: -1}
+	for _, event := range events {
+		result, err := callProjectionApply(definition, cell.state, event)
 		if err != nil {
 			return nil, err
 		}
 		cell.state = result.State
+		cell.observedSeq = int(event.Seq)
 	}
 	return cell, nil
 }
@@ -500,37 +548,40 @@ func (r *SessionProjectionRegistry) driveNow(session *Session, events []Event, e
 		}
 		cell := registration.cells[session]
 		if cell == nil {
-			state, err := callProjectionInit(registration.definition)
-			if err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			cell = &projectionCell{state: state, observedSeq: -1}
-			registration.cells[session] = cell
+			var err error
+			history := make([]Event, 0, len(events))
 			for _, previous := range events {
 				if previous.Seq >= event.Seq {
 					break
 				}
-				result, err := callProjectionApply(registration.definition, cell.state, previous)
-				cell.observedSeq = previous.Seq
-				if err != nil {
-					failures = append(failures, err)
-					continue
-				}
-				cell.state = result.State
+				history = append(history, previous)
 			}
+			cell, err = buildProjectionCellLocked(registration.definition, session.Header, history)
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			registration.cells[session] = cell
+		} else if err := advanceProjectionCellLocked(registration.definition, cell, events, int(event.Seq)-1); err != nil {
+			failures = append(failures, err)
+			continue
 		}
-		if event.Seq <= cell.observedSeq {
+		if int(event.Seq) <= cell.observedSeq {
 			continue
 		}
 		result, err := callProjectionApply(registration.definition, cell.state, event)
-		cell.observedSeq = event.Seq
 		if err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		cell.state = result.State
+		cell.observedSeq = int(event.Seq)
 		if !result.Changed || registration.definition.View == nil {
+			continue
+		}
+		cell.views[0] = cell.views[1]
+		if len(r.listeners) == 0 {
+			cell.views[1] = nil
 			continue
 		}
 		value, err := callProjectionView(registration.definition, result.State)
@@ -538,7 +589,10 @@ func (r *SessionProjectionRegistry) driveNow(session *Session, events []Event, e
 			failures = append(failures, err)
 			continue
 		}
-		changes = append(changes, ProjectionChange{Key: key, Value: value, Seq: event.Seq})
+		cell.views[1] = value
+		if !reflect.DeepEqual(cell.views[0], cell.views[1]) {
+			changes = append(changes, ProjectionChange{Key: key, Value: value, Seq: int(event.Seq)})
+		}
 	}
 	listeners := make([]ProjectionChangeListener, 0, len(r.listeners))
 	for _, listener := range r.listeners {
@@ -783,7 +837,9 @@ func builtinProjectionDefinitions() []ProjectionDefinition {
 		},
 		{
 			Key: "sessionStats", StateVersion: 1,
-			Init:  func() any { return sessionStatsProjectionState{LastTurn: -1, PendingCalls: map[string]int64{}} },
+			Init: func() any {
+				return sessionStatsProjectionState{LastTurn: -1, PendingCalls: map[string]int64{}}
+			},
 			Apply: projectionFoldResult(applySessionStatsProjection),
 			View:  viewSessionStatsProjection,
 		},
@@ -799,6 +855,12 @@ func builtinProjectionDefinitions() []ProjectionDefinition {
 				}
 				return map[string]any{"blank": value.Blank, "lastPromptAt": lastPrompt}
 			},
+		},
+		{
+			Key: "turnOutline", StateVersion: 2,
+			Init:  func() any { return newTurnOutlineProjectionState() },
+			Apply: projectionFoldResult(applyTurnOutlineProjection),
+			View:  viewTurnOutlineProjection,
 		},
 		{
 			Key: "subagent", StateVersion: 2,

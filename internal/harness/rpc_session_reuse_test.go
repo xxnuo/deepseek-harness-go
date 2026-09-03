@@ -13,7 +13,7 @@ func TestSessionCreateRejectsRemovedReuseWorkspaceBlank(t *testing.T) {
 	_, rpcErr := dispatchTestRPC(t, e, "session.create", map[string]any{
 		"workspaceId": "workspace", "sessionId": "session", "reuseWorkspaceBlank": true,
 	})
-	if rpcErr == nil || rpcErr.Code != "bad-request" || !strings.Contains(rpcErr.Message, "does not accept reuseWorkspaceBlank") {
+	if rpcErr == nil || rpcErr.Code != "gateway/bad-request" || !strings.Contains(rpcErr.Message, "does not accept reuseWorkspaceBlank") {
 		t.Fatalf("removed reuse option error = %#v", rpcErr)
 	}
 	if got := len(e.ListSessions()); got != 0 {

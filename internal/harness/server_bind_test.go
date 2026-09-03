@@ -188,7 +188,7 @@ func TestEventStreamsRequireWebSocketUpgrade(t *testing.T) {
 	e := newIntegrationEngine(t)
 	server := httptest.NewServer(e.Handler())
 	t.Cleanup(server.Close)
-	for _, path := range []string{"/api/events.mux", "/api/events.host"} {
+	for _, path := range []string{"/api/events.mux", "/api/events.host", "/api/remote.mux"} {
 		response, err := server.Client().Get(server.URL + path)
 		if err != nil {
 			t.Fatal(err)

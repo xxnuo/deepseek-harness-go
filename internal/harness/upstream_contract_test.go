@@ -18,10 +18,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var upstreamStringItemPattern = regexp.MustCompile(`(?m)^\s*'([^']+)',\s*$`)
 var noHostApplyPattern = regexp.MustCompile(`export function apply\([^)]*\): void \{\}`)
 
-// Each row is id=package. Bundle rows are derived from the pinned alpha.1
+// Each row is id=package. Bundle rows are derived from the pinned alpha.4
 // bundle patches; the web profile also mounts the shipped standard preset.
 var backendPluginContract = map[string][]string{
 	"@deepseek-ai/dsh-acp-app": {
@@ -99,7 +98,6 @@ var backendPluginContract = map[string][]string{
 		"tool-subagent-control=@deepseek-ai/dsh-tool-subagent-control",
 		"tool-subagent-fork=@deepseek-ai/dsh-tool-subagent",
 		"tool-subagent-list-agents=@deepseek-ai/dsh-tool-subagent-control/list-agents",
-		"tool-subagent-report=@deepseek-ai/dsh-tool-subagent-report",
 		"tool-subagent=@deepseek-ai/dsh-tool-subagent",
 		"tool-todo=@deepseek-ai/dsh-tool-todo",
 		"tool-web=@deepseek-ai/dsh-tool-web",
@@ -124,24 +122,39 @@ var backendPluginContract = map[string][]string{
 		"sdk-jsonrpc-server=@deepseek-ai/dsh-sdk-jsonrpc-server",
 	},
 	"@deepseek-ai/dsh-sdk-minimal": {
-		"agent-spine=@deepseek-ai/dsh-agent-spine-demo",
+		"agent-invariant=@deepseek-ai/dsh-agent/invariant",
+		"agent-loop-invariant=@deepseek-ai/dsh-agent-loop/invariant",
+		"agent-loop=@deepseek-ai/dsh-agent-loop",
+		"agent=@deepseek-ai/dsh-agent",
 		"deepseek-llm-api-extensions=@deepseek-ai/dsh-deepseek-llm-api-extensions",
 		"fs-local=@deepseek-ai/dsh-fs-local",
+		"invariants=@deepseek-ai/dsh-invariants",
+		"jobs=@deepseek-ai/dsh-jobs-local",
 		"llm-deepseek=@deepseek-ai/dsh-llm-deepseek",
+		"llm-retry=@deepseek-ai/dsh-llm-retry",
+		"llm=@deepseek-ai/dsh-llm",
 		"persistent-bash=@deepseek-ai/dsh-tool-bash-persistent",
 		"persistent-pwsh=@deepseek-ai/dsh-tool-pwsh-persistent",
 		"plugin-package-inventory-deepseek=@deepseek-ai/dsh-plugin-package-inventory-deepseek",
 		"pty=@deepseek-ai/dsh-terminal",
 		"sandbox-policy=@deepseek-ai/dsh-sandbox-policy",
 		"sandbox=@deepseek-ai/dsh-sandbox-local",
+		"scope-invariant=@deepseek-ai/dsh-scope/invariant",
 		"sdk-app-startup=@deepseek-ai/dsh-sdk-app",
 		"sdk-jsonrpc-server=@deepseek-ai/dsh-sdk-jsonrpc-server",
+		"session-invariant=@deepseek-ai/dsh-session/invariant",
 		"session-log-deepseek=@deepseek-ai/dsh-session-log-deepseek",
+		"session-projection=@deepseek-ai/dsh-session-projection",
+		"session-title=@deepseek-ai/dsh-session-title",
+		"session=@deepseek-ai/dsh-session",
 		"sessions=@deepseek-ai/dsh-session-persistence-jsonl",
 		"str-replace-editor=@deepseek-ai/dsh-tool-str-replace-editor",
 		"subprocess=@deepseek-ai/dsh-subprocess-local",
+		"system-prompt=@deepseek-ai/dsh-system-prompt",
 		"terminal-bash=@deepseek-ai/dsh-terminal-bash",
 		"terminal-pwsh=@deepseek-ai/dsh-terminal-bash",
+		"timer=@deepseek-ai/cordis-plugin-timer",
+		"tools=@deepseek-ai/dsh-tools",
 	},
 	"@deepseek-ai/dsh-web-app": {
 		"agent-presets=@deepseek-ai/dsh-agent-presets",
@@ -160,6 +173,7 @@ var backendPluginContract = map[string][]string{
 		"session-log-download=@deepseek-ai/dsh-session-log-export",
 		"session-reference=@deepseek-ai/dsh-session-reference",
 		"session-stats=@deepseek-ai/dsh-session-stats",
+		"session-turn-outline=@deepseek-ai/dsh-session-turn-outline",
 		"settings-controller=@deepseek-ai/dsh-api-settings-controller",
 		"subagent-model-selection-settings=@deepseek-ai/dsh-tool-subagent/model-selection-settings",
 		"ui-chat=@deepseek-ai/dsh-client-ui-chat",
@@ -289,17 +303,13 @@ func TestUpstreamContractForwardedRemoteEvents(t *testing.T) {
 	}
 	arrayBlock := block[:end]
 	upstream := make([]string, 0)
-	// alpha.1 stores event names in object entries, with the session-controller
-	// family intentionally expanded from its own declaration array.
+	// alpha.4 stores every forwarded event as an explicit object entry. The
+	// session-controller family is intentionally listed in this application
+	// allowlist rather than imported as a runtime array.
 	eventPattern := regexp.MustCompile(`\bevent:\s*'([^']+)'`)
 	for _, match := range eventPattern.FindAllStringSubmatch(arrayBlock, -1) {
 		upstream = append(upstream, match[1])
 	}
-	if !strings.Contains(arrayBlock, "...SESSION_CONTROLLER_REMOTE_EVENTS.map(") {
-		t.Fatal("upstream forwarded remote event allowlist no longer expands SESSION_CONTROLLER_REMOTE_EVENTS")
-	}
-	sessionData := string(readTestFile(t, filepath.Join(root, "deepseek-harness/packages/api/session-controller/src/remote-events.ts")))
-	upstream = append(upstream, quotedArrayItems(t, sessionData, "SESSION_CONTROLLER_REMOTE_EVENTS")...)
 	if len(upstream) == 0 {
 		t.Fatal("upstream forwarded remote event allowlist is empty")
 	}
@@ -310,27 +320,6 @@ func TestUpstreamContractForwardedRemoteEvents(t *testing.T) {
 	sort.Strings(got)
 	sort.Strings(upstream)
 	assertStringSet(t, "forwarded remote events", got, upstream)
-}
-
-func quotedArrayItems(t *testing.T, source, declaration string) []string {
-	t.Helper()
-	start := strings.Index(source, "const "+declaration+" = [")
-	if start < 0 {
-		t.Fatalf("upstream %s declaration not found", declaration)
-	}
-	block := source[start:]
-	end := strings.Index(block, "] as const")
-	if end < 0 {
-		t.Fatalf("upstream %s declaration is not closed", declaration)
-	}
-	items := make([]string, 0)
-	for _, match := range upstreamStringItemPattern.FindAllStringSubmatch(block[:end], -1) {
-		items = append(items, match[1])
-	}
-	if len(items) == 0 {
-		t.Fatalf("upstream %s declaration is empty", declaration)
-	}
-	return items
 }
 
 func TestUpstreamContractDefaultProfiles(t *testing.T) {
@@ -559,6 +548,11 @@ func remoteDescriptorRows(t *testing.T, path string) []string {
 			t.Fatalf("%s: remote descriptor entry is %T, want key-value", path, entry)
 		}
 		endpoint := astString(t, path, pair.Key)
+		// Gateway-internal carrier endpoints are intentionally absent from the
+		// generated Typert business descriptor set.
+		if strings.HasPrefix(endpoint, "$") {
+			continue
+		}
 		descriptor, ok := pair.Value.(*ast.CompositeLit)
 		if !ok {
 			t.Fatalf("%s: remote descriptor %q is %T, want composite literal", path, endpoint, pair.Value)

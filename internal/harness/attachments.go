@@ -98,12 +98,19 @@ type decodedImageInput struct {
 	name      string
 }
 
-type imageAdmissionFailure struct{ err error }
+type imageAdmissionFailure struct {
+	err    error
+	reason string
+}
 
 func (e *imageAdmissionFailure) Error() string { return e.err.Error() }
 func (e *imageAdmissionFailure) Unwrap() error { return e.err }
 
 func markImageAdmissionFailure(err error) error {
+	return markImageAdmissionFailureReason(err, "")
+}
+
+func markImageAdmissionFailureReason(err error, reason string) error {
 	if err == nil {
 		return nil
 	}
@@ -111,7 +118,7 @@ func markImageAdmissionFailure(err error) error {
 	if errors.As(err, &marked) {
 		return err
 	}
-	return &imageAdmissionFailure{err: err}
+	return &imageAdmissionFailure{err: err, reason: reason}
 }
 
 func validateDecodedImageBatch(inputs []*decodedImageInput, maxCount, maxBytes int) error {
@@ -124,10 +131,10 @@ func validateDecodedImageBatch(inputs []*decodedImageInput, maxCount, maxBytes i
 		totalBytes += len(input.data)
 	}
 	if count > maxCount {
-		return markImageAdmissionFailure(errors.New("attachment-error: image batch exceeds the configured image-count limit"))
+		return markImageAdmissionFailureReason(errors.New("attachment-error: image batch exceeds the configured image-count limit"), "TOO_MANY_IMAGES")
 	}
 	if totalBytes > maxBytes {
-		return markImageAdmissionFailure(errors.New("attachment-error: image batch exceeds the configured aggregate image-byte limit"))
+		return markImageAdmissionFailureReason(errors.New("attachment-error: image batch exceeds the configured aggregate image-byte limit"), "IMAGE_BATCH_TOO_LARGE")
 	}
 	for _, input := range inputs {
 		if input != nil && imageExtension(input.mediaType) == "" {
@@ -158,10 +165,7 @@ func imageDimensions(mediaType string, data []byte) (int, int, error) {
 	}
 	config, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil || config.Width <= 0 || config.Height <= 0 {
-		if err == nil {
-			err = errors.New("invalid image dimensions")
-		}
-		return 0, 0, err
+		return 0, 0, errors.New("image data is malformed")
 	}
 	want := strings.TrimPrefix(mediaType, "image/")
 	if want == "jpeg" && format == "jpg" {
@@ -604,7 +608,7 @@ func sanitizeImageName(value string) string {
 func decodeImageBase64(encoded string) ([]byte, error) {
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil || encoded == "" || base64.StdEncoding.EncodeToString(data) != encoded {
-		return nil, markImageAdmissionFailure(errors.New("attachment-error: image data is not canonical base64"))
+		return nil, markImageAdmissionFailureReason(errors.New("attachment-error: image data is not canonical base64"), "INVALID_IMAGE_BASE64")
 	}
 	return data, nil
 }

@@ -688,7 +688,7 @@ func TestImagePromptStoresOnlyRefAndHydratesProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, rpcErr := e.sessionAttachment(map[string]any{"sessionId": otherID, "attachmentId": ref.AttachmentID}); rpcErr == nil || rpcErr.Code != "attachment-error" {
+	if _, rpcErr := e.sessionAttachment(map[string]any{"sessionId": otherID, "attachmentId": ref.AttachmentID}); rpcErr == nil || rpcErr.Code != "session/attachment-invalid" {
 		t.Fatalf("unauthorized session.attachment error = %#v", rpcErr)
 	}
 }

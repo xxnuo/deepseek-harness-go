@@ -16,6 +16,26 @@ type promptGateProvider struct {
 	started chan string
 }
 
+type imageRaceProvider struct {
+	promptGateProvider
+	capabilityStarted chan struct{}
+	capability        chan struct{}
+}
+
+func (p *imageRaceProvider) ResolveModelInfo(ctx context.Context, model string) (ModelInfo, error) {
+	select {
+	case <-p.capabilityStarted:
+	default:
+		close(p.capabilityStarted)
+	}
+	select {
+	case <-p.capability:
+		return ModelInfo{ID: model, Name: model, InputModalities: []string{"text", "image"}}, nil
+	case <-ctx.Done():
+		return ModelInfo{}, ctx.Err()
+	}
+}
+
 func (p *promptGateProvider) ID() string   { return "prompt-gate" }
 func (p *promptGateProvider) Name() string { return "Prompt Gate" }
 func (p *promptGateProvider) Models(context.Context) ([]ModelInfo, error) {
@@ -87,6 +107,21 @@ func waitForModelSubagentDetached(t *testing.T, e *Engine, childID string) {
 	}
 	e.modelSubagentMu.Unlock()
 	t.Fatalf("subagent %q did not settle: running=%v attached=%v parked=%v pending=%d steering=%d events=%d activation=%v disposing=%v owned=%d", childID, running, attached, parked, pending, steering, events, activation != nil, disposing, owned)
+}
+
+func waitForModelSubagentDisposing(t *testing.T, e *Engine, activation *modelSubagentActivation) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		e.modelSubagentMu.Lock()
+		disposing := activation.disposing
+		e.modelSubagentMu.Unlock()
+		if disposing {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("model subagent activation did not enter disposing state")
 }
 
 func TestContinuableModelSubagentRequiresPersistence(t *testing.T) {
@@ -244,6 +279,128 @@ func TestContinuableModelSubagentColdResumeUsesFirstDescriptorAndRestoresComposi
 	}
 	close(gate)
 	waitForModelSubagentDetached(t, e, childID)
+}
+
+func TestContinuableModelSubagentLiveImageRaceReturnsDraining(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	provider := &imageRaceProvider{
+		promptGateProvider: promptGateProvider{gates: map[string]chan struct{}{"child work": make(chan struct{})}, started: make(chan string, 2)},
+		capabilityStarted:  make(chan struct{}), capability: make(chan struct{}),
+	}
+	e.RegisterProvider(provider)
+	parent, err := e.CreateSession(t.Context(), e.Config().Workspace, "image-race-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(parent, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	result := executeRegisteredTool(t, e, "subagent", parent, map[string]any{
+		"description": "image race child", "prompt": "child work",
+	})
+	childID, _ := result.Value.(map[string]any)["subagentId"].(string)
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child model request did not start")
+	}
+
+	image := ContentBlock{Type: "image"}
+	delivery := make(chan error, 1)
+	go func() {
+		_, deliveryErr := e.promptContinuableModelSubagent(t.Context(), parent, childID, []ContentBlock{image}, map[string]any{"kind": "user"})
+		delivery <- deliveryErr
+	}()
+	select {
+	case <-provider.capabilityStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("image capability lookup did not start")
+	}
+	e.modelSubagentMu.Lock()
+	activation := e.modelSubagentActivations[childID]
+	e.modelSubagentMu.Unlock()
+	if activation == nil {
+		t.Fatal("live image race activation disappeared before drain")
+	}
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- e.drainModelSubagentDescendants(t.Context(), []string{parent}) }()
+	waitForModelSubagentDisposing(t, e, activation)
+	close(provider.capability)
+	select {
+	case deliveryErr := <-delivery:
+		if !IsSubagentServiceError(deliveryErr, "DRAINING") {
+			t.Fatalf("live image race error = %v", deliveryErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("live image race did not return")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestContinuableModelSubagentMaterializedImageRaceRollsBack(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	provider := &imageRaceProvider{
+		promptGateProvider: promptGateProvider{gates: map[string]chan struct{}{}, started: make(chan string, 2)},
+		capabilityStarted:  make(chan struct{}), capability: make(chan struct{}),
+	}
+	e.RegisterProvider(provider)
+	parent, err := e.CreateSession(t.Context(), e.Config().Workspace, "materialized-image-race-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(parent, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	result := executeRegisteredTool(t, e, "subagent", parent, map[string]any{
+		"description": "materialized image race child", "prompt": "child work",
+	})
+	childID, _ := result.Value.(map[string]any)["subagentId"].(string)
+	waitForModelSubagentDetached(t, e, childID)
+
+	delivery := make(chan error, 1)
+	go func() {
+		_, deliveryErr := e.promptContinuableModelSubagent(t.Context(), parent, childID, []ContentBlock{{Type: "image"}}, map[string]any{"kind": "user"})
+		delivery <- deliveryErr
+	}()
+	select {
+	case <-provider.capabilityStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("materialized image capability lookup did not start")
+	}
+	e.modelSubagentMu.Lock()
+	activation := e.modelSubagentActivations[childID]
+	e.modelSubagentMu.Unlock()
+	if activation == nil {
+		t.Fatal("materialized image race activation disappeared before drain")
+	}
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- e.drainModelSubagentDescendants(t.Context(), []string{parent}) }()
+	waitForModelSubagentDisposing(t, e, activation)
+	close(provider.capability)
+	select {
+	case deliveryErr := <-delivery:
+		if !IsSubagentServiceError(deliveryErr, "ACTIVATION_CLOSING") {
+			t.Fatalf("materialized image race error = %v", deliveryErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("materialized image race did not return")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatal(err)
+	}
+	child := mustSession(t, e, childID)
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	for _, event := range child.Events {
+		if event.Type != "user/message" {
+			continue
+		}
+		if strings.Contains(contentValueText(event.Data), "image") {
+			t.Fatal("materialized image race persisted a user message")
+		}
+	}
 }
 
 func TestModelSubagentDepthUsesPersistedMonotoneFloor(t *testing.T) {

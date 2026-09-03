@@ -122,7 +122,7 @@ func (e *Engine) streamFrames(ctx context.Context, kind string) <-chan streamFra
 						// Subscribe happens before the baseline snapshot to avoid a
 						// delivery gap. An event can therefore be present in both;
 						// sequence numbers are the authoritative deduplication key.
-						if event.Seq <= baselineLastSeq {
+						if int(event.Seq) <= baselineLastSeq {
 							continue
 						}
 						if !send(streamFrame{method: "session/event", payload: map[string]any{

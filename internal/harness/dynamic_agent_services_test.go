@@ -413,7 +413,8 @@ return {
     harness.handle('exercise', async () => {
       const handle = await ctx.agents.create({
         sessionId: 'cordis-agent-setup',
-        meta: { seedLength: 1, origin: 'subagent' },
+        meta: { isSeeded: true, origin: 'subagent' },
+        inheritedEventCount: 1,
         seed: [{ type: 'plugin/seed', seq: 0, time: 1, data: { ready: true }, ignorable: true }],
         setup: async agentCtx => {
           order.push('setup:' + agentCtx.agent.id)
@@ -428,6 +429,7 @@ return {
         order: [...order],
         header: handle.agent.session.header,
         firstLiveSeq: handle.agent.session.firstLiveSeq,
+        inheritedEventCount: handle.agent.session.inheritedEventCount,
         events: handle.agent.session.events.map(event => event.type),
         ctxSame: handle.agent.ctx.agent === handle.agent
       }
@@ -446,7 +448,7 @@ return {
 		t.Fatalf("publish order = %#v, want %#v", value["order"], wantOrder)
 	}
 	header := value["header"].(map[string]any)
-	if header["seedLength"] != float64(1) || header["origin"] != "subagent" || value["ctxSame"] != true {
+	if header["isSeeded"] != true || value["inheritedEventCount"] != float64(1) || header["origin"] != "subagent" || value["ctxSame"] != true {
 		t.Fatalf("agent setup surface = %#v", value)
 	}
 	if !reflect.DeepEqual(value["events"], []any{"plugin/seed", "session/end-seed"}) || value["firstLiveSeq"] != float64(1) {

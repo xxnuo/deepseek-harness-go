@@ -338,12 +338,12 @@ func acceptedDeepSeekSessionLogThrough(header SessionHeader, events []Event) (in
 		}
 		sessionID, ok := data["sessionId"].(string)
 		throughValue, throughOK := integerJSONValue(data["throughSeq"])
-		if !ok || sessionID == "" || !throughOK || throughValue < 0 || throughValue >= event.Seq {
+		if !ok || sessionID == "" || !throughOK || throughValue < 0 || throughValue >= int(event.Seq) {
 			return 0, fmt.Errorf("session-log-deepseek: malformed acceptance watermark at seq %d", event.Seq)
 		}
 		// Seeded acceptance markers belong to the inherited parent log and
 		// must never advance the child upload cursor.
-		if header.ParentSession != "" && event.Seq < header.SeedLength {
+		if header.ParentSession != "" && int(event.Seq) < header.SeedLength {
 			continue
 		}
 		if sessionID == header.ID && throughValue > through {
@@ -362,6 +362,10 @@ func integerJSONValue(value any) (int, bool) {
 	var integer int64
 	switch value := value.(type) {
 	case int:
+		integer = int64(value)
+	case SessionSeq:
+		integer = int64(value)
+	case SessionLogOffset:
 		integer = int64(value)
 	case int8:
 		integer = int64(value)

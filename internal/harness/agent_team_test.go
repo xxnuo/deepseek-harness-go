@@ -15,11 +15,11 @@ import (
 	"time"
 )
 
-func newAgentTeamEngine(t *testing.T, dataDir string, sqlite bool) *Engine {
-	return newAgentTeamEngineWithInvariants(t, dataDir, sqlite, false)
+func newAgentTeamEngine(t *testing.T, dataDir string) *Engine {
+	return newAgentTeamEngineWithInvariants(t, dataDir, false)
 }
 
-func newAgentTeamEngineWithInvariants(t *testing.T, dataDir string, sqlite, runtimeInvariants bool) *Engine {
+func newAgentTeamEngineWithInvariants(t *testing.T, dataDir string, runtimeInvariants bool) *Engine {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.DataDir, cfg.Workspace = dataDir, dataDir
@@ -30,13 +30,6 @@ func newAgentTeamEngineWithInvariants(t *testing.T, dataDir string, sqlite, runt
 		cfg.RuntimeInvariants = &RuntimeInvariantConfig{}
 	}
 	cfg.Persist = true
-	if sqlite {
-		store, err := NewSQLiteSessionStore(filepath.Join(dataDir, "sessions.sqlite"), SQLiteJournalWAL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cfg.SessionStore = store
-	}
 	engine, err := New(WithConfig(cfg))
 	if err != nil {
 		t.Fatal(err)
@@ -107,9 +100,9 @@ func (s *failingTeamFlushStore) Delete(ctx context.Context, id string) error {
 	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
 }
 
-func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader) error {
+func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) error {
 	if meta.ParentSession == "" {
-		return s.SessionStore.Create(ctx, meta)
+		return s.SessionStore.Create(ctx, meta, inheritedEventCount)
 	}
 	select {
 	case s.entered <- struct{}{}:
@@ -121,7 +114,7 @@ func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader
 	default:
 	}
 	<-s.release
-	return s.SessionStore.Create(context.Background(), meta)
+	return s.SessionStore.Create(context.Background(), meta, inheritedEventCount)
 }
 
 func (s *blockingTeamCreateStore) Flush(ctx context.Context, id string) error {
@@ -255,7 +248,7 @@ func TestAgentTeamConfigAndTextUseUpstreamNumericSemantics(t *testing.T) {
 }
 
 func TestAgentTeamInvariantRejectsInvalidCandidateBeforeAppend(t *testing.T) {
-	engine := newAgentTeamEngineWithInvariants(t, t.TempDir(), false, true)
+	engine := newAgentTeamEngineWithInvariants(t, t.TempDir(), true)
 	defer engine.Close()
 	id, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "team-invariant", "")
 	if err != nil {
@@ -283,7 +276,7 @@ func TestAgentTeamInvariantRejectsInvalidCandidateBeforeAppend(t *testing.T) {
 }
 
 func TestTeamServiceRunsTeammateMailboxAndTaskBoard(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	root, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "team-root", "")
 	if err != nil {
@@ -476,7 +469,7 @@ func TestAgentTeamTaskBoardLimitsTombstonesAndIDExhaustion(t *testing.T) {
 }
 
 func TestAgentTeamTaskBoardTransitionAndGraphMatrix(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	rootID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "task-matrix-root", "")
 	if err != nil {
@@ -615,7 +608,7 @@ func TestAgentTeamMessageLimitUsesJavaScriptJSONStringifyBytes(t *testing.T) {
 }
 
 func TestAgentTeamLiveTeammateAuthorityAndInterrupt(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	gate := make(chan struct{})
 	provider := &promptGateProvider{gates: map[string]chan struct{}{"live team work": gate}, started: make(chan string, 4)}
@@ -678,7 +671,7 @@ func TestAgentTeamLiveTeammateAuthorityAndInterrupt(t *testing.T) {
 }
 
 func TestAgentTeamMembershipUsesOwnedDescriptorAndParentTeamState(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	rootID, err := engine.CreateSession(t.Context(), engine.Config().Workspace, "identity-root", "")
 	if err != nil {
@@ -1011,7 +1004,7 @@ func TestAgentTeamMailboxTargetFlushFailureRecoversWithoutDuplicate(t *testing.T
 }
 
 func TestAgentTeamToolsAndPolicyAreScopedToExactMembers(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	rootID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "team-scope-root", "")
 	if err != nil {
@@ -1111,7 +1104,7 @@ func TestAgentTeamToolsShadowLegacyControlsOnlyForMembers(t *testing.T) {
 		t.Fatalf("Lead send_message schema = %#v", leadSend)
 	}
 	ordinarySend := parameters(ordinarySchemas, "send_message")
-	if ordinarySend["subagent_id"] == nil || ordinarySend["target"] != nil {
+	if ordinarySend["agent_id"] == nil || ordinarySend["subagent_id"] != nil || ordinarySend["target"] != nil {
 		t.Fatalf("ordinary send_message schema = %#v", ordinarySend)
 	}
 	if visible, visibleErr := engine.toolVisibleForSession(ordinary, "spawn_teammate"); visibleErr != nil || visible {
@@ -1141,7 +1134,7 @@ func TestAgentTeamToolsShadowLegacyControlsOnlyForMembers(t *testing.T) {
 }
 
 func TestAgentTeamToolsAreCompleteAndExecutable(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	root, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "team-tools", "")
 	if err != nil {
@@ -1204,70 +1197,64 @@ func TestAgentTeamToolsAreCompleteAndExecutable(t *testing.T) {
 	}
 }
 
-func TestAgentTeamMailboxRecoversAcrossJSONLAndSQLite(t *testing.T) {
-	for _, sqlite := range []bool{false, true} {
-		name := "jsonl"
-		if sqlite {
-			name = "sqlite"
+func TestAgentTeamMailboxRecoversAcrossJSONL(t *testing.T) {
+	t.Run("jsonl", func(t *testing.T) {
+		dataDir := t.TempDir()
+		first := newAgentTeamEngine(t, dataDir)
+		root, err := first.CreateSession(context.Background(), dataDir, "persisted-team", "")
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Run(name, func(t *testing.T) {
-			dataDir := t.TempDir()
-			first := newAgentTeamEngine(t, dataDir, sqlite)
-			root, err := first.CreateSession(context.Background(), dataDir, "persisted-team", "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			spawned, err := first.AgentTeams().SpawnTeammate(context.Background(), root, SpawnTeammateRequest{
-				Name: "persisted-worker", Description: "Persistent worker", Prompt: []ContentBlock{{Type: "text", Text: "initial"}},
-				Context: "fresh", Provider: "spawn",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			child := spawned.Member.ID
-			waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if err := first.WaitForIdle(waitCtx, child); err != nil {
-				cancel()
-				t.Fatal(err)
-			}
-			cancel()
-			if err := first.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			second := newAgentTeamEngine(t, dataDir, sqlite)
-			if _, err := second.CreateSession(context.Background(), dataDir, root, ""); err != nil {
-				t.Fatal(err)
-			}
-			queued, err := second.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-				Target: "persisted-worker", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "recover me"}},
-			})
-			if err != nil || queued.Status != "queued" {
-				t.Fatalf("queued = %#v, %v", queued, err)
-			}
-			if _, err := second.CreateSession(context.Background(), dataDir, child, ""); err != nil {
-				t.Fatal(err)
-			}
-			rootSession := mustSession(t, second, root)
-			rootSession.mu.Lock()
-			rootEvents := append([]Event(nil), rootSession.Events...)
-			rootSession.mu.Unlock()
-			fold, err := FoldTeam(root, rootEvents)
-			if err != nil || !reflect.DeepEqual(fold.Delivered, []string{queued.MessageID}) {
-				t.Fatalf("recovered fold = %#v, %v", fold, err)
-			}
-			if !sessionHasTeamMessage(mustSession(t, second, child), queued.MessageID) {
-				t.Fatal("recovered message was not durably staged in target Session")
-			}
-			if err := second.Close(); err != nil {
-				t.Fatal(err)
-			}
+		spawned, err := first.AgentTeams().SpawnTeammate(context.Background(), root, SpawnTeammateRequest{
+			Name: "persisted-worker", Description: "Persistent worker", Prompt: []ContentBlock{{Type: "text", Text: "initial"}},
+			Context: "fresh", Provider: "spawn",
 		})
-	}
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := spawned.Member.ID
+		waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := first.WaitForIdle(waitCtx, child); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		second := newAgentTeamEngine(t, dataDir)
+		if _, err := second.CreateSession(context.Background(), dataDir, root, ""); err != nil {
+			t.Fatal(err)
+		}
+		queued, err := second.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
+			Target: "persisted-worker", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "recover me"}},
+		})
+		if err != nil || queued.Status != "queued" {
+			t.Fatalf("queued = %#v, %v", queued, err)
+		}
+		if _, err := second.CreateSession(context.Background(), dataDir, child, ""); err != nil {
+			t.Fatal(err)
+		}
+		rootSession := mustSession(t, second, root)
+		rootSession.mu.Lock()
+		rootEvents := append([]Event(nil), rootSession.Events...)
+		rootSession.mu.Unlock()
+		fold, err := FoldTeam(root, rootEvents)
+		if err != nil || !reflect.DeepEqual(fold.Delivered, []string{queued.MessageID}) {
+			t.Fatalf("recovered fold = %#v, %v", fold, err)
+		}
+		if !sessionHasTeamMessage(mustSession(t, second, child), queued.MessageID) {
+			t.Fatal("recovered message was not durably staged in target Session")
+		}
+		if err := second.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestAgentTeamAcknowledgesTargetSideReceipt(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	rootID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "receipt-root", "")
 	if err != nil {
@@ -1392,7 +1379,7 @@ func TestAgentTeamDispatchRechecksLiveReceiptAfterFlush(t *testing.T) {
 }
 
 func TestAgentTeamWaitPreservesCauseAndClosesAdmission(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	rootID, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "wait-lifecycle-root", "")
 	if err != nil {
 		t.Fatal(err)
@@ -1504,7 +1491,7 @@ func TestAgentTeamCloseAwaitsAdmittedReceiptAcknowledgement(t *testing.T) {
 }
 
 func TestAgentTeamCloseAggregatesAdmittedOperationFailures(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	service := engine.AgentTeams()
 	creationCtx, creation, err := service.beginCreation(t.Context())
 	if err != nil {
@@ -1547,7 +1534,7 @@ func TestAgentTeamCloseAggregatesAdmittedOperationFailures(t *testing.T) {
 }
 
 func TestAgentTeamRosterDiscoverySurfacesMalformedParentState(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
 	rootID, err := engine.CreateSession(t.Context(), engine.Config().Workspace, "discovery-root", "")
 	if err != nil {
@@ -1583,7 +1570,7 @@ func TestAgentTeamRosterDiscoverySurfacesMalformedParentState(t *testing.T) {
 }
 
 func TestAgentTeamCloseReleasesRosterChildrenOnly(t *testing.T) {
-	engine := newAgentTeamEngine(t, t.TempDir(), false)
+	engine := newAgentTeamEngine(t, t.TempDir())
 	root, err := engine.CreateSession(context.Background(), engine.Config().Workspace, "close-team-root", "")
 	if err != nil {
 		t.Fatal(err)

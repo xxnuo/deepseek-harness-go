@@ -164,19 +164,19 @@ func TestSessionQueryEventTraceTracksSurfaceReplacementChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := e.appendEventWithMetadata(s, "assistant/message", map[string]any{"message": map[string]any{"content": []ContentBlock{{Type: "text", Text: "replacement one"}}}}, map[string]any{"op": "replace", "start": first.Seq, "end": first.Seq}, []int{first.Seq}, false)
+	second, err := e.appendEventWithMetadata(s, "assistant/message", map[string]any{"message": map[string]any{"content": []ContentBlock{{Type: "text", Text: "replacement one"}}}}, map[string]any{"op": "replace", "start": first.Seq, "end": first.Seq}, []int{int(first.Seq)}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = e.appendEventWithMetadata(s, "assistant/message", map[string]any{"message": map[string]any{"content": []ContentBlock{{Type: "text", Text: "replacement two"}}}}, map[string]any{"op": "replace", "start": second.Seq, "end": second.Seq}, []int{second.Seq}, false)
+	_, err = e.appendEventWithMetadata(s, "assistant/message", map[string]any{"message": map[string]any{"content": []ContentBlock{{Type: "text", Text: "replacement two"}}}}, map[string]any{"op": "replace", "start": second.Seq, "end": second.Seq}, []int{int(second.Seq)}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	trace, err := e.sessionQueryEventTrace(id, id, first.Seq)
+	trace, err := e.sessionQueryEventTrace(id, id, int(first.Seq))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := trace["replacementChain"].([]int); len(got) != 2 || got[0] != second.Seq || got[1] != second.Seq+1 {
+	if got := trace["replacementChain"].([]int); len(got) != 2 || got[0] != int(second.Seq) || got[1] != int(second.Seq)+1 {
 		t.Fatalf("replacement chain = %#v", got)
 	}
 	if got := trace["target"].(map[string]any)["surface"]; got != string(sessionSurfaceShadowed) {

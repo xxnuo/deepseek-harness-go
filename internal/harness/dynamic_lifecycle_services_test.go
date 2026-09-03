@@ -325,7 +325,7 @@ return {
 	if !reflect.DeepEqual(store.deleted, []string{"rollback-child"}) {
 		t.Fatalf("rolled back ids = %#v", store.deleted)
 	}
-	if err := backend.Create(t.Context(), SessionHeader{Version: SessionFormatVersion, ID: "rollback-child", CreatedAt: 1}); err != nil {
+	if err := backend.Create(t.Context(), SessionHeader{Version: SessionFormatVersion, ID: "rollback-child", CreatedAt: 1}, 0); err != nil {
 		t.Fatalf("persistence registration remained: %v", err)
 	}
 }
@@ -408,71 +408,65 @@ func TestDynamicCordisEnterRollsBackFailedModelSelectionPolicy(t *testing.T) {
 }
 
 func TestDynamicCordisPersistenceRestoreReusesArtifactAndQueues(t *testing.T) {
-	openers := []struct {
+	opener := struct {
 		name string
 		open func(string) (SessionStore, error)
-	}{
-		{name: "jsonl", open: func(root string) (SessionStore, error) { return NewJSONLSessionStore(filepath.Join(root, "sessions")) }},
-		{name: "sqlite", open: func(root string) (SessionStore, error) {
-			return NewSQLiteSessionStore(filepath.Join(root, "sessions.db"), SQLiteJournalDelete)
-		}},
-	}
-	for _, opener := range openers {
-		for _, existingMarker := range []bool{false, true} {
-			name := opener.name + "/missing-marker"
-			if existingMarker {
-				name = opener.name + "/existing-marker"
+	}{name: "jsonl", open: func(root string) (SessionStore, error) { return NewJSONLSessionStore(filepath.Join(root, "sessions")) }}
+	for _, existingMarker := range []bool{false, true} {
+		name := opener.name + "/missing-marker"
+		if existingMarker {
+			name = opener.name + "/existing-marker"
+		}
+		t.Run(name, func(t *testing.T) {
+			root, workspace := t.TempDir(), t.TempDir()
+			id := "restore-" + opener.name
+			meta := SessionHeader{Version: SessionFormatVersion, ID: id, CreatedAt: 1, CWD: workspace}
+			events := []Event{
+				{Type: "agent/inbox/spliced", Seq: 0, Time: 1, Data: map[string]any{
+					"target": "next-turn", "start": 0, "inserted": []any{map[string]any{
+						"id": "pending-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "pending prompt"}}, "source": map[string]any{"kind": "user"},
+					}},
+				}},
+				{Type: "agent/inbox/spliced", Seq: 1, Time: 2, Data: map[string]any{
+					"target": "next-step", "start": 0, "inserted": []any{map[string]any{
+						"id": "steering-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "steering prompt"}}, "source": map[string]any{"kind": "user"},
+					}},
+				}},
 			}
-			t.Run(name, func(t *testing.T) {
-				root, workspace := t.TempDir(), t.TempDir()
-				id := "restore-" + opener.name
-				meta := SessionHeader{Version: SessionFormatVersion, ID: id, CreatedAt: 1, CWD: workspace}
-				events := []Event{
-					{Type: "agent/inbox/spliced", Seq: 0, Time: 1, Data: map[string]any{
-						"target": "next-turn", "start": 0, "inserted": []any{map[string]any{
-							"id": "pending-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "pending prompt"}}, "source": map[string]any{"kind": "user"},
-						}},
-					}},
-					{Type: "agent/inbox/spliced", Seq: 1, Time: 2, Data: map[string]any{
-						"target": "next-step", "start": 0, "inserted": []any{map[string]any{
-							"id": "steering-1", "role": "user", "content": []any{map[string]any{"type": "text", "text": "steering prompt"}}, "source": map[string]any{"kind": "user"},
-						}},
-					}},
-				}
-				if existingMarker {
-					events = append(events, Event{Type: "session/end-seed", Seq: 2, Time: 3, Data: map[string]any{}})
-				}
-				initial, err := opener.open(root)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := initial.Create(t.Context(), meta); err != nil {
-					t.Fatal(err)
-				}
-				if err := initial.Append(t.Context(), id, events); err != nil {
-					t.Fatal(err)
-				}
-				if err := initial.Close(); err != nil {
-					t.Fatal(err)
-				}
+			if existingMarker {
+				events = append(events, Event{Type: "session/end-seed", Seq: 2, Time: 3, Data: map[string]any{}})
+			}
+			initial, err := opener.open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := initial.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
+				t.Fatal(err)
+			}
+			if err := initial.Append(t.Context(), id, events); err != nil {
+				t.Fatal(err)
+			}
+			if err := initial.Close(); err != nil {
+				t.Fatal(err)
+			}
 
-				store, err := opener.open(root)
-				if err != nil {
-					t.Fatal(err)
-				}
-				cfg := DefaultConfig()
-				cfg.DataDir, cfg.Workspace, cfg.Provider, cfg.Model = t.TempDir(), workspace, "echo", "echo"
-				cfg.SessionTitleLLM.Enabled = false
-				e, err := New(WithConfig(cfg), WithSessionStore(store))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = e.Close() })
-				owner, err := e.CreateSession(t.Context(), workspace, "restore-owner-"+opener.name, "")
-				if err != nil {
-					t.Fatal(err)
-				}
-				pluginID, runID := runDynamicBuiltinPlugin(t, e, owner, "rst", `
+			store, err := opener.open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.DataDir, cfg.Workspace, cfg.Provider, cfg.Model = t.TempDir(), workspace, "echo", "echo"
+			cfg.SessionTitleLLM.Enabled = false
+			e, err := New(WithConfig(cfg), WithSessionStore(store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Close() })
+			owner, err := e.CreateSession(t.Context(), workspace, "restore-owner-"+opener.name, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pluginID, runID := runDynamicBuiltinPlugin(t, e, owner, "rst", `
 let detach
 return {
   inject: ['sessions', 'agents'],
@@ -500,64 +494,63 @@ return {
     })
   }
 }`)
-				seed := make([]any, len(events))
-				for index, event := range events {
-					seed[index] = dynamicSessionEventValue(event)
-				}
-				result := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "resume", map[string]any{
-					"meta": dynamicSessionHeaderValue(meta), "seed": seed,
-				})
-				if !result.OK {
-					t.Fatalf("resume = %#v", result)
-				}
-				value := result.Value.(map[string]any)
-				if value["firstLiveSeq"] != float64(len(events)) || !reflect.DeepEqual(value["types"], []any{
-					"agent/inbox/spliced", "agent/inbox/spliced", "session/end-seed", "plugin/test",
-				}) {
-					t.Fatalf("restored session = %#v", value)
-				}
-				session, err := e.getSession(id)
-				if err != nil {
-					t.Fatal(err)
-				}
-				session.mu.Lock()
-				pending, steering := append([]*queuedPrompt(nil), session.pending...), append([]*queuedPrompt(nil), session.steering...)
-				session.mu.Unlock()
-				if len(pending) != 1 || pending[0].text != "pending prompt" || len(steering) != 1 || steering[0].text != "steering prompt" {
-					t.Fatalf("restored queues = pending %#v, steering %#v", pending, steering)
-				}
-				if detached := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "detach", nil); !detached.OK || detached.Value != true {
-					t.Fatalf("detach = %#v", detached)
-				}
-				if _, err := e.getSession(id); err == nil {
-					t.Fatal("detached restored session remained live")
-				}
-				inspection, err := store.Load(t.Context(), id)
-				if err != nil {
-					t.Fatalf("artifact was removed on detach: %v", err)
-				}
-				if len(inspection.Events) != 4 {
-					t.Fatalf("persisted events = %#v", inspection.Events)
-				}
-				resumed := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "resumeAgent", map[string]any{"id": id})
-				if !resumed.OK {
-					t.Fatalf("persisted agent resume = %#v", resumed)
-				}
-				resumedValue := resumed.Value.(map[string]any)
-				if resumedValue["firstLiveSeq"] != float64(4) || !reflect.DeepEqual(resumedValue["types"], []any{
-					"agent/inbox/spliced", "agent/inbox/spliced", "session/end-seed", "plugin/test", "session/end-seed",
-				}) {
-					t.Fatalf("persisted agent = %#v", resumedValue)
-				}
-				inspection, err = store.Load(t.Context(), id)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(inspection.Events) != 7 || inspection.Events[5].Type != "agent/inbox/spliced" || inspection.Events[6].Type != "agent/inbox/spliced" {
-					t.Fatalf("persisted agent events = %#v", inspection.Events)
-				}
+			seed := make([]any, len(events))
+			for index, event := range events {
+				seed[index] = dynamicSessionEventValue(event)
+			}
+			result := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "resume", map[string]any{
+				"meta": dynamicSessionHeaderValue(meta), "seed": seed,
 			})
-		}
+			if !result.OK {
+				t.Fatalf("resume = %#v", result)
+			}
+			value := result.Value.(map[string]any)
+			if value["firstLiveSeq"] != float64(len(events)) || !reflect.DeepEqual(value["types"], []any{
+				"agent/inbox/spliced", "agent/inbox/spliced", "session/end-seed", "plugin/test",
+			}) {
+				t.Fatalf("restored session = %#v", value)
+			}
+			session, err := e.getSession(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session.mu.Lock()
+			pending, steering := append([]*queuedPrompt(nil), session.pending...), append([]*queuedPrompt(nil), session.steering...)
+			session.mu.Unlock()
+			if len(pending) != 1 || pending[0].text != "pending prompt" || len(steering) != 1 || steering[0].text != "steering prompt" {
+				t.Fatalf("restored queues = pending %#v, steering %#v", pending, steering)
+			}
+			if detached := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "detach", nil); !detached.OK || detached.Value != true {
+				t.Fatalf("detach = %#v", detached)
+			}
+			if _, err := e.getSession(id); err == nil {
+				t.Fatal("detached restored session remained live")
+			}
+			inspection, err := store.Load(t.Context(), id)
+			if err != nil {
+				t.Fatalf("artifact was removed on detach: %v", err)
+			}
+			if len(inspection.Events) != 4 {
+				t.Fatalf("persisted events = %#v", inspection.Events)
+			}
+			resumed := e.DynamicCordisInvoke(t.Context(), pluginID, runID, "resumeAgent", map[string]any{"id": id})
+			if !resumed.OK {
+				t.Fatalf("persisted agent resume = %#v", resumed)
+			}
+			resumedValue := resumed.Value.(map[string]any)
+			if resumedValue["firstLiveSeq"] != float64(4) || !reflect.DeepEqual(resumedValue["types"], []any{
+				"agent/inbox/spliced", "agent/inbox/spliced", "session/end-seed", "plugin/test", "session/end-seed",
+			}) {
+				t.Fatalf("persisted agent = %#v", resumedValue)
+			}
+			inspection, err = store.Load(t.Context(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(inspection.Events) != 7 || inspection.Events[5].Type != "agent/inbox/spliced" || inspection.Events[6].Type != "agent/inbox/spliced" {
+				t.Fatalf("persisted agent events = %#v", inspection.Events)
+			}
+		})
 	}
 }
 
@@ -568,7 +561,7 @@ func TestJSONLSessionStoreDeleteRemovesMaterializedSession(t *testing.T) {
 	}
 	defer store.Close()
 	meta := SessionHeader{Version: SessionFormatVersion, ID: "delete-materialized", CreatedAt: 1}
-	if err := store.Create(t.Context(), meta); err != nil {
+	if err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Append(t.Context(), meta.ID, []Event{{Type: "plugin/test", Seq: 0, Time: 1, Data: nil, Ignorable: true}}); err != nil {
@@ -581,7 +574,7 @@ func TestJSONLSessionStoreDeleteRemovesMaterializedSession(t *testing.T) {
 	if _, err := os.Stat(location.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("materialized artifact remained: %v", err)
 	}
-	if err := store.Create(t.Context(), meta); err != nil {
+	if err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatalf("session remained registered: %v", err)
 	}
 }

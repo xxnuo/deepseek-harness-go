@@ -359,7 +359,7 @@ func successfulAttemptChunkSeqs(session *Session, turn, step, stepStartSeq int) 
 	session.mu.Unlock()
 	boundary := stepStartSeq
 	for _, event := range events {
-		if event.Seq <= stepStartSeq {
+		if int(event.Seq) <= stepStartSeq {
 			continue
 		}
 		data, ok := event.Data.(map[string]any)
@@ -368,19 +368,19 @@ func successfulAttemptChunkSeqs(session *Session, turn, step, stepStartSeq int) 
 		}
 		if event.Type == "llm/retry-started" && eventInt(data["turn"]) == turn && eventInt(data["step"]) == step ||
 			event.Type == "compaction/end" && eventInt(data["turn"]) == turn {
-			boundary = event.Seq
+			boundary = int(event.Seq)
 		}
 	}
 	seqs := make([]int, 0)
 	for _, event := range events {
-		if event.Seq <= boundary || event.Type != "assistant/chunk" {
+		if int(event.Seq) <= boundary || event.Type != "assistant/chunk" {
 			continue
 		}
 		data, ok := event.Data.(map[string]any)
 		if !ok || eventInt(data["turn"]) != turn || eventInt(data["step"]) != step {
 			continue
 		}
-		seqs = append(seqs, event.Seq)
+		seqs = append(seqs, int(event.Seq))
 	}
 	return seqs
 }
@@ -389,6 +389,10 @@ func eventInt(value any) int {
 	switch number := value.(type) {
 	case int:
 		return number
+	case SessionSeq:
+		return int(number)
+	case SessionLogOffset:
+		return int(number)
 	case int8:
 		return int(number)
 	case int16:

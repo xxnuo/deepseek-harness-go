@@ -6,7 +6,7 @@ import (
 )
 
 func init() {
-	ConfigureRuntime("0.1.2-alpha.1", func() (AssetPaths, error) {
+	ConfigureRuntime("0.1.2-alpha.4", func() (AssetPaths, error) {
 		root := filepath.Join(os.TempDir(), "deepseek-harness-go-test-assets")
 		return MaterializeEmbeddedAssets(root)
 	})

@@ -88,7 +88,7 @@ func TestSessionProjectionCacheMandatoryWritesColdReadAndStaleWriteBack(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitProjectionCacheSeq(t, engine, id, end.Seq)
+	waitProjectionCacheSeq(t, engine, id, int(end.Seq))
 
 	if _, _, err := engine.RenameSession(id, "Fresh title"); err != nil {
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestSessionProjectionCacheMandatoryWritesColdReadAndStaleWriteBack(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.AsOfSeq != end.Seq+1 || snapshot.Values["title"] != "Fresh title" {
+	if snapshot.AsOfSeq != int(end.Seq)+1 || snapshot.Values["title"] != "Fresh title" {
 		t.Fatalf("stale cache refresh = %#v", snapshot)
 	}
 	waitProjectionCacheSeq(t, engine, id, snapshot.AsOfSeq)

@@ -102,7 +102,7 @@ func foldTokenSurface(nodes []tokenSurfaceNode, event Event) (int, []tokenSurfac
 	}
 	tokens := estimateProjectionEvent(event)
 	if isAppendSurfaceEvent(event) {
-		next := append(append([]tokenSurfaceNode(nil), nodes...), tokenSurfaceNode{seq: event.Seq, tokens: tokens})
+		next := append(append([]tokenSurfaceNode(nil), nodes...), tokenSurfaceNode{seq: int(event.Seq), tokens: tokens})
 		return tokens, next, tokens, nil
 	}
 	start, end, ok := surfaceReplaceBounds(event.SurfaceOp)
@@ -126,7 +126,7 @@ func foldTokenSurface(nodes []tokenSurfaceNode, event Event) (int, []tokenSurfac
 		removed += node.tokens
 	}
 	next := append([]tokenSurfaceNode(nil), nodes...)
-	next = append(next[:startIndex], append([]tokenSurfaceNode{{seq: event.Seq, tokens: tokens}}, next[endIndex+1:]...)...)
+	next = append(next[:startIndex], append([]tokenSurfaceNode{{seq: int(event.Seq), tokens: tokens}}, next[endIndex+1:]...)...)
 	return tokens, next, tokens - removed, nil
 }
 
@@ -158,7 +158,7 @@ func providerAssistantTokens(events []Event, assistant Event, durableTokens int)
 	tools := map[int]*toolChunk{}
 	indices := make([]int, 0)
 	for _, seq := range assistant.SourceEventSeqs {
-		if seq < 0 || seq >= assistant.Seq || seq >= len(events) {
+		if seq < 0 || seq >= int(assistant.Seq) || seq >= len(events) {
 			return 0, fmt.Errorf("token meter: assistant/message at seq %d source seq %d is not earlier", assistant.Seq, seq)
 		}
 		if seen[seq] {

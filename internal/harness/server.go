@@ -330,6 +330,19 @@ func (e *Engine) Handler() http.Handler {
 		}
 		e.handleWebSocket(w, r, "host")
 	})
+	mux.HandleFunc("/api/remote.mux", func(w http.ResponseWriter, r *http.Request) {
+		if !e.allowed(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodGet && !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			w.Header().Set("Connection", "Upgrade")
+			w.Header().Set("Upgrade", "websocket")
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		e.handleRemoteStreamMux(w, r)
+	})
 	mux.HandleFunc("/api/", e.apiHandler)
 	mux.HandleFunc("/api/session.export", e.sessionExportHandler)
 	mux.HandleFunc("/plugins/events", e.servePluginEvents)
@@ -599,8 +612,8 @@ func (e *Engine) ExportSession(id string, w io.Writer) error {
 	if s.Header.ParentSession != "" {
 		header["parentSession"] = s.Header.ParentSession
 	}
-	if s.Header.SeedLength != 0 {
-		header["seedLength"] = s.Header.SeedLength
+	if s.Header.IsSeeded {
+		header["seedLength"] = int(s.InheritedEventCount)
 	}
 	if s.Header.Origin != "" {
 		header["origin"] = s.Header.Origin

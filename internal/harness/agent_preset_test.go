@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,6 +82,42 @@ func TestAgentPresetSelectPersistsEffectivePresetAndForwardsEvent(t *testing.T) 
 	}
 }
 
+func TestAlpha4PresetWebFetchAndPTCWorkflowDefaults(t *testing.T) {
+	defaultConfig := DefaultConfig()
+	if defaultConfig.WebFetchProvider != "http" || defaultConfig.WebTools == nil || !defaultConfig.WebTools.FetchEnabled {
+		t.Fatalf("base web fetch defaults = provider %q tools %#v", defaultConfig.WebFetchProvider, defaultConfig.WebTools)
+	}
+	e := newIntegrationEngine(t)
+	for _, test := range []struct {
+		preset       string
+		wantWorkflow bool
+	}{
+		{preset: "standard", wantWorkflow: true},
+		{preset: "cordis", wantWorkflow: true},
+		{preset: "ptc", wantWorkflow: false},
+	} {
+		t.Run(test.preset, func(t *testing.T) {
+			id, err := e.CreateSession(t.Context(), e.Config().Workspace, "alpha4-preset-"+test.preset, test.preset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeConfig, err := e.runtimeForSession(mustSession(t, e, id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtimeConfig.webTools == nil || !runtimeConfig.webTools.FetchEnabled {
+				t.Fatalf("%s web tools = %#v", test.preset, runtimeConfig.webTools)
+			}
+			if runtimeConfig.toolNames["workflow"] != test.wantWorkflow || !runtimeConfig.toolNames["ralph"] {
+				t.Fatalf("%s tools = workflow %v ralph %v", test.preset, runtimeConfig.toolNames["workflow"], runtimeConfig.toolNames["ralph"])
+			}
+			if runtimeConfig.workflowProvider == "" {
+				t.Fatalf("%s lost workflow worker runtime", test.preset)
+			}
+		})
+	}
+}
+
 func TestCreateSessionAdoptsOnlyMatchingEffectivePreset(t *testing.T) {
 	e := newIntegrationEngine(t)
 	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "preset-adoption", "standard")
@@ -99,7 +139,7 @@ func TestCreateSessionAdoptsOnlyMatchingEffectivePreset(t *testing.T) {
 	if !errors.As(err, &conflict) || conflict.ExistingPreset != "minimal" {
 		t.Fatalf("stale preset conflict = %#v", err)
 	}
-	if got := errorToRPC(err); got.Code != "agent-preset-conflict" || got.Details.(map[string]any)["existingPreset"] != "minimal" {
+	if got := errorToRPC(err); got.Code != "agent-preset/conflict" || got.Details.(map[string]any)["existingPreset"] != "minimal" {
 		t.Fatalf("RPC conflict = %#v", got)
 	}
 }
@@ -136,13 +176,102 @@ func TestSessionCreateRPCPreservesOmittedPresetDuringBlankReuse(t *testing.T) {
 		"workspaceId": workspace.WorkspaceID,
 		"sessionId":   sessionID,
 		"agentPreset": "standard",
-	}); rpcErr == nil || rpcErr.Code != "agent-preset-conflict" {
+	}); rpcErr == nil || rpcErr.Code != "agent-preset/conflict" {
 		t.Fatalf("explicit stale preset = %#v", rpcErr)
 	}
 	if _, rpcErr := dispatchTestRPC(t, e, "session.create", map[string]any{
 		"workspaceId": workspace.WorkspaceID,
 		"agentPreset": true,
-	}); rpcErr == nil || rpcErr.Code != "bad-request" {
+	}); rpcErr == nil || rpcErr.Code != "gateway/bad-request" {
 		t.Fatalf("non-string preset = %#v", rpcErr)
+	}
+}
+
+func TestAgentPresetAuthoringCopiesWholeDirectory(t *testing.T) {
+	systemRoot := t.TempDir()
+	source := filepath.Join(systemRoot, "source")
+	if err := os.MkdirAll(filepath.Join(source, "skills", "demo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"agent.cordis.yml":          "- id: demo\n  name: demo\n",
+		"preset.yml":                "name: Source\ndescription: Keeps context.\norder: 1\n",
+		"skills/demo/SKILL.md":      "# demo\n",
+		"skills/demo/executable.sh": "#!/bin/sh\n",
+	} {
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(path, ".sh") {
+			mode = 0o755
+		}
+		if err := os.WriteFile(filepath.Join(source, filepath.FromSlash(path)), []byte(content), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("SKILL.md", filepath.Join(source, "skills", "demo", "linked.md")); err != nil && runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	e := &Engine{cfg: Config{DataDir: dataDir, PresetDir: systemRoot}}
+	if _, rpcErr := e.copyPreset("source", "mine", ""); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	target := filepath.Join(dataDir, ".agent-presets", "mine")
+	if content, err := os.ReadFile(filepath.Join(target, "skills", "demo", "SKILL.md")); err != nil || string(content) != "# demo\n" {
+		t.Fatalf("copied skill = %q, %v", content, err)
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Lstat(filepath.Join(target, "skills", "demo", "linked.md")); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("dereferenced asset = %#v, %v", info, err)
+		}
+		for path, want := range map[string]os.FileMode{
+			".":                         0o700,
+			"skills/demo/SKILL.md":      0o600,
+			"skills/demo/executable.sh": 0o700,
+		} {
+			info, err := os.Stat(filepath.Join(target, filepath.FromSlash(path)))
+			if err != nil {
+				t.Fatalf("stat copied path %s: %v", path, err)
+			}
+			if got := info.Mode().Perm(); got != want {
+				t.Fatalf("mode %s = %#o, want %#o", path, got, want)
+			}
+		}
+	}
+	metadata, err := os.ReadFile(filepath.Join(target, "preset.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := string(metadata); !strings.Contains(text, "description: Keeps context.") || strings.Contains(text, "name:") || strings.Contains(text, "order:") {
+		t.Fatalf("copied metadata = %q", text)
+	}
+}
+
+func TestAgentPresetErrorsCarryStableDetails(t *testing.T) {
+	systemRoot := t.TempDir()
+	source := filepath.Join(systemRoot, "source")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "agent.cordis.yml"), []byte("- id: demo\n  name: demo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{cfg: Config{DataDir: t.TempDir(), PresetDir: systemRoot}}
+
+	missing := e.presetNotFound("missing")
+	missingDetails, _ := missing.Details.(map[string]any)
+	available, _ := missingDetails["available"].([]string)
+	if missing.Code != "agent-preset/not-found" || len(available) != 1 || available[0] != "source" {
+		t.Fatalf("missing preset error = %#v", missing)
+	}
+	_, invalid := e.copyPreset("source", "Upper", "")
+	invalidDetails, _ := invalid.Details.(map[string]any)
+	if invalid.Code != "agent-preset/invalid" || !strings.Contains(invalidDetails["reason"].(string), "must match") {
+		t.Fatalf("invalid preset error = %#v", invalid)
+	}
+	readOnly := e.removePreset("source")
+	readOnlyDetails, _ := readOnly.Details.(map[string]any)
+	if readOnly.Code != "agent-preset/read-only" || !strings.Contains(readOnlyDetails["reason"].(string), "ships with the deployment") {
+		t.Fatalf("read-only preset error = %#v", readOnly)
 	}
 }

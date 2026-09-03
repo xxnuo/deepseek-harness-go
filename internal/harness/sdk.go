@@ -703,7 +703,6 @@ func detachSDKSessionRecordWithDynamicOrigin(e *Engine, origin *dynamicCordisRun
 			item.done <- promptOutcome{err: errors.New("SDK server shut down before the prompt ran")}
 		}
 	}
-	setupErr := e.subagentActivationSetups.releaseChild(session)
 	jobsErr := e.jobs.disposeOwner(id, "owner disposed")
 	terminalErr := e.terminals.closeOwner(id)
 	e.shells.closeOwner(id)
@@ -712,7 +711,7 @@ func detachSDKSessionRecordWithDynamicOrigin(e *Engine, origin *dynamicCordisRun
 	} else {
 		e.emitDynamicCordisScopedContained(id, "session/disposed", dynamicSessionView(session))
 	}
-	return errors.Join(setupErr, jobsErr, terminalErr)
+	return errors.Join(jobsErr, terminalErr)
 }
 
 type sdkSessionLineage struct {

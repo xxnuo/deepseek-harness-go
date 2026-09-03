@@ -221,7 +221,7 @@ func sessionQueryHeadersCompatible(left, right SessionHeader) bool {
 		left.CreatedAt == right.CreatedAt &&
 		left.CWD == right.CWD &&
 		left.ParentSession == right.ParentSession &&
-		left.SeedLength == right.SeedLength &&
+		left.IsSeeded == right.IsSeeded &&
 		left.DelegationDepth == right.DelegationDepth
 }
 
@@ -769,13 +769,13 @@ func (e *Engine) sessionQueryAnalyzeEvents(sessionID string, events []Event) (se
 		current:           map[int]bool{},
 	}
 	for index, event := range events {
-		if event.Seq != index {
+		if int(event.Seq) != index {
 			return analysis, fmt.Errorf("SESSION_QUERY_INVALID_SURFACE: session %q has non-contiguous event seq %d at index %d", sessionID, event.Seq, index)
 		}
 		if event.SourceEventSeqs != nil {
 			seen := make(map[int]bool, len(event.SourceEventSeqs))
 			for _, source := range event.SourceEventSeqs {
-				if source < 0 || source >= event.Seq {
+				if source < 0 || source >= int(event.Seq) {
 					return analysis, fmt.Errorf("SESSION_QUERY_INVALID_SURFACE: event %d cites invalid source seq %d", event.Seq, source)
 				}
 				if seen[source] {
@@ -796,7 +796,7 @@ func (e *Engine) sessionQueryAnalyzeEvents(sessionID string, events []Event) (se
 			continue
 		}
 		if isAppendSurfaceEvent(event) {
-			surface = append(surface, event.Seq)
+			surface = append(surface, int(event.Seq))
 			continue
 		}
 		start, end, ok := surfaceReplaceBounds(event.SurfaceOp)
@@ -816,13 +816,13 @@ func (e *Engine) sessionQueryAnalyzeEvents(sessionID string, events []Event) (se
 			return analysis, fmt.Errorf("SESSION_QUERY_INVALID_SURFACE: replacement at seq %d references an invalid range", event.Seq)
 		}
 		removed := append([]int(nil), surface[startIndex:endIndex+1]...)
-		analysis.replacedEventSeqs[event.Seq] = removed
+		analysis.replacedEventSeqs[int(event.Seq)] = removed
 		for _, seq := range removed {
-			analysis.replacedBy[seq] = event.Seq
+			analysis.replacedBy[seq] = int(event.Seq)
 		}
 		next := make([]int, 0, len(surface)-len(removed)+1)
 		next = append(next, surface[:startIndex]...)
-		next = append(next, event.Seq)
+		next = append(next, int(event.Seq))
 		next = append(next, surface[endIndex+1:]...)
 		surface = next
 	}
@@ -831,13 +831,13 @@ func (e *Engine) sessionQueryAnalyzeEvents(sessionID string, events []Event) (se
 	}
 	for _, event := range events {
 		surfaceKind := sessionSurfaceLogOnly
-		if analysis.current[event.Seq] {
+		if analysis.current[int(event.Seq)] {
 			surfaceKind = sessionSurfaceCurrent
-		} else if _, ok := analysis.replacedBy[event.Seq]; ok {
+		} else if _, ok := analysis.replacedBy[int(event.Seq)]; ok {
 			surfaceKind = sessionSurfaceShadowed
 		}
-		analysis.records[event.Seq] = sessionQueryEventRecord{
-			SessionID: sessionID, Seq: event.Seq, Type: event.Type, Time: event.Time, Surface: surfaceKind,
+		analysis.records[int(event.Seq)] = sessionQueryEventRecord{
+			SessionID: sessionID, Seq: int(event.Seq), Type: event.Type, Time: event.Time, Surface: surfaceKind,
 		}
 	}
 	return analysis, nil
@@ -1081,7 +1081,7 @@ func (e *Engine) sessionQuerySearchWithOptionsContext(ctx context.Context, calle
 		var bestText string
 		var bestRank sessionQueryMatchRank
 		for _, event := range snapshot.events {
-			record := analysis.records[event.Seq]
+			record := analysis.records[int(event.Seq)]
 			text := sessionQueryEventText(event)
 			if !options.filters.event.matches(record, text) {
 				continue
@@ -1217,7 +1217,7 @@ func (e *Engine) sessionQueryEventSearchWithOptionsContext(ctx context.Context, 
 		boundary := -1
 		for _, event := range events {
 			if event.Type == "step/start" {
-				boundary = event.Seq
+				boundary = int(event.Seq)
 			}
 		}
 		if boundary < 0 {
@@ -1236,7 +1236,7 @@ func (e *Engine) sessionQueryEventSearchWithOptionsContext(ctx context.Context, 
 		if err := ctx.Err(); err != nil {
 			return sessionQueryCollection{}, err
 		}
-		record := analysis.records[event.Seq]
+		record := analysis.records[int(event.Seq)]
 		text := sessionQueryEventText(event)
 		if !options.filters.matches(record, text) {
 			continue
@@ -1503,7 +1503,7 @@ func (e *Engine) sessionQueryEventTraceContext(ctx context.Context, callerID, ta
 	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, header) {
 		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
 	}
-	if seq >= len(events) || events[seq].Seq != seq {
+	if seq >= len(events) || int(events[seq].Seq) != seq {
 		return nil, fmt.Errorf("SESSION_QUERY_EVENT_NOT_FOUND: session %q has no event at seq %d", targetID, seq)
 	}
 	analysis, err := e.sessionQueryAnalyzeEvents(targetID, events)
@@ -1526,12 +1526,12 @@ func (e *Engine) sessionQueryEventTraceContext(ctx context.Context, callerID, ta
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if event.Seq <= seq {
+		if int(event.Seq) <= seq {
 			continue
 		}
 		for _, source := range event.SourceEventSeqs {
 			if source == seq {
-				derived = append(derived, event.Seq)
+				derived = append(derived, int(event.Seq))
 				break
 			}
 		}
@@ -1596,7 +1596,7 @@ func (e *Engine) sessionQueryEventReadContext(ctx context.Context, callerID, tar
 	if !sessionQueryObservedTargetAuthorized(callerID, callerCWD, targetID, header) {
 		return nil, errors.New("SESSION_QUERY_TOOL_UNAUTHORIZED: target session is outside the caller workspace")
 	}
-	if seq >= len(events) || events[seq].Seq != seq {
+	if seq >= len(events) || int(events[seq].Seq) != seq {
 		return nil, fmt.Errorf("SESSION_QUERY_EVENT_NOT_FOUND: session %q has no event at seq %d", targetID, seq)
 	}
 	start := seq - before
@@ -1613,10 +1613,10 @@ func (e *Engine) sessionQueryEventReadContext(ctx context.Context, callerID, tar
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if event.Seq == seq {
+		if int(event.Seq) == seq {
 			continue
 		}
-		neighbor := map[string]any{"seq": event.Seq, "type": event.Type, "time": event.Time}
+		neighbor := map[string]any{"seq": int(event.Seq), "type": event.Type, "time": event.Time}
 		if text := sessionQueryEventText(event); text != "" {
 			neighbor["snippet"] = clipQueryText(text)
 		}
@@ -1640,7 +1640,7 @@ func mapString(value map[string]any, key string) string {
 }
 
 func mapInt(value map[string]any, key string) int {
-	result, _ := value[key].(int)
+	result, _ := eventSeqNumber(value[key])
 	return result
 }
 
@@ -1810,8 +1810,8 @@ func formatEventReadResult(value map[string]any) string {
 		name string
 		from func(int) bool
 	}{
-		{"Before", func(seq int) bool { return seq < target.Seq }},
-		{"After", func(seq int) bool { return seq > target.Seq }},
+		{"Before", func(seq int) bool { return seq < int(target.Seq) }},
+		{"After", func(seq int) bool { return seq > int(target.Seq) }},
 	} {
 		sectionLines := []string{}
 		for _, neighbor := range neighbors {

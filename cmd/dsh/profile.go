@@ -102,43 +102,42 @@ type entryRef struct {
 }
 
 type composition struct {
-	entries                []*yaml.Node
-	provenance             []provenance
-	index                  map[string]entryRef
-	profileDir             string
-	packageIdentities      map[string]profilePackageIdentity
-	e2b                    *harness.E2BConfig
-	hooks                  []harness.HookBridgeConfig
-	mcpConfigs             []harness.MCPConfig
-	lspServers             map[string]harness.LSPStdioConfig
-	lspTool                harness.LSPToolConfig
-	terminalConfig         harness.TerminalConfig
-	terminalToolConfig     harness.TerminalToolConfig
-	persist                bool
-	sessionStore           harness.SessionStore
-	sessionTitleLLM        *harness.SessionTitleLLMConfig
-	sessionTelemetry       *harness.SessionTelemetryConfig
-	subagentProviders      []harness.SubagentProvider
-	subagentTools          []harness.SubagentToolConfig
-	subagentReportDelivery string
-	deepSeekWebSearch      *harness.DeepSeekWebSearchConfig
-	exaSearch              *harness.ExaSearchProviderOptions
-	perplexitySearch       *harness.PerplexitySearchProviderOptions
-	storage                *harness.StorageRuntimeConfig
-	fileReference          *harness.FileReferenceConfig
-	agentTeams             *harness.AgentTeamConfig
-	jobs                   harness.JobsConfig
-	clientHMRPollInterval  time.Duration
-	httpFetch              bool
-	httpFetchConfig        *harness.HTTPWebFetchConfig
-	webTools               *harness.WebToolConfig
-	todoAllowParallel      *bool
-	webSearchProvider      string
-	webSearchSet           bool
-	webFetchProvider       string
-	webFetchSet            bool
-	patchReload            string
-	sdkServer              harness.SDKServerOptions
+	entries               []*yaml.Node
+	provenance            []provenance
+	index                 map[string]entryRef
+	profileDir            string
+	packageIdentities     map[string]profilePackageIdentity
+	e2b                   *harness.E2BConfig
+	hooks                 []harness.HookBridgeConfig
+	mcpConfigs            []harness.MCPConfig
+	lspServers            map[string]harness.LSPStdioConfig
+	lspTool               harness.LSPToolConfig
+	terminalConfig        harness.TerminalConfig
+	terminalToolConfig    harness.TerminalToolConfig
+	persist               bool
+	sessionTitleLLM       *harness.SessionTitleLLMConfig
+	sessionTelemetry      *harness.SessionTelemetryConfig
+	subagentProviders     []harness.SubagentProvider
+	subagentTools         []harness.SubagentToolConfig
+	deepSeekWebSearch     *harness.DeepSeekWebSearchConfig
+	exaSearch             *harness.ExaSearchProviderOptions
+	perplexitySearch      *harness.PerplexitySearchProviderOptions
+	storage               *harness.StorageRuntimeConfig
+	fileReference         *harness.FileReferenceConfig
+	agentTeams            *harness.AgentTeamConfig
+	runtimeInvariants     *harness.RuntimeInvariantConfig
+	jobs                  harness.JobsConfig
+	clientHMRPollInterval time.Duration
+	httpFetch             bool
+	httpFetchConfig       *harness.HTTPWebFetchConfig
+	webTools              *harness.WebToolConfig
+	todoAllowParallel     *bool
+	webSearchProvider     string
+	webSearchSet          bool
+	webFetchProvider      string
+	webFetchSet           bool
+	patchReload           string
+	sdkServer             harness.SDKServerOptions
 }
 
 type pluginEntry struct {
@@ -152,7 +151,9 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-agent":                                  true,
 	"@deepseek-ai/dsh-agent-default-model":                    true,
 	"@deepseek-ai/dsh-agent-instructions":                     true,
+	"@deepseek-ai/dsh-agent/invariant":                        true,
 	"@deepseek-ai/dsh-agent-loop":                             true,
+	"@deepseek-ai/dsh-agent-loop/invariant":                   true,
 	"@deepseek-ai/dsh-agent-presets":                          true,
 	"@deepseek-ai/dsh-agent-spine-demo":                       true,
 	"@deepseek-ai/dsh-acp":                                    true,
@@ -254,12 +255,13 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-sandbox-local":                          true,
 	"@deepseek-ai/dsh-sandbox-policy":                         true,
 	"@deepseek-ai/dsh-schedule":                               true,
+	"@deepseek-ai/dsh-invariants":                             true,
 	"@deepseek-ai/dsh-session":                                true,
+	"@deepseek-ai/dsh-session/invariant":                      true,
 	"@deepseek-ai/dsh-session-checkpoint-policy":              true,
 	"@deepseek-ai/dsh-session-log-export":                     true,
 	"@deepseek-ai/dsh-session-log-deepseek":                   true,
 	"@deepseek-ai/dsh-session-persistence-jsonl":              true,
-	"@deepseek-ai/dsh-session-persistence-sqlite":             true,
 	"@deepseek-ai/dsh-session-projection":                     true,
 	"@deepseek-ai/dsh-session-projection-cache":               true,
 	"@deepseek-ai/dsh-session-query-sqlite":                   true,
@@ -268,10 +270,12 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-session-title":                          true,
 	"@deepseek-ai/dsh-session-title-all-prompts-llm":          true,
 	"@deepseek-ai/dsh-session-title-first-prompt-llm":         true,
+	"@deepseek-ai/dsh-session-turn-outline":                   true,
 	"@deepseek-ai/dsh-settings-file":                          true,
 	"@deepseek-ai/dsh-sdk-app":                                true,
 	"@deepseek-ai/dsh-sdk-jsonrpc-server":                     true,
 	"@deepseek-ai/dsh-shell-env":                              true,
+	"@deepseek-ai/dsh-scope/invariant":                        true,
 	"@deepseek-ai/dsh-skill":                                  true,
 	"@deepseek-ai/dsh-skill-badge":                            true,
 	"@deepseek-ai/dsh-skill-filesystem":                       true,
@@ -311,7 +315,6 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-tool-subagent/model-selection-settings": true,
 	"@deepseek-ai/dsh-tool-subagent-control":                  true,
 	"@deepseek-ai/dsh-tool-subagent-control/list-agents":      true,
-	"@deepseek-ai/dsh-tool-subagent-report":                   true,
 	"@deepseek-ai/dsh-tool-todo":                              true,
 	"@deepseek-ai/dsh-tool-terminal":                          true,
 	"@deepseek-ai/dsh-tool-web":                               true,
@@ -1153,6 +1156,44 @@ func (composition *composition) sdkServerOptions() (harness.SDKServerOptions, er
 	return options, nil
 }
 
+func (composition *composition) resolveRuntimeInvariantConfig() (*harness.RuntimeInvariantConfig, error) {
+	var resolved *harness.RuntimeInvariantConfig
+	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-invariants" {
+			return nil
+		}
+		if resolved != nil {
+			return errors.New("invariants is configured more than once")
+		}
+		if err := rejectUnknownConfig(entry, "invariants", "enabled", "package_allowlist", "package_blocklist"); err != nil {
+			return err
+		}
+		var raw struct {
+			Enabled          *bool    `json:"enabled"`
+			PackageAllowlist []string `json:"package_allowlist"`
+			PackageBlocklist []string `json:"package_blocklist"`
+		}
+		if err := decodeProfileEntryConfig(entry, &raw); err != nil {
+			return fmt.Errorf("invariants(%s): invalid config: %w", id, err)
+		}
+		config := harness.RuntimeInvariantConfig{
+			PackageAllowlist: raw.PackageAllowlist,
+			PackageBlocklist: raw.PackageBlocklist,
+		}
+		if raw.Enabled != nil {
+			config.Disabled = !*raw.Enabled
+		}
+		registry, err := harness.NewInvariantRegistry(config)
+		if err != nil {
+			return fmt.Errorf("invariants(%s): invalid config: %w", id, err)
+		}
+		_ = registry.Close()
+		resolved = &config
+		return nil
+	})
+	return resolved, err
+}
+
 func (composition *composition) resolveE2BConfig() (*harness.E2BConfig, error) {
 	var resolved *harness.E2BConfig
 	usesAdapter := false
@@ -1716,76 +1757,19 @@ func (composition *composition) resolveTodoPolicy() (*bool, error) {
 }
 
 func (composition *composition) resolveSessionPersistence() error {
-	var kind string
-	var sqliteConfig struct {
-		Path                     string `json:"path"`
-		JournalMode              string `json:"journalMode"`
-		BusyTimeoutMS            *int64 `json:"busyTimeoutMs"`
-		PreparedSessionCacheSize *int   `json:"preparedSessionCacheSize"`
-		WriteBatchMaxDelayMS     *int   `json:"writeBatchMaxDelayMs"`
-	}
-	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
-		if name != "@deepseek-ai/dsh-session-persistence-jsonl" && name != "@deepseek-ai/dsh-session-persistence-sqlite" {
+	seen := false
+	err := composition.walkActiveEntries(func(_, name string, _ *yaml.Node) error {
+		if name != "@deepseek-ai/dsh-session-persistence-jsonl" {
 			return nil
 		}
-		if kind != "" {
+		if seen {
 			return errors.New("session persistence is configured more than once")
 		}
-		if name == "@deepseek-ai/dsh-session-persistence-jsonl" {
-			kind = "jsonl"
-			return nil
-		}
-		kind = "sqlite"
-		if err := decodeProfileEntryConfig(entry, &sqliteConfig); err != nil {
-			return fmt.Errorf("session-persistence-sqlite(%s): invalid config: %w", id, err)
-		}
-		if strings.TrimSpace(sqliteConfig.Path) == "" {
-			return fmt.Errorf("session-persistence-sqlite(%s): path is required", id)
-		}
-		switch sqliteConfig.JournalMode {
-		case "", "wal", "delete", "truncate", "persist":
-		default:
-			return fmt.Errorf("session-persistence-sqlite(%s): unsupported journalMode %q", id, sqliteConfig.JournalMode)
-		}
-		if sqliteConfig.PreparedSessionCacheSize != nil && *sqliteConfig.PreparedSessionCacheSize < 1 {
-			return fmt.Errorf("session-persistence-sqlite(%s): preparedSessionCacheSize must be a positive integer", id)
-		}
-		if sqliteConfig.BusyTimeoutMS != nil && (*sqliteConfig.BusyTimeoutMS < 0 || *sqliteConfig.BusyTimeoutMS > int64(harness.MaxSQLiteBusyTimeout/time.Millisecond)) {
-			return fmt.Errorf("session-persistence-sqlite(%s): busyTimeoutMs must be between 0 and 2147483647", id)
-		}
-		if sqliteConfig.WriteBatchMaxDelayMS != nil && (*sqliteConfig.WriteBatchMaxDelayMS < 1 || int64(*sqliteConfig.WriteBatchMaxDelayMS) > int64(harness.MaxSQLiteWriteBatchDelay/time.Millisecond)) {
-			return fmt.Errorf("session-persistence-sqlite(%s): writeBatchMaxDelayMs must be between 1 and 2147483647", id)
-		}
+		seen = true
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	if composition.sessionStore != nil {
-		_ = composition.sessionStore.Close()
-		composition.sessionStore = nil
-	}
-	composition.persist = kind != ""
-	if kind != "sqlite" {
-		return nil
-	}
-	options := harness.SQLiteSessionStoreOptions{Path: sqliteConfig.Path, JournalMode: harness.SQLiteJournalMode(sqliteConfig.JournalMode)}
-	if sqliteConfig.BusyTimeoutMS != nil {
-		options.BusyTimeout = time.Duration(*sqliteConfig.BusyTimeoutMS) * time.Millisecond
-		options.BusyTimeoutSet = true
-	}
-	if sqliteConfig.PreparedSessionCacheSize != nil {
-		options.PreparedSessionCacheSize = *sqliteConfig.PreparedSessionCacheSize
-	}
-	if sqliteConfig.WriteBatchMaxDelayMS != nil {
-		options.WriteBatchMaxDelay = time.Duration(*sqliteConfig.WriteBatchMaxDelayMS) * time.Millisecond
-	}
-	store, err := harness.NewSQLiteSessionStoreWithOptions(options)
-	if err != nil {
-		return fmt.Errorf("session-persistence-sqlite: %w", err)
-	}
-	composition.sessionStore = store
-	return nil
+	composition.persist = seen
+	return err
 }
 
 func (composition *composition) resolveStorageRuntime() (*harness.StorageRuntimeConfig, error) {
@@ -1914,6 +1898,11 @@ func (composition *composition) validate() error {
 		return err
 	}
 	composition.jobs = jobs
+	runtimeInvariants, err := composition.resolveRuntimeInvariantConfig()
+	if err != nil {
+		return err
+	}
+	composition.runtimeInvariants = runtimeInvariants
 	fileReference, err := composition.resolveFileReferenceConfig()
 	if err != nil {
 		return err
@@ -1959,11 +1948,6 @@ func (composition *composition) validate() error {
 		return err
 	}
 	composition.subagentTools = subagentTools
-	reportDelivery, err := composition.resolveSubagentReportDelivery()
-	if err != nil {
-		return err
-	}
-	composition.subagentReportDelivery = reportDelivery
 	toolsMode := strings.TrimSpace(os.Getenv("DSH_TOOLS_MODE"))
 	if configured, ok := composition.configString("tools", "mode"); ok {
 		toolsMode = configured
@@ -2405,33 +2389,6 @@ func (composition *composition) resolveSubagentTools() ([]harness.SubagentToolCo
 		}
 	}
 	return tools, nil
-}
-
-func (composition *composition) resolveSubagentReportDelivery() (string, error) {
-	delivery := ""
-	err := composition.walkActiveEntries(func(id, name string, entry *yaml.Node) error {
-		if name != "@deepseek-ai/dsh-tool-subagent-report" {
-			return nil
-		}
-		if delivery != "" {
-			return errors.New("tool-subagent-report is configured more than once")
-		}
-		var raw struct {
-			ReportDelivery *string `json:"reportDelivery"`
-		}
-		if err := decodeProfileEntryConfig(entry, &raw); err != nil {
-			return fmt.Errorf("tool-subagent-report(%s): invalid config: %w", id, err)
-		}
-		delivery = harness.SubagentReportNextStep
-		if raw.ReportDelivery != nil {
-			delivery = *raw.ReportDelivery
-		}
-		if delivery != harness.SubagentReportQuiet && delivery != harness.SubagentReportNextStep {
-			return fmt.Errorf("tool-subagent-report(%s): reportDelivery must be quiet or next-step", id)
-		}
-		return nil
-	})
-	return delivery, err
 }
 
 func (composition *composition) resolveJobsConfig() (harness.JobsConfig, error) {

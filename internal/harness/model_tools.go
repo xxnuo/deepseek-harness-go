@@ -48,9 +48,6 @@ func registerModelTools(e *Engine) error {
 	if e.hostPluginActive("@deepseek-ai/dsh-tool-goal") {
 		tools = append(tools, builtinGetGoalTool(e), builtinCreateGoalTool(e), builtinUpdateGoalTool(e))
 	}
-	if e.hostPluginActive("@deepseek-ai/dsh-tool-subagent-report") {
-		tools = append(tools, subagentReportTool(e))
-	}
 	if e.agentTeams == nil && e.hostPluginActive("@deepseek-ai/dsh-tool-subagent-control") {
 		tools = append(tools, builtinSendMessageTool(e), builtinInterruptAgentTool(e), builtinListAgentsTool(e))
 	} else if e.agentTeams != nil && e.hostPluginActive("@deepseek-ai/dsh-experimental-tool-agent-team") {
@@ -935,7 +932,6 @@ func (e *Engine) rollbackUnpublishedModelSubagent(childID string, child *Session
 	detachSessionLocked(child)
 	child.mu.Unlock()
 	e.releaseSessionScopedTools(childID)
-	_ = e.subagentActivationSetups.releaseChild(child)
 	_ = e.terminals.closeOwner(childID)
 	e.shells.closeOwner(childID)
 	e.mu.Lock()
@@ -1060,7 +1056,7 @@ func (e *Engine) notifyModelSubagentSettlement(parentID, childID string, output 
 		return
 	}
 	parent.mu.Lock()
-	running, attached := parent.Running, parent.attached
+	attached := parent.attached
 	parent.mu.Unlock()
 	if !attached {
 		return
@@ -1076,11 +1072,7 @@ func (e *Engine) notifyModelSubagentSettlement(parentID, childID string, output 
 		_, _ = e.enqueueTeamPrompt(parent, content, source, "next-step", false)
 		return
 	}
-	target := "next-turn"
-	if running {
-		target = "next-step"
-	}
-	_, _ = e.enqueueTeamPrompt(parent, content, source, target, true)
+	_, _ = e.enqueueTeamPrompt(parent, content, source, "next-step", true)
 }
 
 func (e *Engine) modelSubagentStopReason(childID string, runErr error) string {
@@ -1128,22 +1120,21 @@ func (e *Engine) setSessionTitle(id, title string) {
 
 func builtinSendMessageTool(e *Engine) Tool {
 	type input struct {
-		SubagentID string `json:"subagent_id"`
-		Message    string `json:"message"`
+		AgentID string `json:"agent_id"`
+		Message string `json:"message"`
 	}
 	return Tool{
-		Schema: ToolSchema{Name: "send_message", Description: "Send a message to a direct continuable subagent as its next turn.", Parameters: objectSchema(map[string]any{"subagent_id": map[string]any{"type": "string"}, "message": map[string]any{"type": "string"}}, "subagent_id", "message"), Output: objectSchema(map[string]any{"messageId": map[string]any{"type": "string"}}, "messageId")},
+		Schema: ToolSchema{Name: "send_message", Description: "Send a message to a direct continuable child by its agent id, or from a resident continuable child to its direct parent. A running target receives it at the nearest step boundary; an idle target starts a turn.", Parameters: objectSchema(map[string]any{"agent_id": map[string]any{"type": "string"}, "message": map[string]any{"type": "string"}}, "agent_id", "message"), Output: objectSchema(map[string]any{"messageId": map[string]any{"type": "string"}}, "messageId")},
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input
 			if err := decodeToolArguments(call, &in); err != nil {
 				return ToolResult{}, err
 			}
-			value, rpcErr := e.subagentPrompt(ctx, map[string]any{"parentSessionId": call.SessionID, "childSessionId": in.SubagentID, "content": []any{map[string]any{"type": "text", "text": in.Message}}})
-			if rpcErr != nil {
-				return ToolResult{}, rpcErr
+			messageID, err := e.SendAdjacentAgentMessage(ctx, call.SessionID, in.AgentID, []ContentBlock{{Type: "text", Text: in.Message}})
+			if err != nil {
+				return ToolResult{}, err
 			}
-			messageID, _ := value.(map[string]any)["messageId"].(string)
-			result := textToolResult(fmt.Sprintf("message queued as the next turn for subagent %s (%s)", in.SubagentID, messageID))
+			result := textToolResult(fmt.Sprintf("message delivered to agent %s (%s)", in.AgentID, messageID))
 			result.Value = map[string]any{"messageId": messageID}
 			return result, nil
 		},

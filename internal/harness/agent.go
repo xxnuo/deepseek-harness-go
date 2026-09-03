@@ -1009,7 +1009,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 			}
 			reason := map[string]any{"kind": "error", "error": retryFailurePayload(failure)}
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, ErrEngineClosed) {
-				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, stepStart.Seq, selection, streamed); appendErr != nil {
+				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, int(stepStart.Seq), selection, streamed); appendErr != nil {
 					return "", appendErr
 				}
 				reason = turnAbortReason(ctx)
@@ -1044,7 +1044,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		if len(completion.Usage) > 0 {
 			message["usage"] = completion.Usage
 		}
-		chunkSeqs := successfulAttemptChunkSeqs(s, turn, step, stepStart.Seq)
+		chunkSeqs := successfulAttemptChunkSeqs(s, turn, step, int(stepStart.Seq))
 		if _, err := e.appendEvent(s, "assistant/message", message, chunkSeqs...); err != nil {
 			return "", err
 		}

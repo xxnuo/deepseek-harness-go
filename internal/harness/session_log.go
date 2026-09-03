@@ -168,7 +168,7 @@ func decodeSessionSeedEvent(value any, index int) (Event, error) {
 		json.Unmarshal(raw["data"], &event.Data) != nil {
 		return Event{}, fmt.Errorf("seed event at index %d has an invalid event envelope", index)
 	}
-	if event.Seq != index {
+	if int(event.Seq) != index {
 		return Event{}, fmt.Errorf("seed event at index %d has seq %d (expected %d); seed must be contiguous from 0", index, event.Seq, index)
 	}
 	if _, ok := raw["surfaceOp"]; ok {
@@ -327,7 +327,7 @@ func validateSourceEventSeqs(event Event) error {
 	}
 	seen := make(map[int]struct{}, len(event.SourceEventSeqs))
 	for _, source := range event.SourceEventSeqs {
-		if source < 0 || source >= event.Seq {
+		if source < 0 || source >= int(event.Seq) {
 			return fmt.Errorf("sourceEventSeqs on event %q must reference earlier events", event.Type)
 		}
 		if _, ok := seen[source]; ok {
@@ -408,7 +408,7 @@ func decodePackedChunks(tag string, raw map[string]json.RawMessage) ([]Event, er
 				chunk["name"] = name
 			}
 		}
-		events = append(events, Event{Type: "assistant/chunk", Seq: seq, Time: currentTime, Data: map[string]any{
+		events = append(events, Event{Type: "assistant/chunk", Seq: SessionSeq(seq), Time: currentTime, Data: map[string]any{
 			"turn": turn, "step": step, "chunk": chunk,
 		}})
 	}
@@ -447,10 +447,10 @@ func foldSurfaceEvents(events []Event, strict bool) ([]Event, error) {
 		}
 		startIndex, endIndex := -1, -1
 		for i := range surface {
-			if surface[i].Seq == start {
+			if int(surface[i].Seq) == start {
 				startIndex = i
 			}
-			if surface[i].Seq == end {
+			if int(surface[i].Seq) == end {
 				endIndex = i
 			}
 		}
@@ -467,7 +467,7 @@ func foldSurfaceEvents(events []Event, strict bool) ([]Event, error) {
 				sources[source] = struct{}{}
 			}
 			for _, shadowed := range surface[startIndex : endIndex+1] {
-				if _, ok := sources[shadowed.Seq]; !ok {
+				if _, ok := sources[int(shadowed.Seq)]; !ok {
 					return nil, fmt.Errorf("surface replace at seq %d does not cite shadowed seq %d", event.Seq, shadowed.Seq)
 				}
 			}
@@ -551,6 +551,10 @@ func eventSeqNumber(value any) (int, bool) {
 	switch number := value.(type) {
 	case int:
 		return number, int64(number) >= -maxJSONSafeInteger && int64(number) <= maxJSONSafeInteger
+	case SessionSeq:
+		return int(number), int64(number) >= -maxJSONSafeInteger && int64(number) <= maxJSONSafeInteger
+	case SessionLogOffset:
+		return int(number), int64(number) >= -maxJSONSafeInteger && int64(number) <= maxJSONSafeInteger
 	case int64:
 		return int(number), number >= -maxJSONSafeInteger && number <= maxJSONSafeInteger && int64(int(number)) == number
 	case float64:

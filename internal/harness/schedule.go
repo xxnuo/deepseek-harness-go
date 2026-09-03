@@ -68,6 +68,54 @@ func (r scheduleRecord) view(now int64) map[string]any {
 type foldedSchedules struct {
 	active []scheduleRecord
 	seen   map[string]struct{}
+	// seenOrder preserves the durable creation order for projection state.
+	seenOrder []string
+}
+
+type scheduleProjectionState struct {
+	SeedLength int              `json:"seedLength"`
+	Active     []scheduleRecord `json:"active"`
+	SeenIDs    []string         `json:"seenIds"`
+}
+
+func scheduleProjectionDefinition() ProjectionDefinition {
+	return ProjectionDefinition{
+		Key: "schedule", StateVersion: 1,
+		InitWithHeader: func(header SessionHeader) any {
+			return scheduleProjectionState{SeedLength: header.SeedLength, Active: []scheduleRecord{}, SeenIDs: []string{}}
+		},
+		Apply: func(state any, event Event) ProjectionResult {
+			current := state.(scheduleProjectionState)
+			if int(event.Seq) < current.SeedLength || event.Type != "schedule/change" {
+				return projectionUnchanged(state)
+			}
+			change, ok := event.Data.(map[string]any)
+			if !ok {
+				panic(&scheduleLogError{"schedule/change must be an object"})
+			}
+			folded := foldedSchedules{
+				active:    append([]scheduleRecord(nil), current.Active...),
+				seenOrder: append([]string(nil), current.SeenIDs...),
+			}
+			if err := applyScheduleChangeMap(&folded, change); err != nil {
+				panic(err)
+			}
+			next := scheduleProjectionState{
+				SeedLength: current.SeedLength,
+				Active:     append([]scheduleRecord(nil), folded.active...),
+				SeenIDs:    append([]string(nil), folded.seenOrder...),
+			}
+			return projectionValueResult(current, next)
+		},
+		View: func(state any) any {
+			current := state.(scheduleProjectionState)
+			values := make([]map[string]any, 0, len(current.Active))
+			for _, record := range current.Active {
+				values = append(values, record.value())
+			}
+			return values
+		},
+	}
 }
 
 type schedulePublicError struct {
@@ -116,7 +164,7 @@ func installScheduleInvariant(scope *InvariantScope, fail InvariantFailure) erro
 		if _, err := foldScheduleEvents(events, header.SeedLength); err != nil {
 			seq := -1
 			if len(events) > 0 {
-				seq = events[len(events)-1].Seq
+				seq = int(events[len(events)-1].Seq)
 			}
 			return fail(fmt.Sprintf("session event %d violates the durable schedule stream: %s", seq, err))
 		}
@@ -285,84 +333,120 @@ func foldScheduleEvents(events []Event, seedLength int) (foldedSchedules, error)
 	if seedLength < 0 || seedLength > len(events) {
 		return foldedSchedules{}, &scheduleLogError{"schedule seedLength must be within the event log"}
 	}
-	active := map[string]scheduleRecord{}
-	order := make([]string, 0)
-	seen := map[string]struct{}{}
+	result := foldedSchedules{seen: map[string]struct{}{}}
 	for _, event := range events[seedLength:] {
 		if event.Type != "schedule/change" {
 			continue
 		}
 		change, ok := event.Data.(map[string]any)
-		if !ok || change["version"] != float64(scheduleChangeVersion) && change["version"] != scheduleChangeVersion {
-			return foldedSchedules{}, &scheduleLogError{"schedule/change version must be 1"}
+		if !ok {
+			return foldedSchedules{}, &scheduleLogError{"schedule/change must be an object"}
 		}
-		operation, _ := change["operation"].(string)
-		switch operation {
-		case "create":
-			if !exactScheduleKeys(change, "version", "operation", "schedule") {
-				return foldedSchedules{}, &scheduleLogError{"schedule create has an invalid shape"}
-			}
-			record, err := decodeScheduleRecord(change["schedule"])
-			if err != nil {
-				return foldedSchedules{}, err
-			}
-			if _, exists := seen[record.ID]; exists {
-				return foldedSchedules{}, &scheduleLogError{fmt.Sprintf("schedule id %q was reused", record.ID)}
-			}
-			seen[record.ID] = struct{}{}
-			active[record.ID] = record
-			order = append(order, record.ID)
-		case "delete":
-			if !exactScheduleKeys(change, "version", "operation", "id") {
-				return foldedSchedules{}, &scheduleLogError{"schedule delete has an invalid shape"}
-			}
-			id, ok := change["id"].(string)
-			if !ok || active[id].ID == "" {
-				return foldedSchedules{}, &scheduleLogError{"schedule delete targets an inactive id"}
-			}
-			delete(active, id)
-		case "dispatch":
-			id, ok := change["id"].(string)
-			record, activeNow := active[id]
-			if !ok || !activeNow {
-				return foldedSchedules{}, &scheduleLogError{"schedule dispatch targets an inactive id"}
-			}
-			acceptedAt, hasAcceptedAt := change["acceptedAt"].(string)
-			if record.Kind != "every" {
-				if hasAcceptedAt || !exactScheduleKeys(change, "version", "operation", "id") {
-					return foldedSchedules{}, &scheduleLogError{"one-shot dispatch has an invalid shape"}
-				}
-				delete(active, id)
-				continue
-			}
-			if !hasAcceptedAt || !exactScheduleKeys(change, "version", "operation", "id", "acceptedAt") {
-				return foldedSchedules{}, &scheduleLogError{"every dispatch requires acceptedAt"}
-			}
-			acceptedMillis, err := parseCanonicalScheduleInstant(acceptedAt)
-			if err != nil {
-				return foldedSchedules{}, err
-			}
-			_, next, err := resolveEverySchedule(record, acceptedMillis)
-			if err != nil {
-				return foldedSchedules{}, err
-			}
-			if next == "" {
-				delete(active, id)
-			} else {
-				record.ScheduledAt = next
-				active[id] = record
-			}
-		default:
-			return foldedSchedules{}, &scheduleLogError{"schedule/change operation must be create, delete, or dispatch"}
-		}
-	}
-	result := foldedSchedules{seen: seen}
-	for _, id := range order {
-		if record, ok := active[id]; ok {
-			result.active = append(result.active, record)
+		if err := applyScheduleChangeMap(&result, change); err != nil {
+			return foldedSchedules{}, err
 		}
 	}
 	return result, nil
+}
+
+// applyScheduleChangeMap is the shared single-event transition authority for
+// full replay and the incremental session projection.
+func applyScheduleChangeMap(folded *foldedSchedules, change map[string]any) error {
+	if folded.seen == nil {
+		folded.seen = make(map[string]struct{}, len(folded.seenOrder)+len(folded.active))
+		for _, id := range folded.seenOrder {
+			folded.seen[id] = struct{}{}
+		}
+		if len(folded.seenOrder) == 0 {
+			for _, record := range folded.active {
+				folded.seenOrder = append(folded.seenOrder, record.ID)
+			}
+		}
+		for _, record := range folded.active {
+			folded.seen[record.ID] = struct{}{}
+		}
+	}
+	version := change["version"]
+	if version != float64(scheduleChangeVersion) && version != scheduleChangeVersion {
+		return &scheduleLogError{"schedule/change version must be 1"}
+	}
+	operation, _ := change["operation"].(string)
+	switch operation {
+	case "create":
+		if !exactScheduleKeys(change, "version", "operation", "schedule") {
+			return &scheduleLogError{"schedule create has an invalid shape"}
+		}
+		record, err := decodeScheduleRecord(change["schedule"])
+		if err != nil {
+			return err
+		}
+		if _, exists := folded.seen[record.ID]; exists {
+			return &scheduleLogError{fmt.Sprintf("schedule id %q was reused", record.ID)}
+		}
+		folded.seen[record.ID] = struct{}{}
+		folded.seenOrder = append(folded.seenOrder, record.ID)
+		folded.active = append(folded.active, record)
+		return nil
+	case "delete":
+		if !exactScheduleKeys(change, "version", "operation", "id") {
+			return &scheduleLogError{"schedule delete has an invalid shape"}
+		}
+		id, ok := change["id"].(string)
+		if !ok {
+			return &scheduleLogError{"schedule delete targets an inactive id"}
+		}
+		for index, record := range folded.active {
+			if record.ID == id {
+				folded.active = append(folded.active[:index], folded.active[index+1:]...)
+				return nil
+			}
+		}
+		return &scheduleLogError{"schedule delete targets an inactive id"}
+	case "dispatch":
+		id, ok := change["id"].(string)
+		if !ok {
+			return &scheduleLogError{"schedule dispatch targets an inactive id"}
+		}
+		index := -1
+		for candidate, record := range folded.active {
+			if record.ID == id {
+				index = candidate
+				break
+			}
+		}
+		if index < 0 {
+			return &scheduleLogError{"schedule dispatch targets an inactive id"}
+		}
+		record := folded.active[index]
+		acceptedAt, hasAcceptedAt := change["acceptedAt"].(string)
+		if record.Kind != "every" {
+			if hasAcceptedAt || !exactScheduleKeys(change, "version", "operation", "id") {
+				return &scheduleLogError{"one-shot dispatch has an invalid shape"}
+			}
+			folded.active = append(folded.active[:index], folded.active[index+1:]...)
+			return nil
+		}
+		if !hasAcceptedAt || !exactScheduleKeys(change, "version", "operation", "id", "acceptedAt") {
+			return &scheduleLogError{"every dispatch requires acceptedAt"}
+		}
+		acceptedMillis, err := parseCanonicalScheduleInstant(acceptedAt)
+		if err != nil {
+			return err
+		}
+		_, next, err := resolveEverySchedule(record, acceptedMillis)
+		if err != nil {
+			return err
+		}
+		if next == "" {
+			folded.active = append(folded.active[:index], folded.active[index+1:]...)
+		} else {
+			record.ScheduledAt = next
+			folded.active[index] = record
+		}
+		return nil
+	default:
+		return &scheduleLogError{"schedule/change operation must be create, delete, or dispatch"}
+	}
 }
 
 func allocateScheduleID(folded foldedSchedules) string {

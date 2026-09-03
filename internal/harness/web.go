@@ -820,17 +820,17 @@ func (p *deepSeekWebSearchProvider) Search(ctx context.Context, req WebSearchReq
 	}
 	resp, err := client.Do(request)
 	if err != nil {
-		return WebSearchResult{}, webSearchContextError(err, ctx)
+		return WebSearchResult{}, deepSeekSearchEndpointError(ctx, endpoint, "DeepSeek search request failed: "+err.Error(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return WebSearchResult{}, deepSeekHTTPError(resp, ctx)
+		return WebSearchResult{}, deepSeekHTTPError(resp, ctx, endpoint)
 	}
 	var payload struct {
 		Content []json.RawMessage `json:"content"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return WebSearchResult{}, webSearchContextError(err, ctx)
+		return WebSearchResult{}, deepSeekSearchEndpointError(ctx, endpoint, "DeepSeek returned an unprocessable response body: "+err.Error(), err)
 	}
 	// Citations and result blocks are independent content blocks. Collect all
 	// citations first so a citation appearing after its result still joins.
@@ -886,7 +886,7 @@ func (p *deepSeekWebSearchProvider) Search(ctx context.Context, req WebSearchReq
 		}
 	}
 	if !found {
-		return WebSearchResult{}, &WebError{Code: "WEB_PROVIDER_ERROR", Message: "DeepSeek returned no web_search_tool_result blocks; the request may not have triggered native web search"}
+		return WebSearchResult{}, deepSeekSearchEndpointError(ctx, endpoint, "DeepSeek returned no web_search_tool_result blocks; the request may not have triggered native web search", nil)
 	}
 	return WebSearchResult{Sources: sources}, nil
 }
@@ -1018,37 +1018,49 @@ func webSearchContextError(err error, ctx context.Context) error {
 	return &WebError{Code: "WEB_PROVIDER_ERROR", Message: err.Error()}
 }
 
-func deepSeekHTTPError(resp *http.Response, ctx context.Context) error {
+func deepSeekHTTPError(resp *http.Response, ctx context.Context, endpoint string) error {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 	if err != nil {
-		return webSearchContextError(err, ctx)
+		return deepSeekSearchEndpointError(ctx, endpoint, fmt.Sprintf("DeepSeek API error (HTTP %d): %v", resp.StatusCode, err), err)
 	}
-	message := ""
+	message := fmt.Sprintf("DeepSeek API error (HTTP %d)", resp.StatusCode)
+	detail := ""
 	var payload struct {
 		Error   json.RawMessage `json:"error"`
 		Message string          `json:"message"`
 	}
 	if json.Unmarshal(body, &payload) == nil {
-		message = strings.TrimSpace(payload.Message)
+		detail = strings.TrimSpace(payload.Message)
 		if len(payload.Error) > 0 {
-			var detail struct {
+			var errorValue struct {
 				Message string `json:"message"`
 			}
-			if json.Unmarshal(payload.Error, &detail) == nil && strings.TrimSpace(detail.Message) != "" {
-				message = strings.TrimSpace(detail.Message)
+			if json.Unmarshal(payload.Error, &errorValue) == nil && strings.TrimSpace(errorValue.Message) != "" {
+				detail = strings.TrimSpace(errorValue.Message)
 			} else {
 				var text string
 				if json.Unmarshal(payload.Error, &text) == nil {
-					message = strings.TrimSpace(text)
+					detail = strings.TrimSpace(text)
 				}
 			}
 		}
 	}
-	if message == "" {
-		message = fmt.Sprintf("DeepSeek API error (HTTP %d)", resp.StatusCode)
+	if detail != "" {
+		message += ": " + detail
 	}
-	return &WebError{Code: "WEB_PROVIDER_ERROR", Message: message}
+	return deepSeekSearchEndpointError(ctx, endpoint, message, nil)
+}
+
+func deepSeekSearchEndpointError(ctx context.Context, endpoint, message string, cause error) error {
+	if ctx != nil && ctx.Err() != nil {
+		return webSearchContextError(cause, ctx)
+	}
+	return &WebError{Code: "WEB_PROVIDER_ERROR", Message: message +
+		"\n\nThe web search request used endpoint " + strconv.Quote(endpoint) + ". " +
+		"Search endpoint configuration is separate from chat. If that endpoint is not intended, guide the user to Settings > Plugins > Plugin configuration > Web search, where they can change and save Endpoint. " +
+		"If that settings page is unavailable, the user can set DEEPSEEK_SEARCH_BASE_URL or configure web-search-deepseek.baseURL to a trusted Anthropic-compatible Messages API base. " +
+		"Only the user should choose or change the endpoint."}
 }
 
 type HTTPWebFetchProvider struct {

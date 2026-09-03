@@ -6,7 +6,7 @@ import (
 )
 
 func projectionEvent(typ string, time int64, data map[string]any) Event {
-	return Event{Type: typ, Seq: int(time / 10), Time: time, Data: data, SurfaceOp: func() any {
+	return Event{Type: typ, Seq: SessionSeq(time / 10), Time: time, Data: data, SurfaceOp: func() any {
 		if isSurfaceEligibleType(typ) {
 			return "append"
 		}
@@ -16,7 +16,7 @@ func projectionEvent(typ string, time int64, data map[string]any) Event {
 
 func TestSessionProjectionBaselineIncludesUIUnits(t *testing.T) {
 	values := sessionProjectionValues(nil, "")
-	for _, key := range []string{"title", "todos", "permissions", "plan", "goal", "tokenUsage", "contextPressure", "contextBreakdown", "sessionStats", "sessionListMetadata", "subagent", "subagentTiming", "imageLimits"} {
+	for _, key := range []string{"title", "todos", "permissions", "plan", "goal", "tokenUsage", "contextPressure", "contextBreakdown", "sessionStats", "sessionListMetadata", "turnOutline", "subagent", "subagentTiming", "imageLimits"} {
 		if _, ok := values[key]; !ok {
 			t.Fatalf("missing projection %q: %#v", key, values)
 		}
@@ -64,7 +64,7 @@ func TestSessionListAndSubagentProjections(t *testing.T) {
 	if got, want := values["subagentTiming"], (map[string]any{"settledMs": int64(30)}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("subagent timing = %#v, want %#v", got, want)
 	}
-	if changed := projectionKeysChanged(events[1]); !reflect.DeepEqual(changed, []string{"todos", "sessionListMetadata", "subagentTiming"}) {
+	if changed := projectionKeysChanged(events[1]); !reflect.DeepEqual(changed, []string{"todos", "sessionListMetadata", "turnOutline", "subagentTiming"}) {
 		t.Fatalf("turn/start changed keys = %#v", changed)
 	}
 }

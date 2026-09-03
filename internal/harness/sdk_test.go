@@ -85,7 +85,7 @@ type sdkCreateGateStore struct {
 	release chan struct{}
 }
 
-func (s *sdkCreateGateStore) Create(ctx context.Context, header SessionHeader) error {
+func (s *sdkCreateGateStore) Create(ctx context.Context, header SessionHeader, inheritedEventCount SessionLogOffset) error {
 	s.mu.Lock()
 	s.creates++
 	fail := s.fail > 0
@@ -109,7 +109,7 @@ func (s *sdkCreateGateStore) Create(ctx context.Context, header SessionHeader) e
 	if fail {
 		return errors.New("creation failed")
 	}
-	return s.SessionStore.Create(ctx, header)
+	return s.SessionStore.Create(ctx, header, inheritedEventCount)
 }
 
 func (s *sdkCreateGateStore) count() int {

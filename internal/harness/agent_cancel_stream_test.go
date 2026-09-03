@@ -100,7 +100,7 @@ func TestCancelFinalizesVisibleStreamPrefix(t *testing.T) {
 	for index, event := range events {
 		switch event.Type {
 		case "assistant/chunk":
-			chunkSeqs = append(chunkSeqs, event.Seq)
+			chunkSeqs = append(chunkSeqs, int(event.Seq))
 		case "assistant/message":
 			message, messageIndex = event, index
 		case "step/end":

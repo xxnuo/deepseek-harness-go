@@ -189,7 +189,7 @@ func TestSessionReferenceProjectsOnlyCurrentConversationSurface(t *testing.T) {
 		"id": "checkpoint", "role": "user",
 		"content": []ContentBlock{{Type: "text", Text: "<compacted-summary>checkpoint</compacted-summary>"}},
 		"source":  map[string]any{"kind": "plugin", "plugin": "compact", "compactionId": "conversation"},
-	}, map[string]any{"op": "replace", "start": oldUser.Seq, "end": oldAssistant.Seq}, []int{oldUser.Seq, oldAssistant.Seq}, false)
+	}, map[string]any{"op": "replace", "start": oldUser.Seq, "end": oldAssistant.Seq}, []int{int(oldUser.Seq), int(oldAssistant.Seq)}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestSessionReferenceProjectsOnlyCurrentConversationSurface(t *testing.T) {
 		{Role: "user", Text: "human steer"},
 		{Role: "assistant", Text: "visible answer"},
 	}
-	if len(data) != 1 || data[0].CapturedThroughSeq == nil || *data[0].CapturedThroughSeq != last.Seq ||
+	if len(data) != 1 || data[0].CapturedThroughSeq == nil || *data[0].CapturedThroughSeq != int(last.Seq) ||
 		!reflect.DeepEqual(data[0].Conversation, want) {
 		t.Fatalf("projected surface = %#v, checkpoint=%d", data, checkpoint.Seq)
 	}

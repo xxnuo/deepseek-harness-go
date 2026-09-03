@@ -103,7 +103,6 @@ type Config struct {
 	Hooks                       []HookBridgeConfig
 	SubagentProviders           []SubagentProvider
 	SubagentTools               []SubagentToolConfig
-	SubagentReportDelivery      string
 	AgentTeams                  *AgentTeamConfig
 	Terminal                    TerminalConfig
 	TerminalTool                TerminalToolConfig
@@ -151,6 +150,11 @@ type PluginInventoryEntry struct {
 	Enabled         bool
 	FiberPhase      *string
 	Group           bool
+	// condition/conditional are only used by the agent-preset composition
+	// projection; they stay private because Host package provenance does not
+	// expose this loader detail.
+	condition   string
+	conditional bool
 }
 
 func clonePluginInventory(entries []PluginInventoryEntry) []PluginInventoryEntry {
@@ -257,6 +261,9 @@ func DefaultConfig() Config {
 		webSearchProvider = "deepseek-official"
 	}
 	webFetchProvider := strings.TrimSpace(os.Getenv("DSH_WEB_FETCH_PROVIDER"))
+	if webFetchProvider == "" {
+		webFetchProvider = "http"
+	}
 	webTools := defaultWebToolConfig()
 	webTools.FetchEnabled = webFetchProvider != ""
 	toolPresentation := strings.TrimSpace(os.Getenv("DSH_TOOLS_MODE"))
@@ -285,7 +292,6 @@ func DefaultConfig() Config {
 		Spill: defaultSpillConfig(), RepeatToolReminder: defaultRepeatToolReminderConfig(),
 		Jobs:                        JobsConfig{WaitTimeoutMs: 30 * time.Second, MaxWaitTimeoutMs: 10 * time.Minute, CompletionDelivery: "wakeup", MaxConsecutiveWakes: 3},
 		FileReference:               defaultFileReferenceConfig(),
-		SubagentReportDelivery:      "next-step",
 		DynamicCordisVMTimeout:      5 * time.Second,
 		RetryPolicy:                 defaultRetryPolicy(),
 		MaxBodyBytes:                140 << 20,
@@ -399,9 +405,6 @@ func normalizeConfig(c Config) Config {
 	}
 	c.FileReference = normalizeFileReferenceConfig(c.FileReference)
 	c.Storage = cloneStorageRuntimeConfig(c.Storage)
-	if c.SubagentReportDelivery == "" {
-		c.SubagentReportDelivery = d.SubagentReportDelivery
-	}
 	if c.AgentTeams != nil {
 		clone := *c.AgentTeams
 		c.AgentTeams = &clone
@@ -515,9 +518,6 @@ func WithSubagentProviders(v ...SubagentProvider) Option {
 }
 func WithSubagentTools(v ...SubagentToolConfig) Option {
 	return func(c *Config) { c.SubagentTools = append([]SubagentToolConfig(nil), v...) }
-}
-func WithSubagentReportDelivery(v string) Option {
-	return func(c *Config) { c.SubagentReportDelivery = v }
 }
 func WithAgentTeams(v AgentTeamConfig) Option {
 	return func(c *Config) { c.AgentTeams = &v }
@@ -772,37 +772,60 @@ type ExactModelInfoResolver interface {
 }
 
 type SessionHeader struct {
-	Version         int    `json:"version"`
-	ID              string `json:"id"`
-	CreatedAt       int64  `json:"createdAt"`
-	CWD             string `json:"cwd,omitempty"`
-	ParentSession   string `json:"parentSession,omitempty"`
-	SeedLength      int    `json:"seedLength,omitempty"`
+	Version       int    `json:"version"`
+	ID            string `json:"id"`
+	CreatedAt     int64  `json:"createdAt"`
+	CWD           string `json:"cwd,omitempty"`
+	ParentSession string `json:"parentSession,omitempty"`
+	IsSeeded      bool   `json:"isSeeded"`
+	// SeedLength is the exact inherited prefix length. It remains as an
+	// internal compatibility field while the logical JSON header exposes only
+	// IsSeeded; persistence observations carry InheritedEventCount separately.
+	SeedLength      int    `json:"-"`
 	Origin          string `json:"origin,omitempty"`
 	DelegationDepth int    `json:"delegationDepth,omitempty"`
 	AgentPreset     string `json:"agentPreset,omitempty"`
 	Mode            string `json:"mode,omitempty"`
 }
 
+// SessionSeq identifies an existing event. SessionLogOffset identifies a gap
+// in the log and may equal the event count.
+type SessionSeq int
+type SessionLogOffset int
+
+func validateSessionSeq(value SessionSeq) error {
+	if value < 0 || int64(value) > maxJSONSafeInteger {
+		return fmt.Errorf("SessionSeq must be a non-negative safe integer, got %d", value)
+	}
+	return nil
+}
+
+func validateSessionLogOffset(value SessionLogOffset) error {
+	if value < 0 || int64(value) > maxJSONSafeInteger {
+		return fmt.Errorf("SessionLogOffset must be a non-negative safe integer, got %d", value)
+	}
+	return nil
+}
+
 type Event struct {
-	Type            string `json:"type"`
-	Seq             int    `json:"seq"`
-	Time            int64  `json:"time"`
-	Data            any    `json:"data"`
-	SourceEventSeqs []int  `json:"sourceEventSeqs,omitempty"`
-	SurfaceOp       any    `json:"surfaceOp,omitempty"`
-	Ignorable       bool   `json:"ignorable,omitempty"`
+	Type            string     `json:"type"`
+	Seq             SessionSeq `json:"seq"`
+	Time            int64      `json:"time"`
+	Data            any        `json:"data"`
+	SourceEventSeqs []int      `json:"sourceEventSeqs,omitempty"`
+	SurfaceOp       any        `json:"surfaceOp,omitempty"`
+	Ignorable       bool       `json:"ignorable,omitempty"`
 }
 
 func (e Event) MarshalJSON() ([]byte, error) {
 	type wireEvent struct {
-		Type            string `json:"type"`
-		Seq             int    `json:"seq"`
-		Time            int64  `json:"time"`
-		Data            any    `json:"data"`
-		SourceEventSeqs *[]int `json:"sourceEventSeqs,omitempty"`
-		SurfaceOp       any    `json:"surfaceOp,omitempty"`
-		Ignorable       bool   `json:"ignorable,omitempty"`
+		Type            string     `json:"type"`
+		Seq             SessionSeq `json:"seq"`
+		Time            int64      `json:"time"`
+		Data            any        `json:"data"`
+		SourceEventSeqs *[]int     `json:"sourceEventSeqs,omitempty"`
+		SurfaceOp       any        `json:"surfaceOp,omitempty"`
+		Ignorable       bool       `json:"ignorable,omitempty"`
 	}
 	var sources *[]int
 	if e.SourceEventSeqs != nil {
@@ -832,10 +855,11 @@ type HistoryEntry struct {
 }
 
 type Session struct {
-	Header SessionHeader
-	Model  ModelSelection
-	Title  string
-	Events []Event
+	Header              SessionHeader
+	Model               ModelSelection
+	Title               string
+	Events              []Event
+	InheritedEventCount SessionLogOffset
 	// attached distinguishes a live in-process agent from a cold persisted log.
 	// It is intentionally private: callers use the host/session APIs rather than
 	// mutating lifecycle state behind the Engine registry.
@@ -880,6 +904,64 @@ type Session struct {
 	mu                             sync.Mutex
 	store                          SessionStore
 	invariants                     *InvariantRegistry
+}
+
+// Seq returns the current log length as a gap position.
+func (s *Session) Seq() SessionLogOffset {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SessionLogOffset(len(s.Events))
+}
+
+// EventAt performs a constant-time lookup by event identity.
+func (s *Session) EventAt(seq SessionSeq) (Event, bool) {
+	if validateSessionSeq(seq) != nil {
+		return Event{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if int(seq) >= len(s.Events) {
+		return Event{}, false
+	}
+	return s.Events[int(seq)], true
+}
+
+// SnapshotEvents returns a detached materialization of [from,to). It accepts
+// zero bounds for the full log, one for [from,end), or two for [from,to).
+func (s *Session) SnapshotEvents(bounds ...SessionLogOffset) ([]Event, error) {
+	if len(bounds) > 2 {
+		return nil, errors.New("SnapshotEvents accepts at most from and toExclusive")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	from, to := SessionLogOffset(0), SessionLogOffset(len(s.Events))
+	if len(bounds) > 0 {
+		from = bounds[0]
+	}
+	if len(bounds) > 1 {
+		to = bounds[1]
+	}
+	if err := validateSessionLogOffset(from); err != nil {
+		return nil, err
+	}
+	if err := validateSessionLogOffset(to); err != nil {
+		return nil, err
+	}
+	if from > to || int(to) > len(s.Events) {
+		return nil, fmt.Errorf("SnapshotEvents range [%d,%d) is outside log length %d", from, to, len(s.Events))
+	}
+	result := make([]Event, int(to-from))
+	for index, event := range s.Events[int(from):int(to)] {
+		result[index] = cloneSessionEvent(event)
+	}
+	return result, nil
+}
+
+func cloneSessionEvent(event Event) Event {
+	event.Data = cloneJSON(event.Data)
+	event.SurfaceOp = cloneJSON(event.SurfaceOp)
+	event.SourceEventSeqs = append([]int(nil), event.SourceEventSeqs...)
+	return event
 }
 
 func attachSessionLocked(s *Session) {
@@ -1026,6 +1108,7 @@ type Engine struct {
 	muxSubs                      map[chan map[string]any]struct{}
 	pendingMu                    sync.Mutex
 	pending                      map[string]*pendingInteraction
+	remoteEventClients           map[string]map[string]struct{}
 	scheduleRuntimeMu            sync.Mutex
 	scheduleRuntimes             map[string]*scheduleRuntime
 	dynamicCordis                *dynamicCordisState
@@ -1048,9 +1131,9 @@ type Engine struct {
 	modelSubagentLocks           sync.Map
 	jobWakeMu                    sync.Mutex
 	jobWakes                     map[string]int
-	subagentActivationSetups     *subagentActivationSetupRegistry
 	sessionStore                 SessionStore
 	sessionProjections           *SessionProjectionRegistry
+	scheduleProjectionDispose    func()
 	projectionCache              *sessionProjectionCache
 	storage                      *StorageHub
 	storageBackends              []StorageBackend
@@ -1142,9 +1225,6 @@ func New(opts ...Option) (*Engine, error) {
 	if cfg.ToolPresentation != "native" && cfg.ToolPresentation != "ptc" && cfg.ToolPresentation != "both" {
 		return nil, fmt.Errorf("tools: mode must be native, ptc, or both, got %q", cfg.ToolPresentation)
 	}
-	if cfg.SubagentReportDelivery != "quiet" && cfg.SubagentReportDelivery != "next-step" {
-		return nil, fmt.Errorf("tool-subagent-report: reportDelivery must be quiet or next-step, got %q", cfg.SubagentReportDelivery)
-	}
 	if cfg.InstructionMaxBytes < 0 {
 		return nil, errors.New("agent-instructions: maxBytes must be non-negative")
 	}
@@ -1185,8 +1265,16 @@ func New(opts ...Option) (*Engine, error) {
 		_ = invariants.Close()
 		return nil, err
 	}
+	var scheduleProjectionDispose func()
+	if cfg.ScheduleEnabled {
+		scheduleProjectionDispose, err = sessionProjections.Register(scheduleProjectionDefinition())
+		if err != nil {
+			_ = invariants.Close()
+			return nil, err
+		}
+	}
 	titleCtx, titleCancel := context.WithCancel(context.Background())
-	e := &Engine{cfg: cfg, deepSeekExtensions: newDeepSeekLlmAPIExtensionRegistry(), pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, modelSubagentActivations: map[string]*modelSubagentActivation{}, subagentActivationSetups: newSubagentActivationSetupRegistry(), storage: NewStorageHub(), jobWakes: map[string]int{}}
+	e := &Engine{cfg: cfg, deepSeekExtensions: newDeepSeekLlmAPIExtensionRegistry(), pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, remoteEventClients: map[string]map[string]struct{}{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, scheduleProjectionDispose: scheduleProjectionDispose, modelSubagentActivations: map[string]*modelSubagentActivation{}, storage: NewStorageHub(), jobWakes: map[string]int{}}
 	sessionProjections.setRuntimeExecutor(func(job func()) error {
 		if !e.dynamicCordis.loop.call(job) {
 			return errors.New("dynamic Cordis runtime is closed")
@@ -1433,6 +1521,9 @@ func (e *Engine) ApplyRuntimeConfig(cfg Config) error {
 	terminalChanged := !reflect.DeepEqual(previousConfig.TerminalTool, cfg.TerminalTool)
 	e.cfg = cfg
 	e.mu.Unlock()
+	if err := e.reconcileScheduleProjection(cfg.ScheduleEnabled); err != nil {
+		return e.rollbackRuntimeConfig(previousConfig, previousInventory, previousProviders, previousProviderOrder, false, false, false, false, false, err)
+	}
 	e.setToolTimeoutPolicyEnabled(cfg.ToolTimeoutPolicyEnabled)
 	e.SetPluginInventory(cfg.PluginInventory)
 	if terminalChanged {
@@ -1518,6 +1609,9 @@ func (e *Engine) rollbackRuntimeConfig(previous Config, inventory []PluginInvent
 	e.setToolTimeoutPolicyEnabled(previous.ToolTimeoutPolicyEnabled)
 	e.SetPluginInventory(inventory)
 	errs := []error{cause}
+	if err := e.reconcileScheduleProjection(previous.ScheduleEnabled); err != nil {
+		errs = append(errs, err)
+	}
 	if err := e.reconcileMCPServers(context.Background(), previous.MCPServers); err != nil {
 		errs = append(errs, err)
 	}
@@ -1550,6 +1644,41 @@ func (e *Engine) rollbackRuntimeConfig(previous Config, inventory []PluginInvent
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (e *Engine) reconcileScheduleProjection(enabled bool) error {
+	e.mu.Lock()
+	dispose := e.scheduleProjectionDispose
+	e.mu.Unlock()
+	if enabled {
+		if dispose != nil {
+			return nil
+		}
+		newDispose, err := e.sessionProjections.Register(scheduleProjectionDefinition())
+		if err != nil {
+			return err
+		}
+		e.mu.Lock()
+		e.scheduleProjectionDispose = newDispose
+		sessions := make([]*Session, 0, len(e.sessions))
+		for _, session := range e.sessions {
+			sessions = append(sessions, session)
+		}
+		e.mu.Unlock()
+		for _, session := range sessions {
+			e.startScheduleRuntime(session)
+		}
+		return nil
+	}
+	if dispose == nil {
+		return nil
+	}
+	e.mu.Lock()
+	e.scheduleProjectionDispose = nil
+	e.mu.Unlock()
+	dispose()
+	e.closeScheduleRuntimes()
+	return nil
 }
 
 // setToolTimeoutPolicyEnabled updates all registered tools in place when the
@@ -2004,7 +2133,7 @@ var shippedToolNames = map[string]bool{
 	"str_replace_editor": true,
 	"job_output":         true, "job_list": true, "job_kill": true,
 	"skill": true, "get_goal": true, "create_goal": true, "update_goal": true,
-	"send_message": true, "interrupt_agent": true, "list_agents": true, "report": true,
+	"send_message": true, "interrupt_agent": true, "list_agents": true,
 	"spawn_teammate": true, "followup_task": true, "wait_agent": true,
 	"team_task_create": true, "team_task_list": true, "team_task_get": true, "team_task_update": true,
 	"subagent": true, "subagent_fork": true, "ask_user_question": true, "exit_plan_mode": true,
@@ -2066,7 +2195,6 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 	}
 	s.mu.Lock()
 	sessionID, restriction := s.Header.ID, s.toolRestriction
-	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached
 	scheduleVisible := s.Header.Origin != "subagent"
 	s.mu.Unlock()
 	agentTeamModes := e.agentTeamToolModes(s, runtimeConfig)
@@ -2081,9 +2209,6 @@ func (e *Engine) toolsForSession(s *Session) ([]ToolSchema, error) {
 		}
 		if scoped {
 			return true
-		}
-		if name == "report" {
-			return owner == "" && reportVisible && restriction.allows(name)
 		}
 		if owner != "" {
 			return owner == sessionID
@@ -2259,7 +2384,6 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 	}
 	s.mu.Lock()
 	sessionID, restriction := s.Header.ID, s.toolRestriction
-	reportVisible := s.Header.Origin == "subagent" && s.Header.Mode == "continuable" && s.attached
 	scheduleVisible := s.Header.Origin != "subagent"
 	s.mu.Unlock()
 	e.mu.RLock()
@@ -2290,10 +2414,6 @@ func (e *Engine) toolVisibleForSession(s *Session, name string) (bool, error) {
 	e.mu.RUnlock()
 	if owner != "" && owner != sessionID {
 		return false, nil
-	}
-	if name == "report" {
-		return owner == "" && reportVisible && restriction.allows(name) &&
-			(runtimeConfig.toolNames == nil || runtimeConfig.toolNames[name]), nil
 	}
 	if owner == "" && !restriction.allows(name) && name != "run_code" {
 		return false, nil
@@ -2331,8 +2451,9 @@ func (e *Engine) load() error {
 		}
 		s := &Session{
 			Header: inspection.Meta, Title: sessionTitleFromEvents(inspection.Events),
-			Events: append([]Event(nil), inspection.Events...), firstLiveSeq: len(inspection.Events),
-			pending: pending, steering: steering, published: true, store: e.sessionStore, invariants: e.invariants,
+			Events: append([]Event(nil), inspection.Events...), InheritedEventCount: inspection.InheritedEventCount,
+			firstLiveSeq: len(inspection.Events),
+			pending:      pending, steering: steering, published: true, store: e.sessionStore, invariants: e.invariants,
 		}
 		if err := e.invariants.ValidateSession(s.Header, s.Events); err != nil {
 			return fmt.Errorf("session %q: %w", s.Header.ID, err)
@@ -2564,24 +2685,28 @@ func (e *Engine) unsetCredentialFrom(origin *dynamicCordisRun, ref string) *RPCE
 func readSession(r io.Reader) (*Session, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 16<<20)
-	var header SessionHeader
-	var first map[string]any
 	var events []Event
 	if !scanner.Scan() {
 		return nil, errors.New("empty session log")
 	}
-	if err := json.Unmarshal(scanner.Bytes(), &first); err != nil {
+	var wireHeader sessionHeaderLine
+	if err := json.Unmarshal(scanner.Bytes(), &wireHeader); err != nil {
 		return nil, err
 	}
-	b, _ := json.Marshal(first)
-	if err := json.Unmarshal(b, &header); err != nil {
-		return nil, err
-	}
-	if first["type"] != "session" || header.ID == "" {
+	if wireHeader.Type != "session" || wireHeader.ID == "" {
 		return nil, errors.New("invalid session header")
 	}
-	if header.Version != SessionFormatVersion {
-		return nil, fmt.Errorf("unsupported session format version %d", header.Version)
+	if wireHeader.Version != SessionFormatVersion {
+		return nil, fmt.Errorf("unsupported session format version %d", wireHeader.Version)
+	}
+	header := SessionHeader{
+		Version: wireHeader.Version, ID: wireHeader.ID, CreatedAt: wireHeader.CreatedAt,
+		CWD: wireHeader.CWD, ParentSession: wireHeader.ParentSession,
+		IsSeeded: wireHeader.SeedLength != nil, Origin: wireHeader.Origin,
+		DelegationDepth: wireHeader.DelegationDepth, AgentPreset: wireHeader.AgentPreset, Mode: wireHeader.Mode,
+	}
+	if wireHeader.SeedLength != nil {
+		header.SeedLength = *wireHeader.SeedLength
 	}
 	line := 1
 	for scanner.Scan() {
@@ -2591,7 +2716,7 @@ func readSession(r io.Reader) (*Session, error) {
 			return nil, fmt.Errorf("session log line %d: %w", line, err)
 		}
 		for _, event := range record {
-			if event.Seq != len(events) {
+			if int(event.Seq) != len(events) {
 				return nil, fmt.Errorf("session log line %d: expected seq %d, got %d", line, len(events), event.Seq)
 			}
 			events = append(events, event)
@@ -2607,7 +2732,7 @@ func readSession(r io.Reader) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, firstLiveSeq: len(events), pending: pending, steering: steering, published: true}, nil
+	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, InheritedEventCount: SessionLogOffset(header.SeedLength), firstLiveSeq: len(events), pending: pending, steering: steering, published: true}, nil
 }
 
 func (e *Engine) CreateSession(ctx context.Context, cwd, id, preset string) (string, error) {
@@ -2645,6 +2770,9 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		id = newID("ses")
 	}
 	meta.CWD, meta.ID, meta.AgentPreset = cwd, id, preset
+	if meta.SeedLength != 0 {
+		meta.IsSeeded = true
+	}
 	var presetRuntime *presetRuntimeGeneration
 	var presetRuntimeErr error
 	if preset != "" {
@@ -2719,7 +2847,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	}
 	now := time.Now().UnixMilli()
 	meta.Version, meta.CreatedAt = SessionFormatVersion, now
-	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants, subagentModelSelectionEligible: meta.Origin != "subagent" && meta.ParentSession == ""}
+	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, InheritedEventCount: SessionLogOffset(meta.SeedLength), published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants, subagentModelSelectionEligible: meta.Origin != "subagent" && meta.ParentSession == ""}
 	var modelSelectionEvent Event
 	modelSelectionRecorded := false
 	if e.hasSubagentModelSelectionToolLocked() {
@@ -2729,7 +2857,7 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	}
 	attachSessionLocked(s)
 	if s.store != nil {
-		if err := s.store.Create(ctx, meta); err != nil {
+		if err := s.store.Create(ctx, meta, s.InheritedEventCount); err != nil {
 			return "", err
 		}
 	}
@@ -2856,7 +2984,7 @@ func appendSeedEventLocked(s *Session, event Event) (Event, error) {
 	if event.Type == "" {
 		return Event{}, errors.New("seed event type is required")
 	}
-	if event.Seq != len(s.Events) {
+	if int(event.Seq) != len(s.Events) {
 		return Event{}, fmt.Errorf("seed event seq %d does not match expected %d", event.Seq, len(s.Events))
 	}
 	if event.Time < -maxJSONSafeInteger || event.Time > maxJSONSafeInteger {
@@ -2907,7 +3035,7 @@ func appendEventLocked(s *Session, typ string, data, surfaceOp any, sourceEventS
 	if sourceEventSeqs != nil {
 		sources = append(make([]int, 0, len(sourceEventSeqs)), sourceEventSeqs...)
 	}
-	event := Event{Type: typ, Seq: len(s.Events), Time: time.Now().UnixMilli(), Data: data, SurfaceOp: surfaceOp, SourceEventSeqs: sources, Ignorable: ignorable}
+	event := Event{Type: typ, Seq: SessionSeq(len(s.Events)), Time: time.Now().UnixMilli(), Data: data, SurfaceOp: surfaceOp, SourceEventSeqs: sources, Ignorable: ignorable}
 	if s.invariants != nil {
 		if err := s.invariants.validateSessionAppend(s.Header, s.Events, event); err != nil {
 			return Event{}, err
@@ -2936,7 +3064,7 @@ func (e *Engine) publishEventFrom(origin *dynamicCordisRun, id string, event Eve
 		s.mu.Lock()
 		firstLiveSeq := s.firstLiveSeq
 		s.mu.Unlock()
-		if event.Seq < firstLiveSeq {
+		if int(event.Seq) < firstLiveSeq {
 			e.telemetry.trackEvent(s, event)
 		} else {
 			e.telemetry.captureEvent(s, event)
@@ -2973,6 +3101,9 @@ func (e *Engine) publishEventFrom(origin *dynamicCordisRun, id string, event Eve
 	if sessionErr == nil && e.projectionCache != nil {
 		e.projectionCache.observe(s, event)
 	}
+	if sessionErr == nil && event.Type == "user/message" && eventSourceKind(event.Data) == "user" {
+		e.emitRemoteEventFrom(origin, "api-session/activity", id, event.Time)
+	}
 }
 
 func (e *Engine) emitEvent(id string, event Event) {
@@ -2988,6 +3119,23 @@ func (e *Engine) emitEvent(id string, event Event) {
 }
 
 func (e *Engine) emitHost(frame map[string]any) {
+	e.emitHostRaw(frame)
+	switch frame["type"] {
+	case "host/session-added":
+		id, _ := frame["sessionId"].(string)
+		if summary, ok := e.remoteSessionSummary(id); ok {
+			e.emitRemoteEventMux("api-session/added", summary)
+		}
+	case "host/session-status":
+		id, _ := frame["sessionId"].(string)
+		running, ok := frame["running"].(bool)
+		if id != "" && ok {
+			e.emitRemoteEventMux("api-session/status", id, running)
+		}
+	}
+}
+
+func (e *Engine) emitHostRaw(frame map[string]any) {
 	e.mu.RLock()
 	for ch := range e.hostSubs {
 		select {
@@ -3186,49 +3334,53 @@ func (e *Engine) ListSessions() []SessionSummary {
 	e.mu.RUnlock()
 	rows := make([]SessionSummary, 0, len(list))
 	for _, s := range list {
-		s.mu.Lock()
-		published := s.published
-		if !published {
-			s.mu.Unlock()
+		row, ok := e.sessionSummary(s)
+		if !ok || archived[row.SessionID] {
 			continue
 		}
-		id := s.Header.ID
-		parentID := s.Header.ParentSession
-		origin := s.Header.Origin
-		cwd := s.Header.CWD
-		preset := sessionAgentPreset(s.Header, s.Events)
-		blank, lastPromptAt := sessionListMetadata(s.Events)
-		updated := s.Header.CreatedAt
-		if lastPromptAt > updated {
-			updated = lastPromptAt
-		}
-		header := s.Header
-		attached := s.attached
-		running := s.Running
-		lastSeq := len(s.Events) - 1
-		s.mu.Unlock()
-		var snapshot ProjectionSnapshot
-		cached := false
-		if !attached && e.projectionCache != nil {
-			snapshot, cached = e.projectionCache.medium.snapshot(header, lastSeq, false, e.sessionProjections.Signature())
-		}
-		if !cached {
-			var snapshotErr error
-			snapshot, snapshotErr = e.sessionProjections.Snapshot(s)
-			if snapshotErr != nil {
-				log.Printf("deepseek-harness: snapshot session projections for list row %q: %v", id, snapshotErr)
-				snapshot = ProjectionSnapshot{AsOfSeq: lastSeq, Values: map[string]any{}}
-			}
-		}
-		if archived[id] {
-			continue
-		}
-		row := SessionSummary{SessionID: id, UpdatedAt: updated, Running: running, Blank: blank, ParentSessionID: parentID, Origin: origin, CWD: cwd, AgentPreset: preset}
-		row.Projections = map[string]any{"asOfSeq": snapshot.AsOfSeq, "values": snapshot.Values}
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].UpdatedAt > rows[j].UpdatedAt })
 	return rows
+}
+
+func (e *Engine) sessionSummary(s *Session) (SessionSummary, bool) {
+	s.mu.Lock()
+	if !s.published {
+		s.mu.Unlock()
+		return SessionSummary{}, false
+	}
+	id := s.Header.ID
+	parentID := s.Header.ParentSession
+	origin := s.Header.Origin
+	cwd := s.Header.CWD
+	preset := sessionAgentPreset(s.Header, s.Events)
+	blank, lastPromptAt := sessionListMetadata(s.Events)
+	updated := s.Header.CreatedAt
+	if lastPromptAt > updated {
+		updated = lastPromptAt
+	}
+	header := s.Header
+	attached := s.attached
+	running := s.Running
+	lastSeq := len(s.Events) - 1
+	s.mu.Unlock()
+	var snapshot ProjectionSnapshot
+	cached := false
+	if !attached && e.projectionCache != nil {
+		snapshot, cached = e.projectionCache.medium.snapshot(header, lastSeq, false, e.sessionProjections.Signature())
+	}
+	if !cached {
+		var snapshotErr error
+		snapshot, snapshotErr = e.sessionProjections.Snapshot(s)
+		if snapshotErr != nil {
+			log.Printf("deepseek-harness: snapshot session projections for list row %q: %v", id, snapshotErr)
+			snapshot = ProjectionSnapshot{AsOfSeq: lastSeq, Values: map[string]any{}}
+		}
+	}
+	row := SessionSummary{SessionID: id, UpdatedAt: updated, Running: running, Blank: blank, ParentSessionID: parentID, Origin: origin, CWD: cwd, AgentPreset: preset}
+	row.Projections = map[string]any{"asOfSeq": snapshot.AsOfSeq, "values": snapshot.Values}
+	return row, true
 }
 
 func (e *Engine) History(id string, beforeSeq, maxMessages int) ([]HistoryEntry, bool, error) {
@@ -3246,7 +3398,7 @@ func (e *Engine) History(id string, beforeSeq, maxMessages int) ([]HistoryEntry,
 	if beforeSeq >= 0 {
 		window = make([]Event, 0, len(events))
 		for _, event := range events {
-			if event.Seq < beforeSeq {
+			if int(event.Seq) < beforeSeq {
 				window = append(window, event)
 			}
 		}
@@ -3259,7 +3411,7 @@ func (e *Engine) History(id string, beforeSeq, maxMessages int) ([]HistoryEntry,
 			continue
 		}
 		count++
-		groupStart := event.Seq
+		groupStart := int(event.Seq)
 		for _, sourceSeq := range event.SourceEventSeqs {
 			if sourceSeq < groupStart {
 				groupStart = sourceSeq
@@ -3272,7 +3424,7 @@ func (e *Engine) History(id string, beforeSeq, maxMessages int) ([]HistoryEntry,
 	}
 	page := make([]Event, 0, len(window))
 	for _, event := range window {
-		if event.Seq >= cut {
+		if int(event.Seq) >= cut {
 			page = append(page, event)
 		}
 	}
@@ -3304,7 +3456,7 @@ func (e *Engine) RenameSession(id, title string) (string, int, error) {
 	if err != nil {
 		return "", -1, err
 	}
-	return title, ev.Seq, nil
+	return title, int(ev.Seq), nil
 }
 
 func (e *Engine) SelectModel(id string, selection ModelSelection) error {
@@ -3500,6 +3652,10 @@ func (e *Engine) Close() error {
 		// Dynamic projection definitions and their JavaScript executor must stay
 		// alive until the final checkpoint has folded every shutdown event.
 		projectionCacheErr = e.projectionCache.close(sessions)
+	}
+	if e.scheduleProjectionDispose != nil {
+		e.scheduleProjectionDispose()
+		e.scheduleProjectionDispose = nil
 	}
 	e.disposeDynamicCordisRuns()
 	e.sessionProjections.setRuntimeExecutor(nil)

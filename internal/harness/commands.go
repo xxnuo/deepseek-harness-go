@@ -280,7 +280,7 @@ func surfaceSpanPresent(surface []Event, seqs []int) bool {
 	for start := 0; start+len(seqs) <= len(surface); start++ {
 		matched := true
 		for offset, seq := range seqs {
-			if surface[start+offset].Seq != seq {
+			if int(surface[start+offset].Seq) != seq {
 				matched = false
 				break
 			}

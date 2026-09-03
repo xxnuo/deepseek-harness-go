@@ -56,7 +56,7 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	shadowedSeqs := make([]int, len(selected))
 	shadowedTokens := 0
 	for index, event := range selected {
-		shadowedSeqs[index] = event.Seq
+		shadowedSeqs[index] = int(event.Seq)
 		shadowedTokens += estimateProjectionEvent(event)
 	}
 	selection := request.selection
@@ -174,7 +174,7 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 	if request.sourceCommandID != "" {
 		checkpoint["source"].(map[string]any)["sourceCommandId"] = request.sourceCommandID
 	}
-	sources := append([]int{start.Seq, summaryEvent.Seq}, shadowedSeqs...)
+	sources := append([]int{int(start.Seq), int(summaryEvent.Seq)}, shadowedSeqs...)
 	if _, err := e.appendEventWithMetadata(s, "user/message", checkpoint, map[string]any{
 		"op": "replace", "start": shadowedSeqs[0], "end": shadowedSeqs[len(shadowedSeqs)-1],
 	}, sources, false); err != nil {
@@ -184,7 +184,7 @@ func (e *Engine) compactSession(ctx context.Context, s *Session, request compact
 		return result, err
 	}
 	closed = true
-	return compactResult{shadowedSeqs: shadowedSeqs, shadowedTokenCount: shadowedTokens, summarySeq: summaryEvent.Seq}, nil
+	return compactResult{shadowedSeqs: shadowedSeqs, shadowedTokenCount: shadowedTokens, summarySeq: int(summaryEvent.Seq)}, nil
 }
 
 func selectCompactableSurface(surface []Event, retainTokens int) []Event {
@@ -217,7 +217,7 @@ func selectCompactableSurface(surface []Event, retainTokens int) []Event {
 func surfaceSeqs(surface []Event) []int {
 	seqs := make([]int, len(surface))
 	for index, event := range surface {
-		seqs[index] = event.Seq
+		seqs[index] = int(event.Seq)
 	}
 	return seqs
 }
@@ -449,7 +449,7 @@ func (e *Engine) pruneToolResults(s *Session) (int, error) {
 		}
 		message["content"] = outerValues
 		shadowedTokens := estimateProjectionEvent(event)
-		if err := e.appendToolResultPruneReplacement(s, event.Seq, shadowedTokens, data); err != nil {
+		if err := e.appendToolResultPruneReplacement(s, int(event.Seq), shadowedTokens, data); err != nil {
 			return pruned, err
 		}
 		pruned++

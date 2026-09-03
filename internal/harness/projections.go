@@ -571,6 +571,227 @@ func imageLimitsProjection() map[string]any {
 	}
 }
 
+const (
+	turnOutlinePromptPreviewLimit   = 50
+	turnOutlineResponsePreviewLimit = 120
+)
+
+type turnOutlineEntry struct {
+	Turn     int    `json:"turn"`
+	Seq      int    `json:"seq"`
+	Prompt   string `json:"prompt"`
+	Response string `json:"response"`
+}
+
+type turnOutlineProjectionState struct {
+	Turns []turnOutlineEntry `json:"turns"`
+	Draft string             `json:"draft"`
+}
+
+func newTurnOutlineProjectionState() turnOutlineProjectionState {
+	return turnOutlineProjectionState{Turns: make([]turnOutlineEntry, 0)}
+}
+
+// turnOutlineUTF16Prefix mirrors the JavaScript preview budget without
+// scanning or copying an unbounded message body. The upstream rail budgets
+// UTF-16 code units, so non-BMP runes consume two units here as well.
+func turnOutlineUTF16Prefix(value string, limit int) (string, bool) {
+	if limit <= 0 {
+		return "", value != ""
+	}
+	units := 0
+	for index, runeValue := range value {
+		width := 1
+		if runeValue > 0xffff {
+			width = 2
+		}
+		if units+width > limit {
+			return value[:index], true
+		}
+		units += width
+	}
+	return value, false
+}
+
+// turnOutlinePreview reads only a bounded prefix of text blocks, then applies
+// the same whitespace normalization and ellipsis budget as the alpha.4 rail.
+func turnOutlinePreview(content any, limit int) string {
+	const rawFactor = 2
+	rawLimit := limit * rawFactor
+	var raw strings.Builder
+	rawUnits := 0
+	unread := false
+	haveBlock := false
+
+	appendBlock := func(text string) bool {
+		if rawUnits >= rawLimit {
+			unread = true
+			return false
+		}
+		prefix, clipped := turnOutlineUTF16Prefix(text, rawLimit)
+		if haveBlock {
+			raw.WriteByte(' ')
+			rawUnits++
+		}
+		raw.WriteString(prefix)
+		rawUnits += utf16Units(prefix)
+		haveBlock = true
+		if clipped {
+			unread = true
+			return false
+		}
+		return true
+	}
+
+	var visit func(any) bool
+	visit = func(value any) bool {
+		switch blocks := value.(type) {
+		case []ContentBlock:
+			for _, block := range blocks {
+				if block.Type == "text" && !appendBlock(block.Text) {
+					return false
+				}
+			}
+		case []any:
+			for _, value := range blocks {
+				block, ok := value.(map[string]any)
+				if ok && stringValue(block["type"]) == "text" && !appendBlock(stringValue(block["text"])) {
+					return false
+				}
+			}
+		case []map[string]any:
+			for _, block := range blocks {
+				if stringValue(block["type"]) == "text" && !appendBlock(stringValue(block["text"])) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	_ = visit(content)
+
+	normalized := strings.Join(strings.Fields(raw.String()), " ")
+	if normalized == "" {
+		if unread {
+			return "…"
+		}
+		return ""
+	}
+	if prefix, clipped := turnOutlineUTF16Prefix(normalized, limit-1); clipped || utf16Units(normalized) > limit-1 {
+		return strings.TrimRight(prefix, " ") + "…"
+	}
+	if unread {
+		return normalized + "…"
+	}
+	return normalized
+}
+
+func utf16Units(value string) int {
+	units := 0
+	for _, runeValue := range value {
+		units++
+		if runeValue > 0xffff {
+			units++
+		}
+	}
+	return units
+}
+
+func turnOutlineProjectionStateValue(state any) (turnOutlineProjectionState, bool) {
+	value, ok := state.(turnOutlineProjectionState)
+	return value, ok
+}
+
+func applyTurnOutlineProjection(state any, event Event) any {
+	current, ok := turnOutlineProjectionStateValue(state)
+	if !ok {
+		return state
+	}
+	switch event.Type {
+	case "turn/start":
+		data, _ := event.Data.(map[string]any)
+		turn, valid := eventSeqNumber(data["turn"])
+		if !valid || turn < 0 || len(current.Turns) > 0 && turn <= current.Turns[len(current.Turns)-1].Turn {
+			return state
+		}
+		turns := append([]turnOutlineEntry(nil), current.Turns...)
+		turns = append(turns, turnOutlineEntry{Turn: turn, Seq: int(event.Seq)})
+		return turnOutlineProjectionState{Turns: turns}
+	case "user/message":
+		if eventSourceKind(event.Data) != "user" || len(current.Turns) == 0 {
+			return state
+		}
+		last := current.Turns[len(current.Turns)-1]
+		if last.Prompt != "" {
+			return state
+		}
+		message := nestedMessage(event.Data)
+		if message == nil {
+			return state
+		}
+		prompt := turnOutlinePreview(message["content"], turnOutlinePromptPreviewLimit)
+		if prompt == "" {
+			return state
+		}
+		turns := append([]turnOutlineEntry(nil), current.Turns...)
+		turns[len(turns)-1].Prompt = prompt
+		return turnOutlineProjectionState{Turns: turns, Draft: current.Draft}
+	case "assistant/message":
+		message := nestedMessage(event.Data)
+		if message == nil {
+			return state
+		}
+		draft := turnOutlinePreview(message["content"], turnOutlineResponsePreviewLimit)
+		if draft == "" || draft == current.Draft {
+			return state
+		}
+		turns := current.Turns
+		if turns == nil {
+			turns = make([]turnOutlineEntry, 0)
+		}
+		return turnOutlineProjectionState{Turns: turns, Draft: draft}
+	case "turn/end":
+		if current.Draft == "" {
+			return state
+		}
+		if len(current.Turns) == 0 {
+			return turnOutlineProjectionState{Turns: make([]turnOutlineEntry, 0), Draft: ""}
+		}
+		last := current.Turns[len(current.Turns)-1]
+		if last.Response == current.Draft {
+			return turnOutlineProjectionState{Turns: current.Turns}
+		}
+		turns := append([]turnOutlineEntry(nil), current.Turns...)
+		turns[len(turns)-1].Response = current.Draft
+		return turnOutlineProjectionState{Turns: turns}
+	default:
+		return state
+	}
+}
+
+func viewTurnOutlineProjection(state any) any {
+	current, ok := turnOutlineProjectionStateValue(state)
+	if !ok {
+		return []map[string]any{}
+	}
+	view := make([]map[string]any, len(current.Turns))
+	for index, entry := range current.Turns {
+		view[index] = map[string]any{
+			"turn": entry.Turn, "seq": entry.Seq,
+			"prompt": entry.Prompt, "response": entry.Response,
+		}
+	}
+	return view
+}
+
+func currentTurnOutlineProjection(events []Event) any {
+	state := newTurnOutlineProjectionState()
+	for _, event := range events {
+		state = applyTurnOutlineProjection(state, event).(turnOutlineProjectionState)
+	}
+	return viewTurnOutlineProjection(state)
+}
+
 func todosProjectionChange(event Event) (any, bool) {
 	switch event.Type {
 	case "turn/start":
@@ -673,7 +894,7 @@ func currentSubagentIdentity(events []Event) any {
 			current = nil
 			continue
 		}
-		identity := map[string]any{"mode": mode, "seq": event.Seq}
+		identity := map[string]any{"mode": mode, "seq": int(event.Seq)}
 		if mode == "continuable" || label != "" {
 			identity["label"] = label
 		}
@@ -769,6 +990,7 @@ func sessionProjectionValues(events []Event, title string) map[string]any {
 		"contextBreakdown":    currentContextBreakdown(events),
 		"sessionStats":        currentSessionStats(events),
 		"sessionListMetadata": currentSessionListMetadata(events),
+		"turnOutline":         currentTurnOutlineProjection(events),
 		"subagent":            currentSubagentIdentity(events),
 		"subagentTiming":      currentSubagentTiming(events),
 		"imageLimits":         imageLimitsProjection(),
@@ -827,11 +1049,14 @@ func projectionKeysChanged(event Event) []string {
 	if event.Type == "turn/start" || event.Type == "user/message" {
 		changed["sessionListMetadata"] = true
 	}
+	if event.Type == "turn/start" || event.Type == "user/message" || event.Type == "assistant/message" || event.Type == "turn/end" {
+		changed["turnOutline"] = true
+	}
 	if event.Type == "subagent/descriptor" {
 		changed["subagent"] = true
 	}
 	changed["subagentTiming"] = true
-	keys := []string{"title", "todos", "permissions", "plan", "goal", "tokenUsage", "contextPressure", "contextBreakdown", "sessionStats", "sessionListMetadata", "subagent", "subagentTiming"}
+	keys := []string{"title", "todos", "permissions", "plan", "goal", "tokenUsage", "contextPressure", "contextBreakdown", "sessionStats", "sessionListMetadata", "turnOutline", "subagent", "subagentTiming"}
 	result := make([]string, 0, len(changed))
 	for _, key := range keys {
 		if changed[key] {

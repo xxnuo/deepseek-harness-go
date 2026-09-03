@@ -309,6 +309,99 @@ func TestSubagentToolsRunContinueForkAndList(t *testing.T) {
 	}
 }
 
+func TestAdjacentAgentSendMessageRoutesAndSettlementFIFO(t *testing.T) {
+	e := newPersistentModelSubagentEngine(t)
+	parentID, err := e.CreateSession(t.Context(), e.Config().Workspace, "adjacent-parent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(parentID, ModelSelection{Provider: "echo", Model: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+	childID, err := e.createModelSubagent(t.Context(), parentID, "adjacent child", false, "continuable", SubagentToolConfig{Provider: "spawn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := mustSession(t, e, childID)
+	activation, err := e.registerModelSubagentActivation(child, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := mustSession(t, e, parentID)
+	parent.mu.Lock()
+	parent.Running = true
+	parent.mu.Unlock()
+	child.mu.Lock()
+	child.Running = true
+	child.mu.Unlock()
+	t.Cleanup(func() {
+		parent.mu.Lock()
+		parent.Running = false
+		parent.mu.Unlock()
+		child.mu.Lock()
+		child.Running = false
+		child.mu.Unlock()
+		e.removeModelSubagentActivation(activation)
+		_ = detachSDKSession(e, childID)
+	})
+
+	e.mu.RLock()
+	schema := e.tools["send_message"].Schema.Parameters
+	e.mu.RUnlock()
+	properties, _ := schema["properties"].(map[string]any)
+	if properties["agent_id"] == nil || properties["subagent_id"] != nil {
+		t.Fatalf("send_message parameters = %#v", schema)
+	}
+	result, err := executeModelToolWithContext(e, t.Context(), "send_message", parentID, map[string]any{
+		"agent_id": childID,
+		"message":  "parent guidance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, _ := result.Value.(map[string]any)
+	if value["messageId"] == "" {
+		t.Fatalf("send_message result = %#v", result.Value)
+	}
+	child.mu.Lock()
+	if len(child.steering) != 1 {
+		child.mu.Unlock()
+		t.Fatalf("child steering count = %d, want 1", len(child.steering))
+	}
+	toChild := child.steering[0]
+	child.mu.Unlock()
+	toChildText := blockText(toChild.content)
+	if toChild.source["kind"] != "agent-message" || toChild.source["form"] != "relay" ||
+		toChild.source["senderSessionId"] != parentID || !strings.Contains(toChildText, "Agent "+parentID+" sent a message:") || !strings.Contains(toChildText, "parent guidance") {
+		t.Fatalf("parent-to-child delivery = %#v", toChild.message())
+	}
+
+	parent.mu.Lock()
+	parent.steering = nil
+	parent.mu.Unlock()
+	messageID, err := e.SendAdjacentAgentMessage(t.Context(), childID, parentID, []ContentBlock{{Type: "text", Text: "child finding"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.notifyModelSubagentSettlement(parentID, childID, nil, "completed")
+	parent.mu.Lock()
+	steering := append([]*queuedPrompt(nil), parent.steering...)
+	parent.mu.Unlock()
+	if len(steering) != 2 || steering[0].id != messageID || steering[0].source["kind"] != "agent-message" || steering[1].source["kind"] != "subagent-settled" {
+		t.Fatalf("parent steering FIFO = %#v", steering)
+	}
+	childText := blockText(steering[0].content)
+	if !strings.Contains(childText, "Agent "+childID+" sent a message:") || !strings.Contains(childText, "child finding") {
+		t.Fatalf("child-to-parent content = %q", blockText(steering[0].content))
+	}
+	if _, err := e.SendAdjacentAgentMessage(t.Context(), childID, childID, []ContentBlock{{Type: "text", Text: "self"}}); err == nil || !strings.Contains(err.Error(), "subagent-unauthorized") {
+		t.Fatalf("self send error = %v", err)
+	}
+	if _, err := e.SendAdjacentAgentMessage(t.Context(), childID, "not-adjacent", []ContentBlock{{Type: "text", Text: "sideways"}}); err == nil || !strings.Contains(err.Error(), "subagent-unauthorized") {
+		t.Fatalf("non-adjacent send error = %v", err)
+	}
+}
+
 func TestModelSubagentConfigRestrictsOnlyGlobalTools(t *testing.T) {
 	e := newIntegrationEngine(t)
 	parent, err := e.CreateSession(context.Background(), e.Config().Workspace, "configured-subagent-parent", "")

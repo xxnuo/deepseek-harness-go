@@ -104,7 +104,7 @@ func TestSessionSearchUsesOnlyCurrentMessageSurface(t *testing.T) {
 	if _, err := e.appendEventWithMetadata(s, "user/message", map[string]any{
 		"content": []ContentBlock{{Type: "text", Text: "current replacement"}},
 		"source":  map[string]any{"kind": "plugin", "plugin": "test"},
-	}, map[string]any{"op": "replace", "start": first.Seq, "end": first.Seq}, []int{first.Seq}, false); err != nil {
+	}, map[string]any{"op": "replace", "start": first.Seq, "end": first.Seq}, []int{int(first.Seq)}, false); err != nil {
 		t.Fatal(err)
 	}
 	if items, more := e.SearchSessions("needle"); more || len(items) != 0 {

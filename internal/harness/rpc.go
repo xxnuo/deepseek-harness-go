@@ -47,16 +47,183 @@ func okResult(id string, value any) serverResponse {
 	return serverResponse{Type: "server-response", RPCID: id, Result: map[string]any{"ok": true, "value": value}}
 }
 func errResult(id string, err *RPCError) serverResponse {
-	return serverResponse{Type: "server-response", RPCID: id, Result: map[string]any{"ok": false, "error": err}}
+	return serverResponse{Type: "server-response", RPCID: id, Result: map[string]any{"ok": false, "error": normalizeRPCError(err)}}
 }
 func rpcError(code, message string, details any) *RPCError {
-	return &RPCError{Code: code, Message: message, Details: detailsOrEmpty(details)}
+	return normalizeRPCError(&RPCError{Code: code, Message: message, Details: details})
+}
+
+func normalizeRPCError(err *RPCError) *RPCError {
+	if err == nil {
+		return nil
+	}
+	normalized := *err
+	normalized.Code = canonicalRPCErrorCode(err.Code)
+	normalized.Details = detailsOrEmpty(err.Details)
+	return &normalized
+}
+
+// canonicalRPCErrorCode keeps older internal call sites source-compatible
+// while exposing the namespaced RemoteError vocabulary on every wire path.
+func canonicalRPCErrorCode(code string) string {
+	if strings.Contains(code, "/") {
+		return code
+	}
+	switch code {
+	case "bad-request":
+		return "gateway/bad-request"
+	case "cancelled":
+		return "gateway/cancelled"
+	case "internal":
+		return "gateway/internal"
+	case "input-invalid":
+		return "gateway/input-invalid"
+	case "invocation-unavailable":
+		return "gateway/invocation-unavailable"
+	case "session-conflict":
+		return "session/conflict"
+	case "session-not-found":
+		return "session/not-found"
+	case "model-unavailable":
+		return "session/model-unavailable"
+	case "attachment-error":
+		return "session/attachment-invalid"
+	case "queue-item-not-found":
+		return "session/queue-item-not-found"
+	case "steer-unavailable":
+		return "session/steer-unavailable"
+	case "title-invalid":
+		return "session/title-invalid"
+	case "fork-unavailable":
+		return "session/fork-unavailable"
+	case "workspace-attach-failed":
+		return "session/workspace-attach-failed"
+	case "agent-busy":
+		return "session/agent-busy"
+	case "agent-preset-conflict":
+		return "agent-preset/conflict"
+	case "agent-preset-not-found":
+		return "agent-preset/not-found"
+	case "agent-preset-invalid":
+		return "agent-preset/invalid"
+	case "agent-preset-read-only":
+		return "agent-preset/read-only"
+	case "agent-preset-locked":
+		return "agent-preset/locked"
+	case "workspace-not-found":
+		return "workspace/not-found"
+	case "workspace-invalid-path":
+		return "workspace/invalid-path"
+	case "workspace-name-conflict":
+		return "workspace/name-conflict"
+	case "workspace-move-invalid":
+		return "workspace/move-invalid"
+	case "directory-exists":
+		return "directory-picker/exists"
+	case "directory-unreadable":
+		return "directory-picker/unreadable"
+	case "directory-create-failed":
+		return "directory-picker/create-failed"
+	case "settings-conflict":
+		return "settings/conflict"
+	case "settings-rejected":
+		return "settings/rejected"
+	case "credential-rejected":
+		return "credential/rejected"
+	case "subagent-not-found":
+		return "subagent/not-found"
+	case "subagent-unauthorized":
+		return "subagent/unauthorized"
+	case "subagent-not-resumable":
+		return "subagent/not-resumable"
+	case "subagent-parent-unavailable":
+		return "subagent/parent-unavailable"
+	case "subagent-delivery-unavailable":
+		return "subagent/delivery-unavailable"
+	case "subagent-projections-unavailable":
+		return "subagent/projections-unavailable"
+	case "subagent-attachment-invalid":
+		return "subagent/attachment-invalid"
+	case "subagent-invalid-time-zone":
+		return "subagent/invalid-time-zone"
+	case "subagent-list-failed":
+		return "gateway/internal"
+	case "model-discovery-failed":
+		return "llm/model-discovery-rejected"
+	case "inventory-unavailable", "goal-not-found", "workspace-persist-failed":
+		return "gateway/internal"
+	case "invalid-time-zone":
+		return "session/invalid-time-zone"
+	default:
+		return "gateway/internal"
+	}
 }
 func detailsOrEmpty(v any) any {
 	if v == nil {
 		return map[string]any{}
 	}
-	return v
+	encoded, err := json.Marshal(v)
+	if err != nil || len(encoded) == 0 || encoded[0] != '{' {
+		return map[string]any{}
+	}
+	if object, ok := v.(map[string]any); ok {
+		return object
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+		return map[string]any{}
+	}
+	return object
+}
+
+func rpcWithDetails(err *RPCError, details any) *RPCError {
+	if err == nil {
+		return nil
+	}
+	copy := *err
+	copy.Details = details
+	return normalizeRPCError(&copy)
+}
+
+func rpcMergeDetails(err *RPCError, fields map[string]any) *RPCError {
+	if err == nil {
+		return nil
+	}
+	details := map[string]any{}
+	if existing, ok := detailsOrEmpty(err.Details).(map[string]any); ok {
+		for key, value := range existing {
+			details[key] = value
+		}
+	}
+	for key, value := range fields {
+		details[key] = value
+	}
+	return rpcWithDetails(err, details)
+}
+
+func withSubagentAddressDetails(err *RPCError, parentID, childID string) *RPCError {
+	if err == nil {
+		return nil
+	}
+	fields := map[string]any{}
+	if parentID != "" {
+		fields["parentSessionId"] = parentID
+	}
+	if childID != "" {
+		fields["childSessionId"] = childID
+	}
+	switch err.Code {
+	case "subagent/not-found", "subagent/catalog-diagnostic":
+		return rpcMergeDetails(err, fields)
+	case "subagent/parent-unavailable":
+		delete(fields, "childSessionId")
+		return rpcMergeDetails(err, fields)
+	case "subagent/not-resumable", "subagent/unauthorized", "subagent/delivery-unavailable":
+		delete(fields, "parentSessionId")
+		return rpcMergeDetails(err, fields)
+	default:
+		return err
+	}
 }
 
 func containsString(values []string, want string) bool {
@@ -70,6 +237,10 @@ func containsString(values []string, want string) bool {
 func errorToRPC(err error) *RPCError {
 	if err == nil {
 		return nil
+	}
+	var remote *RPCError
+	if errors.As(err, &remote) {
+		return normalizeRPCError(remote)
 	}
 	var sessionConflict *SessionConflictError
 	if errors.As(err, &sessionConflict) {
@@ -88,11 +259,28 @@ func errorToRPC(err error) *RPCError {
 	}
 	var timeZone *ClientTimeZoneError
 	if errors.As(err, &timeZone) {
-		return rpcError("invalid-time-zone", timeZone.Error(), map[string]any{"value": timeZone.Value})
+		return rpcError("session/invalid-time-zone", timeZone.Error(), map[string]any{"value": timeZone.Value})
 	}
 	var reference *SessionReferenceError
 	if errors.As(err, &reference) {
 		return rpcError(string(reference.Code), reference.Message, map[string]any{})
+	}
+	var subagentService *SubagentServiceError
+	if errors.As(err, &subagentService) {
+		switch subagentService.Code {
+		case "PARENT_UNAVAILABLE":
+			return rpcError("subagent-parent-unavailable", subagentService.Message, map[string]any{})
+		case "NOT_RESUMABLE":
+			return rpcError("subagent-not-resumable", "subagent cannot be resumed", map[string]any{})
+		case "UNAUTHORIZED":
+			return rpcError("subagent-unauthorized", "subagent does not belong to this parent", map[string]any{})
+		case "MODEL_DOES_NOT_SUPPORT_IMAGES":
+			return rpcError("subagent-attachment-invalid", subagentService.Message, map[string]any{"reason": subagentService.Code})
+		case "DRAINING", "ACTIVATION_CLOSING", "CONTINUATION_UNAVAILABLE", "PERSISTENCE_UNAVAILABLE":
+			return rpcError("subagent-delivery-unavailable", "subagent follow-up is temporarily unavailable", map[string]any{})
+		case "SUBAGENT_CONTROL_PROJECTIONS_UNAVAILABLE":
+			return rpcError("subagent-projections-unavailable", subagentService.Message, map[string]any{})
+		}
 	}
 	msg := err.Error()
 	code := "internal"
@@ -433,7 +621,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		path, _ := p["path"].(string)
 		w, created, err := e.CreateWorkspace(path)
 		if err != nil {
-			return nil, errorToRPC(err)
+			return nil, rpcWithDetails(errorToRPC(err), map[string]any{"path": path})
 		}
 		return map[string]any{"workspace": w, "created": created}, nil
 	case "workspace.rename":
@@ -441,13 +629,20 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		title, _ := p["title"].(string)
 		w, err := e.RenameWorkspace(id, title)
 		if err != nil {
-			return nil, errorToRPC(err)
+			mapped := errorToRPC(err)
+			switch mapped.Code {
+			case "workspace/not-found":
+				mapped = rpcWithDetails(mapped, map[string]any{"workspaceId": id})
+			case "workspace/name-conflict":
+				mapped = rpcWithDetails(mapped, map[string]any{"name": strings.TrimSpace(title)})
+			}
+			return nil, mapped
 		}
 		return map[string]any{"workspace": w}, nil
 	case "workspace.delete":
 		id, _ := p["workspaceId"].(string)
 		if err := e.DeleteWorkspace(id); err != nil {
-			return nil, errorToRPC(err)
+			return nil, rpcWithDetails(errorToRPC(err), map[string]any{"workspaceId": id})
 		}
 		return map[string]any{"deleted": true}, nil
 	case "workspace.insertBefore":
@@ -458,7 +653,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		id, _ := p["sessionId"].(string)
 		ids, err := e.ArchiveSession(id)
 		if err != nil {
-			return nil, errorToRPC(err)
+			return nil, rpcWithDetails(errorToRPC(err), map[string]any{"sessionId": id})
 		}
 		return map[string]any{"archivedSessionIds": ids}, nil
 	case "skill.list":
@@ -499,7 +694,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		event, appendErr := appendEventLocked(s, "agent-preset/selected", map[string]any{"agentPreset": preset}, nil, nil, false)
 		s.mu.Unlock()
 		if appendErr != nil {
-			return nil, rpcError("agent-preset-invalid", appendErr.Error(), map[string]any{"agentPreset": preset})
+			return nil, agentPresetInvalid(preset, appendErr.Error())
 		}
 		e.publishEvent(id, event)
 		e.emitRemoteEvent("agent-preset/selected", id, preset)
@@ -516,14 +711,14 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		id, _ := p["agentPreset"].(string)
 		row, ok := e.findPreset(id)
 		if !ok {
-			return nil, rpcError("agent-preset-not-found", "preset not found", map[string]any{"agentPreset": id})
+			return nil, e.presetNotFound(id)
 		}
 		if row.trust != "user" {
-			return nil, rpcError("agent-preset-read-only", "shipped presets are read-only", map[string]any{"agentPreset": id})
+			return nil, agentPresetReadOnly(id, "shipped presets are read-only")
 		}
 		if opener := openCommand(); opener != "" {
 			if err := exec.CommandContext(ctx, opener, row.dir).Start(); err != nil {
-				return nil, rpcError("agent-preset-invalid", err.Error(), map[string]any{"agentPreset": id})
+				return nil, agentPresetInvalid(id, err.Error())
 			}
 			return map[string]any{"opened": true}, nil
 		}
@@ -748,7 +943,7 @@ func (e *Engine) reorderWorkspace(p map[string]any) (any, *RPCError) {
 	e.mu.Lock()
 	if e.workspaces[id] == nil {
 		e.mu.Unlock()
-		return nil, rpcError("workspace-not-found", "workspace not found", nil)
+		return nil, rpcError("workspace-not-found", "workspace not found", map[string]any{"workspaceId": id})
 	}
 	previousOrder := append([]string(nil), e.workspaceOrder...)
 	ids := append([]string(nil), e.workspaceOrder...)
@@ -783,7 +978,7 @@ func (e *Engine) reorderWorkspace(p map[string]any) (any, *RPCError) {
 		}
 		if at < 0 {
 			e.mu.Unlock()
-			return nil, rpcError("workspace-move-invalid", "anchor not found", nil)
+			return nil, rpcError("workspace-move-invalid", "anchor not found", map[string]any{"workspaceId": id})
 		}
 		ids = append(ids[:at], append([]string{id}, ids[at:]...)...)
 	}
@@ -809,7 +1004,7 @@ func (e *Engine) reorderSession(p map[string]any) (any, *RPCError) {
 	w := e.workspaces[wid]
 	if w == nil {
 		e.mu.Unlock()
-		return nil, rpcError("workspace-not-found", "workspace not found", nil)
+		return nil, rpcError("workspace-not-found", "workspace not found", map[string]any{"workspaceId": wid})
 	}
 	previousIDs := append([]string(nil), w.SessionIDs...)
 	previousUpdatedAt := w.UpdatedAt
@@ -824,11 +1019,15 @@ func (e *Engine) reorderSession(p map[string]any) (any, *RPCError) {
 	at := find(sid)
 	if at < 0 {
 		e.mu.Unlock()
-		return nil, rpcError("workspace-move-invalid", "session is not in workspace", nil)
+		return nil, rpcError("workspace-move-invalid", "session is not in workspace", map[string]any{
+			"workspaceId": wid, "sessionId": sid,
+		})
 	}
 	if before != "" && find(before) < 0 {
 		e.mu.Unlock()
-		return nil, rpcError("workspace-move-invalid", "anchor is not in workspace", nil)
+		return nil, rpcError("workspace-move-invalid", "anchor is not in workspace", map[string]any{
+			"workspaceId": wid, "sessionId": sid, "beforeSessionId": before,
+		})
 	}
 	if before == sid {
 		copy := *w
@@ -1014,7 +1213,7 @@ func (e *Engine) forkSessionAtFrom(ctx context.Context, id string, atSeq *int, c
 	if cut < 0 {
 		lastSeq := -1
 		if len(events) > 0 {
-			lastSeq = events[len(events)-1].Seq
+			lastSeq = int(events[len(events)-1].Seq)
 		}
 		if atSeq != nil && *atSeq >= 0 && *atSeq <= lastSeq {
 			return "", fmt.Errorf("fork-unavailable: session %q has not completed the turn containing event %d", id, *atSeq)
@@ -1069,6 +1268,8 @@ func (e *Engine) forkSessionAtFrom(ctx context.Context, id string, atSeq *int, c
 	}
 	s.mu.Lock()
 	s.Header.SeedLength = len(s.Events)
+	s.Header.IsSeeded = true
+	s.InheritedEventCount = SessionLogOffset(len(s.Events))
 	s.mu.Unlock()
 	goal, hasGoal, goalErr := foldGoalState(events)
 	if goalErr != nil {
@@ -1179,7 +1380,7 @@ func completedTurnCut(events []Event, atSeq *int) int {
 		return -1
 	}
 	boundary := -1
-	if atSeq == nil || *atSeq > events[len(events)-1].Seq {
+	if atSeq == nil || *atSeq > int(events[len(events)-1].Seq) {
 		// Omitted and past-end anchors use the latest turn boundary.
 		for i := len(events) - 1; i >= 0; i-- {
 			if events[i].Type == "turn/end" {
@@ -1190,7 +1391,7 @@ func completedTurnCut(events []Event, atSeq *int) int {
 	} else if *atSeq >= 0 {
 		// An in-log anchor belongs to the first turn ending at or after it.
 		for i, event := range events {
-			if event.Seq >= *atSeq && event.Type == "turn/end" {
+			if int(event.Seq) >= *atSeq && event.Type == "turn/end" {
 				boundary = i
 				break
 			}

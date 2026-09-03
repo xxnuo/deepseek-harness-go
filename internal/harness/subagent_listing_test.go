@@ -403,7 +403,7 @@ func TestSubagentListRPCPropagatesRequestCancellation(t *testing.T) {
 	<-entered
 	cancel()
 	rpcErr := <-done
-	if rpcErr == nil || rpcErr.Code != "cancelled" {
+	if rpcErr == nil || rpcErr.Code != "gateway/cancelled" {
 		t.Fatalf("subagent.list cancellation = %#v", rpcErr)
 	}
 }

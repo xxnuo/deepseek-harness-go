@@ -104,7 +104,7 @@ var PythonWireFrameFields = map[string]PythonWireFieldSet{
 	"RunMessage":     {Required: []string{"program", "type"}, Optional: []string{}},
 	"BootAckMessage": {Required: []string{"type"}, Optional: []string{}},
 	"CallMessage":    {Required: []string{"args", "global", "id", "name", "type"}, Optional: []string{}},
-	"LogMessage":     {Required: []string{"text", "type"}, Optional: []string{"truncated"}},
+	"LogMessage":     {Required: []string{"text", "type"}, Optional: []string{"open", "truncated"}},
 	"DoneErrorField": {Required: []string{"kind", "message"}, Optional: []string{}},
 	"DoneMessage":    {Required: []string{"type"}, Optional: []string{"error", "value"}},
 	"ErrorClass":     {Required: []string{"memberNameProperty", "name"}, Optional: []string{}},

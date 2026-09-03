@@ -192,7 +192,7 @@ func TestHTTPRPCBusinessErrorEnvelope(t *testing.T) {
 		t.Fatalf("missing session result = %#v, want ok=false", result)
 	}
 	errValue, ok := result["error"].(map[string]any)
-	if !ok || errValue["code"] != "session-not-found" {
+	if !ok || errValue["code"] != "session/not-found" {
 		t.Fatalf("missing session error = %#v, want session-not-found", result["error"])
 	}
 
@@ -205,7 +205,7 @@ func TestHTTPRPCBusinessErrorEnvelope(t *testing.T) {
 		t.Fatalf("unknown method result = %#v, want ok=false", result)
 	}
 	errValue, ok = result["error"].(map[string]any)
-	if !ok || errValue["code"] != "bad-request" {
+	if !ok || errValue["code"] != "gateway/bad-request" {
 		t.Fatalf("unknown method error = %#v, want bad-request", result["error"])
 	}
 }

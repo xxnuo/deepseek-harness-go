@@ -48,45 +48,51 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 }
 
 func (e *Engine) handleWebSocket(w http.ResponseWriter, r *http.Request, kind string) {
+	ws, ok := acceptWebSocket(w, r)
+	if !ok {
+		return
+	}
+	defer ws.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	frames := e.streamFrames(ctx, kind)
+	go drainWebSocket(ws, cancel)
+	e.pumpEvents(ws, frames)
+}
+
+func acceptWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, bool) {
 	if r.Method != http.MethodGet || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "websocket upgrade required", http.StatusUpgradeRequired)
-		return
+		return nil, false
 	}
 	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 16 {
 		http.Error(w, "invalid websocket key", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
 		http.Error(w, "unsupported websocket version", http.StatusUpgradeRequired)
-		return
+		return nil, false
 	}
 	h, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "websocket unavailable", http.StatusNotImplemented)
-		return
+		return nil, false
 	}
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	frames := e.streamFrames(ctx, kind)
 	conn, brw, err := h.Hijack()
 	if err != nil {
-		return
+		return nil, false
 	}
 	accept := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	_, _ = fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", base64.StdEncoding.EncodeToString(accept[:]))
 	if err := brw.Flush(); err != nil {
 		_ = conn.Close()
-		return
+		return nil, false
 	}
-
-	ws := &wsConn{Conn: conn, reader: brw.Reader}
-	go drainWebSocket(ws, cancel)
-	e.pumpEvents(ws, frames)
-	cancel()
-	_ = conn.Close()
+	return &wsConn{Conn: conn, reader: brw.Reader}, true
 }
 
 func drainWebSocket(conn *wsConn, cancel context.CancelFunc) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -71,6 +72,49 @@ func TestSDKProfileRejectsInvalidServerOptions(t *testing.T) {
 				t.Fatalf("validate() = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestRuntimeInvariantProfileConfigReachesEngineRegistry(t *testing.T) {
+	composed := testComposition(t, `
+- id: invariants
+  name: '@deepseek-ai/dsh-invariants'
+  config:
+    package_allowlist: ['^@probe/']
+    package_blocklist: ['blocked$']
+`)
+	if err := composed.validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
+	if cfg.RuntimeInvariants == nil || cfg.RuntimeInvariants.Disabled ||
+		!reflect.DeepEqual(cfg.RuntimeInvariants.PackageAllowlist, []string{"^@probe/"}) ||
+		!reflect.DeepEqual(cfg.RuntimeInvariants.PackageBlocklist, []string{"blocked$"}) {
+		t.Fatalf("runtime invariants = %#v", cfg.RuntimeInvariants)
+	}
+	cfg.Persist = false
+	cfg.Terminal.Disabled = true
+	engine, err := harness.New(harness.WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+
+	selected, blocked := false, false
+	if _, err := engine.InvariantRegistry().Register("@probe/selected", func(*harness.InvariantScope, harness.InvariantFailure) error {
+		selected = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.InvariantRegistry().Register("@probe/blocked", func(*harness.InvariantScope, harness.InvariantFailure) error {
+		blocked = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !selected || blocked {
+		t.Fatalf("registry selection = selected:%t blocked:%t", selected, blocked)
 	}
 }
 

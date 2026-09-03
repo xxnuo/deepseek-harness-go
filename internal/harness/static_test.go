@@ -343,8 +343,8 @@ func TestOriginalFrontendBootsEveryPluginAsset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Entries) != 48 {
-		t.Fatalf("boot graph has %d entries, want 48", len(graph.Entries))
+	if len(graph.Entries) != 49 {
+		t.Fatalf("boot graph has %d entries, want 49", len(graph.Entries))
 	}
 	if presets := scanPresets(e); len(presets) != 4 {
 		t.Fatalf("embedded preset roster has %d entries, want 4", len(presets))
@@ -514,8 +514,8 @@ func TestNewUsesEmbeddedRuntimeAssetsByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Entries) != 48 {
-		t.Fatalf("default embedded boot graph has %d entries, want 48", len(graph.Entries))
+	if len(graph.Entries) != 49 {
+		t.Fatalf("default embedded boot graph has %d entries, want 49", len(graph.Entries))
 	}
 }
 

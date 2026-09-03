@@ -336,13 +336,13 @@ func TestPiAISettingsRejectInvalidSwapAndKeepLastRoute(t *testing.T) {
 	_, rejected := e.settingsMutate(piAISettingsNamespace, []any{map[string]any{
 		"op": "set", "path": []any{"providers", "local-gateway", "api"}, "value": "unsupported",
 	}}, nil)
-	if rejected == nil || rejected.Code != "settings-rejected" || !strings.Contains(rejected.Message, "unsupported api") {
+	if rejected == nil || rejected.Code != "settings/rejected" || !strings.Contains(rejected.Message, "unsupported api") {
 		t.Fatalf("unsupported protocol rejection = %#v", rejected)
 	}
 	_, collision := e.settingsMutate(piAISettingsNamespace, []any{map[string]any{
 		"op": "set", "path": []any{"providers", "echo"}, "value": piAITestProfile("https://gateway.example/v1"),
 	}}, nil)
-	if collision == nil || collision.Code != "settings-rejected" || !strings.Contains(collision.Message, "already registered") {
+	if collision == nil || collision.Code != "settings/rejected" || !strings.Contains(collision.Message, "already registered") {
 		t.Fatalf("route collision rejection = %#v", collision)
 	}
 	e.mu.RLock()

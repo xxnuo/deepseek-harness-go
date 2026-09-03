@@ -507,7 +507,7 @@ func appendUserMessagesLocked(s *Session, messages []map[string]any) ([]Event, e
 	events := make([]Event, len(messages))
 	for index, message := range messages {
 		events[index] = Event{
-			Type: "user/message", Seq: len(s.Events) + index, Time: time.Now().UnixMilli(),
+			Type: "user/message", Seq: SessionSeq(len(s.Events) + index), Time: time.Now().UnixMilli(),
 			Data: message, SurfaceOp: "append",
 		}
 	}

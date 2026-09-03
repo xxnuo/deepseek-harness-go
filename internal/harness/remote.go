@@ -24,6 +24,8 @@ type remoteDescriptor struct {
 }
 
 var remoteDescriptors = map[string]remoteDescriptor{
+	"$events/result": {allowed: []string{"clientId", "eventId", "outcome"}, required: []string{"clientId", "eventId", "outcome"}},
+
 	"agentPresets/copy":         {allowed: []string{"from", "id", "name"}, required: []string{"from", "id"}},
 	"agentPresets/deletePreset": {allowed: []string{"id"}, required: []string{"id"}},
 	"agentPresets/list":         {allowed: []string{}},
@@ -135,6 +137,150 @@ func (e *Engine) dispatchRemote(ctx context.Context, endpoint string, raw json.R
 		return nil, false, err
 	}
 	switch endpoint {
+	case "$events/result":
+		return e.settleRemoteEventResult(endpoint, args)
+	case "agentPresets/list":
+		value, rpcErr := e.dispatch(ctx, "agentPreset.list", []byte(`{}`))
+		return value, true, rpcErr
+	case "agentPresets/read":
+		id, rpcErr := remoteString(endpoint, args, "agentPreset")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		value, rpcErr := e.readPresetContent(id)
+		return value, true, rpcErr
+	case "agentPresets/copy":
+		from, rpcErr := remoteString(endpoint, args, "from")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		id, rpcErr := remoteString(endpoint, args, "id")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		name := ""
+		if _, present := args["name"]; present {
+			name, rpcErr = remoteString(endpoint, args, "name")
+			if rpcErr != nil {
+				return nil, false, rpcErr
+			}
+		}
+		value, rpcErr := e.copyPreset(from, id, name)
+		return value, true, rpcErr
+	case "agentPresets/deletePreset":
+		id, rpcErr := remoteString(endpoint, args, "id")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		return map[string]any{}, true, e.removePreset(id)
+	case "agentPresets/select":
+		agentID, rpcErr := remoteString(endpoint, args, "agentId")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		preset, rpcErr := remoteString(endpoint, args, "agentPreset")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		payload, _ := json.Marshal(map[string]any{"sessionId": agentID, "agentPreset": preset})
+		value, rpcErr := e.dispatch(ctx, "agentPreset.select", payload)
+		return value, true, rpcErr
+	case "directoryPicker/pick":
+		path, runErr := e.pickDirectory(ctx)
+		if runErr != nil {
+			return nil, false, errorToRPC(runErr)
+		}
+		if path == "" {
+			return nil, true, nil
+		}
+		return path, true, nil
+	case "directoryPicker/list":
+		path := ""
+		if _, present := args["path"]; present {
+			var rpcErr *RPCError
+			path, rpcErr = remoteString(endpoint, args, "path")
+			if rpcErr != nil {
+				return nil, false, rpcErr
+			}
+		}
+		value, rpcErr := e.listDirectory(path)
+		return value, true, rpcErr
+	case "directoryPicker/createDirectory":
+		path, rpcErr := remoteString(endpoint, args, "path")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		name, rpcErr := remoteString(endpoint, args, "name")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		payload, _ := json.Marshal(map[string]any{"path": path, "name": name})
+		value, rpcErr := e.dispatch(ctx, "host.createDirectory", payload)
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		if object, ok := value.(map[string]any); ok {
+			return object["path"], true, nil
+		}
+		return value, true, nil
+	case "subagents/list":
+		parentID, rpcErr := remoteString(endpoint, args, "parentSessionId")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		value, rpcErr := e.subagentList(ctx, map[string]any{"parentSessionId": parentID})
+		return value, true, rpcErr
+	case "subagents/prompt":
+		requestValue, requestErr := decodeRemoteSubagentPromptRequest(args["request"])
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		parentID := requestValue["parentSessionId"].(string)
+		childID := requestValue["childSessionId"].(string)
+		parent, parentErr := e.getSession(parentID)
+		if parentErr != nil {
+			return nil, false, rpcError("subagent-parent-unavailable", "parent session is not live", map[string]any{"parentSessionId": parentID})
+		}
+		parent.mu.Lock()
+		parentLive := parent.attached && !parent.draining
+		parent.mu.Unlock()
+		if !parentLive {
+			return nil, false, rpcError("subagent-parent-unavailable", "parent session is not live", map[string]any{"parentSessionId": parentID})
+		}
+		requestID := requestValue["requestId"].(string)
+		value, rpcErr := e.subagentPromptWithSource(ctx, requestValue, "user", requestID)
+		if rpcErr != nil {
+			rpcErr = remoteSubagentPromptError(rpcErr, parentID, childID)
+		}
+		return value, true, rpcErr
+	case "subagents/interruptByParent":
+		parentID, rpcErr := remoteString(endpoint, args, "parentSessionId")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		childID, rpcErr := remoteString(endpoint, args, "childSessionId")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		mode, rpcErr := remoteString(endpoint, args, "mode")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		if mode != "continuable" {
+			return nil, false, rpcError("bad-request", "invalid payload for subagent.interrupt", map[string]any{})
+		}
+		payload := map[string]any{"parentSessionId": parentID, "childSessionId": childID, "mode": mode}
+		value, rpcErr := e.subagentInterrupt(payload)
+		return value, true, rpcErr
+	case "workspace/create", "workspace/rename", "workspace/delete", "workspace/insertBefore", "workspace/insertSessionBefore", "workspace/archiveSession":
+		request, requestErr := decodeRemoteWorkspaceRequest(endpoint, args["request"])
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		method := strings.Replace(endpoint, "/", ".", 1)
+		requestRaw, _ := json.Marshal(request)
+		value, rpcErr := e.dispatch(ctx, method, requestRaw)
+		return value, true, rpcErr
 	case "commands/list":
 		value, rpcErr := e.remoteCommandsList(args)
 		return value, true, rpcErr
@@ -368,7 +514,115 @@ func (e *Engine) remotePluginInventory() (map[string]any, *RPCError) {
 			"enabled": entry.Enabled, "fiberPhase": entry.FiberPhase,
 		})
 	}
-	return map[string]any{"entries": entries}, nil
+	result := map[string]any{"entries": entries}
+	presets := scanPresets(e)
+	if len(presets) == 0 {
+		return result, nil
+	}
+	groups := make([]map[string]any, 0, len(presets))
+	defaultID := ""
+	for _, item := range e.presetRows() {
+		if value, _ := item["isDefault"].(bool); value {
+			defaultID, _ = item["id"].(string)
+			break
+		}
+	}
+	for _, preset := range presets {
+		group := map[string]any{
+			"id": preset.id, "trust": preset.trust, "isDefault": preset.id == defaultID,
+			"rows": []map[string]any{},
+		}
+		if preset.name != "" {
+			group["name"] = preset.name
+		}
+		generation := e.livePresetRuntimeForInventory(preset.id)
+		if generation != nil {
+			group["rows"] = presetInventoryWireRows(generation.pluginInventory, true)
+		} else if preset.broken != "" {
+			group["broken"] = preset.broken
+		} else {
+			rows, err := compilePresetCompositionRows(preset.content, false, false)
+			if err != nil {
+				group["broken"] = err.Error()
+			} else {
+				group["rows"] = compositionRowsWire(rows)
+			}
+		}
+		groups = append(groups, group)
+	}
+	result["agentPresets"] = groups
+	return result, nil
+}
+
+func (e *Engine) livePresetRuntimeForInventory(id string) *presetRuntimeGeneration {
+	id = canonicalPresetID(id)
+	e.mu.RLock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
+	}
+	e.mu.RUnlock()
+
+	var latest *presetRuntimeGeneration
+	for _, session := range sessions {
+		session.mu.Lock()
+		attached := session.attached
+		preset := sessionAgentPreset(session.Header, session.Events)
+		generation := session.presetRuntime
+		session.mu.Unlock()
+		if !attached || preset != id || generation == nil || canonicalPresetID(generation.presetID) != id {
+			continue
+		}
+		if latest == nil || generation.mtimeMs > latest.mtimeMs {
+			latest = generation
+		}
+	}
+	return latest
+}
+
+func presetInventoryWireRows(entries []PluginInventoryEntry, live bool) []map[string]any {
+	rows := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		row := map[string]any{
+			"entryId":    entry.EntryID,
+			"moduleName": entry.ModuleName,
+			"enabled":    any(entry.Enabled),
+			"fiberPhase": entry.FiberPhase,
+		}
+		if entry.EntryID == "" {
+			row["entryId"] = nil
+		}
+		if entry.conditional {
+			row["enabled"] = "conditional"
+		}
+		if entry.condition != "" {
+			row["condition"] = entry.condition
+		}
+		if !live {
+			row["fiberPhase"] = nil
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func compositionRowsWire(rows []presetCompositionRow) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		entryID := any(row.entryID)
+		if row.entryID == "" {
+			entryID = nil
+		}
+		item := map[string]any{
+			"entryId": entryID, "moduleName": row.moduleName, "enabled": row.enabled,
+			"fiberPhase": row.fiberPhase,
+		}
+		if row.condition != "" {
+			item["condition"] = row.condition
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func remoteArgs(endpoint string, raw json.RawMessage, descriptor remoteDescriptor) (map[string]json.RawMessage, *RPCError) {
@@ -452,6 +706,174 @@ func remoteString(endpoint string, object map[string]json.RawMessage, field stri
 		return "", remoteInputError(endpoint, field, errors.New("must be a string"))
 	}
 	return value, nil
+}
+
+func remoteBadRequest(field, message string) *RPCError {
+	return rpcError("bad-request", "invalid Remote "+field+": "+message, nil)
+}
+
+func decodeRemoteSubagentPromptRequest(raw json.RawMessage) (map[string]any, *RPCError) {
+	allowed := []string{"requestId", "parentSessionId", "childSessionId", "mode", "content", "clientTimeZone"}
+	required := []string{"requestId", "parentSessionId", "childSessionId", "mode", "content"}
+	object, err := remoteObject(raw, allowed, required)
+	if err != nil {
+		return nil, remoteBadRequest("request", err.Error())
+	}
+	result := make(map[string]any, len(object))
+	for _, field := range []string{"requestId", "parentSessionId", "childSessionId"} {
+		value, ok := nonEmptyRemoteString(object[field])
+		if !ok {
+			return nil, remoteBadRequest("request."+field, "must be a non-empty string")
+		}
+		result[field] = value
+	}
+	mode, ok := nonEmptyRemoteString(object["mode"])
+	if !ok || mode != "continuable" {
+		return nil, remoteBadRequest("request.mode", "must be \"continuable\"")
+	}
+	result["mode"] = mode
+
+	contentRaw := bytes.TrimSpace(object["content"])
+	if len(contentRaw) == 0 || contentRaw[0] != '[' {
+		return nil, remoteBadRequest("request.content", "must be an array")
+	}
+	var rawBlocks []json.RawMessage
+	if err := json.Unmarshal(contentRaw, &rawBlocks); err != nil || rawBlocks == nil {
+		return nil, remoteBadRequest("request.content", "must be an array")
+	}
+	content := make([]any, 0, len(rawBlocks))
+	for index, rawBlock := range rawBlocks {
+		block, blockErr := decodeRemoteSubagentPromptBlock(rawBlock)
+		if blockErr != nil {
+			return nil, remoteBadRequest(fmt.Sprintf("request.content[%d]", index), blockErr.Error())
+		}
+		content = append(content, block)
+	}
+	result["content"] = content
+	if rawZone, present := object["clientTimeZone"]; present {
+		zone, ok := remoteJSON[string](rawZone)
+		if !ok {
+			return nil, remoteBadRequest("request.clientTimeZone", "must be a string")
+		}
+		result["clientTimeZone"] = zone
+	}
+	return result, nil
+}
+
+func decodeRemoteSubagentPromptBlock(raw json.RawMessage) (map[string]any, error) {
+	object, err := remoteObject(raw, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	typ, ok := remoteJSON[string](object["type"])
+	if !ok {
+		return nil, errors.New("type must be a string")
+	}
+	switch typ {
+	case "text":
+		object, err = remoteObject(raw, []string{"type", "text"}, []string{"type", "text"})
+		if err != nil {
+			return nil, err
+		}
+		text, ok := remoteJSON[string](object["text"])
+		if !ok {
+			return nil, errors.New("text must be a string")
+		}
+		return map[string]any{"type": typ, "text": text}, nil
+	case "image":
+		object, err = remoteObject(raw, []string{"type", "mediaType", "data", "name"}, []string{"type", "mediaType", "data"})
+		if err != nil {
+			return nil, err
+		}
+		mediaType, mediaOK := remoteJSON[string](object["mediaType"])
+		data, dataOK := remoteJSON[string](object["data"])
+		if !mediaOK || !dataOK {
+			return nil, errors.New("mediaType and data must be strings")
+		}
+		switch mediaType {
+		case "image/png", "image/jpeg", "image/webp", "image/gif":
+		default:
+			return nil, errors.New("mediaType is not a supported image type")
+		}
+		result := map[string]any{"type": typ, "mediaType": mediaType, "data": data}
+		if rawName, present := object["name"]; present {
+			name, ok := remoteJSON[string](rawName)
+			if !ok {
+				return nil, errors.New("name must be a string")
+			}
+			result["name"] = name
+		}
+		return result, nil
+	default:
+		return nil, errors.New("type must be \"text\" or \"image\"")
+	}
+}
+
+func nonEmptyRemoteString(raw json.RawMessage) (string, bool) {
+	value, ok := remoteJSON[string](raw)
+	return value, ok && value != ""
+}
+
+func remoteJSON[T any](raw json.RawMessage) (T, bool) {
+	var value T
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &value) != nil {
+		return value, false
+	}
+	return value, true
+}
+
+func remoteSubagentPromptError(err *RPCError, parentID, childID string) *RPCError {
+	if err == nil {
+		return nil
+	}
+	switch err.Code {
+	case "subagent/parent-unavailable", "subagent/not-found", "subagent/catalog-diagnostic", "subagent/not-resumable", "subagent/unauthorized", "subagent/delivery-unavailable":
+		return withSubagentAddressDetails(err, parentID, childID)
+	case "subagent/attachment-invalid":
+		if details, ok := err.Details.(map[string]any); ok && details["reason"] != nil {
+			return err
+		}
+		return rpcWithDetails(err, map[string]any{"reason": "IMAGE_INVALID"})
+	default:
+		return err
+	}
+}
+
+func decodeRemoteWorkspaceRequest(endpoint string, raw json.RawMessage) (map[string]any, *RPCError) {
+	specs := map[string]struct {
+		allowed  []string
+		required []string
+	}{
+		"workspace/create":              {[]string{"path"}, []string{"path"}},
+		"workspace/rename":              {[]string{"workspaceId", "title"}, []string{"workspaceId", "title"}},
+		"workspace/delete":              {[]string{"workspaceId"}, []string{"workspaceId"}},
+		"workspace/insertBefore":        {[]string{"workspaceId", "beforeWorkspaceId"}, []string{"workspaceId"}},
+		"workspace/insertSessionBefore": {[]string{"workspaceId", "sessionId", "beforeSessionId"}, []string{"workspaceId", "sessionId"}},
+		"workspace/archiveSession":      {[]string{"sessionId"}, []string{"sessionId"}},
+	}
+	spec := specs[endpoint]
+	object, err := remoteObject(raw, spec.allowed, spec.required)
+	if err != nil {
+		return nil, remoteBadRequest("request", err.Error())
+	}
+	result := make(map[string]any, len(object))
+	for _, field := range spec.required {
+		value, ok := remoteJSON[string](object[field])
+		if !ok || (field != "path" && value == "") {
+			return nil, remoteBadRequest("request."+field, "must be a non-empty string")
+		}
+		result[field] = value
+	}
+	for _, field := range []string{"beforeWorkspaceId", "beforeSessionId"} {
+		if rawValue, present := object[field]; present {
+			value, ok := remoteJSON[string](rawValue)
+			if !ok || value == "" {
+				return nil, remoteBadRequest("request."+field, "must be a non-empty string")
+			}
+			result[field] = value
+		}
+	}
+	return result, nil
 }
 
 func remoteInt(endpoint string, object map[string]json.RawMessage, field string) (int, *RPCError) {

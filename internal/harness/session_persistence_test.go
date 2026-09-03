@@ -19,7 +19,7 @@ func TestJSONLSessionStoreLazyMaterializationAndSafeLocation(t *testing.T) {
 	}
 	defer store.Close()
 	meta := SessionHeader{Version: SessionFormatVersion, ID: "../../escape😀", CreatedAt: 1, CWD: "/work/demo"}
-	if err := store.Create(context.Background(), meta); err != nil {
+	if err := store.Create(context.Background(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	location, ok := store.Locate(meta)
@@ -60,7 +60,7 @@ func TestJSONLSessionStoreCrashRepairAndLiveOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := SessionHeader{Version: SessionFormatVersion, ID: "repair", CreatedAt: 1, CWD: "/work"}
-	if err := store.Create(ctx, meta); err != nil {
+	if err := store.Create(ctx, meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	events := []Event{
@@ -137,7 +137,7 @@ func TestJSONLSessionStoreTruncatesTornTailAndTracksRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := SessionHeader{Version: SessionFormatVersion, ID: "torn", CreatedAt: 1}
-	if err := store.Create(ctx, meta); err != nil {
+	if err := store.Create(ctx, meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	events := []Event{
@@ -193,7 +193,7 @@ func TestJSONLSessionStoreRejectsCommittedCorruption(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(location.Path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	header, _ := marshalSessionHeader(meta)
+	header, _ := marshalSessionHeader(meta, SessionLogOffset(meta.SeedLength))
 	end, _ := json.Marshal(Event{Type: "turn/end", Seq: 1, Time: 2, Data: map[string]any{"turn": 1}})
 	content := append(append(append(header, '\n'), []byte("not json\n")...), append(end, '\n')...)
 	if err := os.WriteFile(location.Path, content, 0o600); err != nil {
@@ -213,7 +213,7 @@ func TestJSONLSessionStoreRejectsInvalidAppendWithoutMutation(t *testing.T) {
 	}
 	defer store.Close()
 	meta := SessionHeader{Version: SessionFormatVersion, ID: "invalid", CreatedAt: 1}
-	if err := store.Create(ctx, meta); err != nil {
+	if err := store.Create(ctx, meta, SessionLogOffset(meta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	bad := Event{Type: "turn/start", Seq: 0, Time: 1, Data: map[string]any{"turn": make(chan int)}}

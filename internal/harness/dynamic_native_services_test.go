@@ -553,7 +553,7 @@ return {
       let openError = ''
       try { ctx.sessions.fork(source, start.seq, 'native-fork-open') } catch (error) { openError = String(error) }
       return {
-        empty: { seq: empty.seq, seedLength: empty.header.seedLength },
+        empty: { seq: empty.seq, isSeeded: empty.header.isSeeded, inheritedEventCount: empty.inheritedEventCount },
         exact: exact.events.map(event => event.type), openError
       }
     })
@@ -565,7 +565,7 @@ return {
 	}
 	value := result.Value.(map[string]any)
 	empty := value["empty"].(map[string]any)
-	if empty["seedLength"] != float64(0) || empty["seq"] != float64(1) {
+	if empty["isSeeded"] != true || empty["inheritedEventCount"] != float64(0) || empty["seq"] != float64(1) {
 		t.Fatalf("empty fork = %#v", empty)
 	}
 	exact := value["exact"].([]any)

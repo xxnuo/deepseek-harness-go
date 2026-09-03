@@ -57,9 +57,9 @@ func dynamicProjectionDefinition(run *dynamicCordisRun, value goja.Value) (Proje
 	}
 	definition := ProjectionDefinition{
 		Key: key, StateVersion: int(versionNumber), dynamicRuntime: true,
-		Init: func() any {
+		InitWithHeader: func(header SessionHeader) any {
 			value, err := dynamicCordisCallBounded(run.runtime, run.vmTimeout, func() (goja.Value, error) {
-				return init(goja.Undefined())
+				return init(goja.Undefined(), run.runtime.ToValue(dynamicSessionHeaderValue(header)))
 			})
 			if err != nil {
 				panic(dynamicJSMessage(err))

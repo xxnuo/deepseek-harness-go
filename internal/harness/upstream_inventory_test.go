@@ -53,6 +53,12 @@ func TestUpstreamContractWorkspaceInventory(t *testing.T) {
 	}
 	sort.Strings(wantRoots)
 	actualRoots := upstreamWorkspaceRoots(t, upstream)
+	if os.Getenv("UPDATE_UPSTREAM_INVENTORY") == "1" {
+		rows = reconcileUpstreamInventoryRows(rows, actualRoots)
+		owned := upstreamWorkspaceFiles(t, upstream, actualRoots)
+		writeUpstreamInventory(t, inventoryPath, rows, owned)
+		return
+	}
 	assertStringSet(t, "upstream workspace packages", wantRoots, actualRoots)
 
 	owned := upstreamWorkspaceFiles(t, upstream, wantRoots)
@@ -100,9 +106,59 @@ func TestUpstreamInventoryDoesNotOverclaimSDKClient(t *testing.T) {
 	if !reflect.DeepEqual(client.goFiles, []string{"internal/harness/sdk.go"}) {
 		t.Fatalf("packages/sdk/client Go surface = %#v, want SDK server surface", client.goFiles)
 	}
-	if counts["frontend"] != 41 || counts["hybrid"] != 9 || counts["ported"] != 178 || counts["replaced"] != 23 || counts["support"] != 13 {
-		t.Fatalf("alpha.1 inventory counts = %#v, want frontend=41 hybrid=9 ported=178 replaced=23 support=13", counts)
+	if counts["frontend"] != 42 || counts["hybrid"] != 9 || counts["ported"] != 176 || counts["replaced"] != 26 || counts["support"] != 13 {
+		t.Fatalf("alpha.4 inventory counts = %#v, want frontend=42 hybrid=9 ported=176 replaced=26 support=13", counts)
 	}
+}
+
+// reconcileUpstreamInventoryRows keeps the review-owned classification and Go
+// surface for existing roots while adding/removing roots introduced by the
+// pinned upstream release. New roots are classified explicitly here so an
+// inventory refresh cannot silently overclaim an unreviewed package.
+func reconcileUpstreamInventoryRows(rows []upstreamInventoryRow, roots []string) []upstreamInventoryRow {
+	known := make(map[string]upstreamInventoryRow, len(rows))
+	for _, row := range rows {
+		if row.root == "" {
+			continue
+		}
+		known[row.root] = row
+	}
+	defaults := map[string]upstreamInventoryRow{
+		"packages/client/ui-schedule": {
+			status: "frontend", root: "packages/client/ui-schedule",
+		},
+		"packages/session/session-turn-outline": {
+			status: "ported", root: "packages/session/session-turn-outline",
+			goFiles: []string{"internal/harness/projection_registry.go", "internal/harness/projections.go"},
+		},
+		"packages/util/deque": {
+			status: "replaced", root: "packages/util/deque",
+			goFiles: []string{"internal/harness/agent.go"},
+		},
+		"packages/util/time": {
+			status: "replaced", root: "packages/util/time",
+			goFiles: []string{"internal/harness/context_runtime.go"},
+		},
+		"packages/util/values": {
+			status: "replaced", root: "packages/util/values",
+			goFiles: []string{"internal/harness/dynamic.go"},
+		},
+	}
+	result := make([]upstreamInventoryRow, 0, len(roots))
+	for _, root := range roots {
+		if row, ok := known[root]; ok {
+			result = append(result, row)
+			continue
+		}
+		if row, ok := defaults[root]; ok {
+			result = append(result, row)
+			continue
+		}
+		// A newly introduced root must be reviewed and classified before it can
+		// enter the verified baseline.
+		result = append(result, upstreamInventoryRow{status: "support", root: root})
+	}
+	return result
 }
 
 func writeUpstreamInventory(t *testing.T, path string, rows []upstreamInventoryRow, owned map[string][]upstreamWorkspaceFile) {

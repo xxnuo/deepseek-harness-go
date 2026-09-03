@@ -283,7 +283,7 @@ func TestPythonProtocolMirrorWithRealPython(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pyDir := filepath.Join(assets.UpstreamDir, "packages", "code-runtime", "code-runtime-python", "py")
+	pyDir := filepath.Join(assets.UpstreamDir, "packages", "experimental", "code-runtime-python", "py")
 	pathJSON, _ := json.Marshal(pyDir)
 	ordered, err := EncodePythonJSONPlain(PythonJSONObject{
 		{Key: "b", Value: 1}, {Key: "10", Value: 10}, {Key: "2", Value: 2},

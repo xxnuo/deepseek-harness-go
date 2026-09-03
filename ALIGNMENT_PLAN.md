@@ -1,6 +1,6 @@
 # DeepSeek Harness Go 语义对齐记录
 
-当前基线：上游 `deepseek-harness` commit `cd5ef8148158c3a752a658978873241fdf8e2bbc`（`dsh-v0.1.2-alpha.1`）。此前 rc.2 的完成记录保留为迁移历史；本轮继续按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
+当前基线：上游 `deepseek-harness` commit `dd6322d604e00eec1ba5e0c8541159906a21094a`（`dsh-v0.1.2-alpha.3`）。此前 rc.2 与 alpha.1 的完成记录保留为迁移历史；本轮继续按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
 
 ## 对齐顺序
 
@@ -196,14 +196,14 @@ Go 入口：`internal/harness/agent.go`、`internal/harness/sdk.go`、`internal/
 
 上游入口：`packages/session-query/session-query/src/*`、`packages/session-query/session-query-sqlite/src/*`、`packages/session-query/tool-session-query/src/*` 及三组 package tests。
 
-Go 入口：`internal/harness/session_query.go`、`internal/harness/prompt.go`、JSONL/SQLite `SessionStore`。
+Go 入口：`internal/harness/session_query.go`、`internal/harness/prompt.go`、JSONL `SessionStore` 与独立 storage/query SQLite backend。
 
 验收：5 个 cursor-free 工具按 caller 的精确 header cwd 授权；null-cwd 只允许 self，显式空 target 不退化为 self，缺失和跨 workspace target/parent 不可区分。search 为 exclusive 且默认 30 秒 timeout，trace/read 为 parallel；order 113 prompt 与 generic call presentation 已接入。参数支持 safe integer、非空数组、精确 ISO 时间和亚毫秒整数域映射，read window 默认上限 50。logical corpus 使用 live precedence，cold/persisted-only 会话读取当前持久化快照，报告准确 availability，并检测 immutable header source conflict；阻塞后端返回后仍保留取消。搜索使用 Unicode token phrase、去音调大小写归一、匹配次数/文档长度/时间/seq 排名和 240 code-point snippet。当前 step 排除、结果 cap、surface 分类、事件关系、深层 lineage 迭代遍历、隐藏祖先环错误脱敏、unauthorized subtree pruning、标题和深事件快照均与上游模型可见语义一致。
 
 行为验证：
 
 - `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test ./internal/harness -run 'TestSessionQuery' -count=1`
-- `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -race ./internal/harness -run 'TestSessionQuery|TestEngineDefaultSessionStoreLazyPersistenceAndRestart|TestEngineSQLiteSessionStoreRestoresSubagentMetadata' -count=1`
+- `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test -race ./internal/harness -run 'TestSessionQuery|TestEngineDefaultSessionStoreLazyPersistenceAndRestart|TestJSONLSessionStoreLazyMaterializationAndSafeLocation|TestModelSubagentCompositionPersistsAcrossRestart' -count=1`
 - `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- test ./internal/harness -count=1`
 - `go run ./scripts/with_runtime_assets --upstream deepseek-harness -- vet ./...`
 
@@ -532,3 +532,108 @@ telemetry sink 比较增加不可比较动态值保护：接口 concrete type �
 9. `go run ./scripts/gen_public_facade -check` 与 `git diff --check`：PASS；上游 `deepseek-harness` 工作树仍干净并固定在 `cd5ef8148158c3a752a658978873241fdf8e2bbc`。
 
 收口边界：`packages/sdk/client` 仅以 `hybrid` 记录 Go 的 SDK server/runtime，对应的公开 TypeScript client 尚未移植；SDK notification 已按上游 transport 只接受字符串/数字 id。httptest provider wire 只证明请求扩展、SSE 时序和错误边界，不证明真实外部 provider 或 credential 可用。完整 npm/Cordis `ToolRuntime`/registry、对象 intercept 合并、平台 ripgrep 随包交付、低频插件 profile 配置、webhook ingress/rule runtime，以及更深的 reload 故障注入覆盖均保留为后续范围。现有 Go bash 成功文本格式和纯 Go WebP 编码差异已在对应章节明确，不伪称与上游字节级一致。
+
+## dsh-v0.1.2-alpha.3 跟进计划与逐步记录
+
+当前状态：alpha.3 生产差异审计、实现和最终全量门禁均已完成；Remote Stream/Event 与 first-parent 补项已通过定向普通、race 及完整 Makefile 门禁，未验证范围继续明确列为边界，不计入完成声明。
+
+验收原则：本节只记录当前 pinned alpha.3 源码、Go 生产调用链和已实际执行的验证。真实外部 provider、完整 npm/Cordis runtime、connection recovery 和前端-only 行为不标记完成；工作区已有的无关 dirty changes 保留。
+
+首轮同步记录：
+
+1. [已完成] 固定上游基线并检查来源：`upstream.lock` 已锁定 tag `dsh-v0.1.2-alpha.3`、commit `dd6322d604e00eec1ba5e0c8541159906a21094a`；`deepseek-harness` 当前 `HEAD` 与 tag 精确对应，工作树干净。
+2. [已完成] 盘点 alpha.3 workspace：按 pinned `pnpm-workspace.yaml` 重建 `upstream_inventory.tsv`，共 267 个 root，分类为 `frontend=42`、`hybrid=9`、`ported=178`、`replaced=26`、`support=12`；移除已删除的 agent-spine demo/SQLite persistence root，新增 `ui-schedule`、`session-turn-outline`、`util/deque`、`util/time`、`util/values`。`TestUpstreamContractWorkspaceInventory` 在更新模式下已成功重生成，分类断言已更新。
+3. [已完成] 对齐 alpha.3 profile 合同：sdk-minimal 的显式 agent kernel、invariant rows、session projection/title、timer/tools 等 rows，以及 web 的 `session-turn-outline` 已写入合同测试；profile bundles/reload policy 与上游 `PROFILE_TEMPLATES` 保持一致。
+4. [已完成] 对齐 forwarded remote event 合同：上游已从 `SESSION_CONTROLLER_REMOTE_EVENTS` 运行时展开改为 `API_REMOTE_FORWARDED_EVENTS` 显式 event entries；合同测试改为读取显式条目，并保持 Go allowlist 集合校验。
+5. [已完成] 清理版本漂移断言：CLI/config/runtime bridge、插件 provenance fixture 和相关注释已从 alpha.1 更新到 alpha.3；测试 fixture 对当前 `harness.Version()` 使用动态断言的地方不再硬编码旧版本。
+6. [已完成] 已执行最小验证：`GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha3-contract go test -count=1 -run '^TestUpstreamContract(ForwardedRemoteEvents|DefaultProfiles|WorkspaceInventory)$' ./internal/harness`（其中 WorkspaceInventory 在更新模式下运行）；以及版本/fixture 定向测试（`cmd/dsh` 与 `internal/harness`）均通过。
+7. [已完成] 汇合并验证 projection/read-image/session-turn-outline 等 Go 行为实现：已有 projection cell 前进时逐项校验 `observedSeq+1` 到目标 seq 的连续事件并只在 apply 成功后推进 watermark；首次 lazy build 保持上游 `buildCell` 的传入 slice-order 语义，不额外把稀疏 fork/suffix fixture 当作损坏；late-cell 历史重放失败不会缓存半成品，wire view 使用 previous/current 双槽抑制不可见变化；`read_image` 支持无扩展名和 content-addressed 路径，在格式检测前执行 byte cap，并将截断签名归一为可诊断的 malformed-image 错误。专项 wrapper 测试与 `-race` 定向测试均通过。
+8. [已完成] Remote Stream/Event、DeepSeek endpoint guidance 和 first-parent 补项合入当前工作树后，已重新执行 `make verify-upstream test vet race smoke-standalone smoke-clean-archive`、`git diff --check` 和 pinned upstream 状态检查，全部通过；旧结果只作为历史记录。
+
+alpha.3 关键源码变化与当前 Go 对齐证据：
+
+- `packages/bundle/sdk-minimal/cordis.patch.yml` 删除 agent-spine demo，改为显式 session/agent/tool kernel 与四类 invariant；Go profile contract 已同步这些 rows。该项不等价于完整 npm/Cordis runtime 对等，需依赖后续 runtime 门禁。
+- `packages/bundle/web-app/cordis.patch.yml` 新增 `session-turn-outline` 和 disabled `ui-schedule` client row；Go inventory/contract 已记录，前端行为仍属于 frontend-only deferred scope。
+- `packages/api/remotes/src/remote-events.ts` 改为显式列出 session-controller events；Go forwarded allowlist 集合已通过定向合同测试。
+- `packages/api/gateway` 的 `/api/remote.mux` 与 `$events` 已补入 Go：四类逻辑 stream 共用 WebSocket carrier；Remote waterfall 对 active Clients 使用同一 `eventId` fan-out，首个 result/rejected 胜出并只取消仍持有 delivery 的其他 Client，`next` 仅移除当前 delivery，全部 active delivery 均返回 `next` 后才回落，重复或已结算结果为幂等 no-op。Remote Stream 组在 runtime-assets wrapper 下普通测试及 `-race -count=20` 均通过。
+- `host/session-added` 的 Remote 摘要改为按 ID 构造单条 `SessionSummary`，不再为每个新 session 扫描并投影全表；3000 层 lineage 定向 race 从此前约 7 分 52 秒超时路径降至 2.301 秒并通过，完整 `internal/harness` race 用时 239.427 秒并通过。
+- `#3238` DeepSeek web search 在请求实际派发后的 transport、HTTP、decode 和空结果错误中附带实际 endpoint，并给出独立 search 配置恢复路径；credential/config 等派发前错误不伪造 endpoint guidance。
+- `packages/session/session-turn-outline` 的 Go projection/registry 改动来自共享工作区并行实现，已通过 projection 定向测试、完整 race 和 clean-archive；这证明当前 Go 调用链与回归边界，不宣称完整 npm/Cordis runtime 字节级等价。
+
+历史验收记录：新增补项前，完整 `make race`、`make smoke-standalone` 和 `make smoke-clean-archive` 曾通过。一次 standalone 初始失败仅因传入的外部 `GOTMPDIR` 目录不存在，创建目录后重跑通过，非代码失败；当前最终声明以本轮重新执行的门禁为准。
+
+保留边界：上游已删除 `session-persistence-sqlite`，Go 同步删除其实现、公开 facade 和专属测试；`storage-sqlite`、`session-query-sqlite` 与其 `modernc.org/sqlite` 依赖属于不同能力，继续保留。Go Remote mux server 的 Ping/Pong grace 和 socket-close stream cancellation 已覆盖；Client generation 自动重连、stalled-host UI 状态、长生命周期后台唤醒和前端-only `ui-schedule` 交互仍待后续专项验证。完整 npm/Cordis registry、真实外部 provider/credential、平台 ripgrep 随包交付，以及上述未覆盖的专项行为仍不作为本轮已证实结果。
+
+2026-09-01 门禁复核：`GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha3-final2 make verify-upstream`、`make test`、`make vet`、`make race`、`make smoke-standalone` 和 `make smoke-clean-archive` 均通过；catalog、inventory、public facade 与 `git diff --check` 也通过。第一次完整 `make race` 仅出现一次 `TestACPImagesUseExactDefaultAndLatestSessionRoutes` 的 2 秒等待超时，定向 `-race` 连跑 20 次及随后完整 `make race` 均通过，未观察到稳定复现。复核后本地 dirty 文件集合未增加，上游 checkout 仍为 `dd6322d604e00eec1ba5e0c8541159906a21094a` 且工作树干净。
+
+### 2026-09-01 first-parent 完成性审计
+
+审计范围：alpha.1 `cd5ef8148158c3a752a658978873241fdf8e2bbc` 到 alpha.3 `dd6322d604e00eec1ba5e0c8541159906a21094a` 共 351 个 commit、2200 个 changed file；文件数仅用于定位，完成判断按 first-parent 合入项的上游入口、Go 生产入口、状态/错误/持久化语义和行为测试逐项给证据。
+
+PR 矩阵：
+
+- `#2742/#2774/#3065` projection migration、mandatory seam、Schedule web projection：通用 registry 连续序列、view identity 和 turn outline 已覆盖；`ScheduleEnabled` 时注册 `schedule` key/state version 1，wire 返回 active records，reload reconcile 与 checkpoint replay 已有定向测试。
+- `#3238` web search endpoint guidance：Go 仅在请求已派发后附带实际 DeepSeek search endpoint、UI 配置路径、环境变量和 profile key；派发前 credential/config 错误保持原分类，定向 provider error 测试已覆盖。
+- `#3279` Windows absent probe：上游优化的是 TypeScript JSONL `exists()` 在 POSIX ENOENT 后不再额外 stat parent；Go `JSONLSessionStore` 没有该逐候选 probe，按 `filepath.WalkDir` 枚举并直接打开 header，因此不存在对应重复 stat 路径，无需补代码。
+- `#3292` linear stream queues：上游把六处 JavaScript `Array.shift()` 队列换为 circular Deque；Go Remote/session/workspace stream 通过 channel 直接收发，出队为 O(1)，没有 array head move 路径，无需引入第二套 deque。
+- `#3293` Gateway Remote 与 RemoteError：所有 wire error 先经 `canonicalRPCErrorCode` 归一为 namespaced code，`details` 保持 object；`/api/remote.mux`、四类逻辑 stream、Remote Event fan-out/settlement/cancellation/replay 与多 Client delivery ownership 已落到 Go。内部兼容调用点仍可使用旧短 code，但不会泄漏到 wire。
+- `#3305/#3384` connection recovery/stalled hosts：Go server 已覆盖 heartbeat 两次宽限、Pong reset、失联终止和 socket close 取消全部逻辑 stream；Client generation 自动重开及 stalled-host UI 状态仍作为明确边界。
+- `#3316` preset composition/plugin inventory：`pluginInventory.list()` 同时返回 Host Loader entries 和每个 agent preset 的 composition rows；attached preset 使用最新 live generation，cold preset 解析当前文件，broken reason 保留。Remote authoring 按首个 user root 复制完整目录（含 skills/assets）、解引用 symlink、重写 metadata、收紧权限，并固定 not-found/invalid/read-only details。
+- `#3325` ignorable external events：unknown event 仅在 `ignorable=true` 时接受，已覆盖。
+- `#3208/#3277` steer/follow-up images、extension-less `read_image`：durable image admission、queued steer 内容保留、无扩展名格式检测和 byte-cap-before-sniff 已覆盖；continuable/materialized subagent image capability disposal race 在 `-race -count=20` 下通过。
+- `#3128` remove agent-spine：profile/inventory 已移除对应 root 与 rows，已覆盖。
+- `#3339` JSONL-only session persistence：已删除 `session_persistence_sqlite*`、`SQLiteSessionStore` 公开 facade 和专属测试；默认/恢复路径只使用 JSONL。独立的 `storage-sqlite`、`session-query-sqlite` 及 `modernc.org/sqlite` 保留。
+- `#3328` turn outline：projection、registry、wire view 和定向测试已覆盖。
+- `#3319` runtime dependency ownership：上游行为目标是减少 npm peer relay，同时保留 Cordis/constructor/module-state identity；Go 为静态单体注册，没有 npm 安装布局、重复包实例或 peer relay。现有结构化 error/code、注册 token 和 engine-owned registry 已承担相应运行时身份边界，因此该项记录为无对应生产改动，不按 import/package.json 移动伪造 Go 机制。
+
+完成性审计执行计划：
+
+1. [已完成] Schedule projection：复用 `foldScheduleEvents`，按 `Config.ScheduleEnabled` 注册 key `schedule`、stateVersion 1；active records、checkpoint replay 和 reload reconcile 均有定向测试。
+2. [已完成] RemoteError：wire 统一输出 namespaced `{code,message,details}`；preset、workspace、directory、subagent 和 gateway 生产路径已覆盖稳定 details，旧短 code 仅作为内部兼容输入。
+3. [已完成] preset composition/authoring：inventory 覆盖 live generation 与 cold file；copy/delete/read/list/select Remote endpoints、完整目录复制、可写根、权限和错误 shape 已对齐。
+4. [已完成] JSONL-only：删除旧 session persistence SQLite surface，保留独立 storage/query SQLite 能力，并验证 JSONL 默认、恢复和查询路径。
+5. [已完成] Gateway Remote Stream/Event：HTTP upgrade、四类 logical stream、heartbeat、关闭取消、同一 event fan-out、first-result cancellation、all-next 与重复 result no-op 已由定向普通及 race 测试覆盖。
+6. [已完成] first-parent 性能/包装补项：`#3279` 无对应 Go probe，`#3292` 已由 channel O(1) 出队覆盖，`#3319` 属 npm package ownership 且 Go 无 peer relay；均记录证据而不添加无效抽象。
+7. [边界保留] Client generation 自动 recovery/stalled-host、完整 npm/Cordis runtime、前端-only `ui-schedule` 和真实外部 provider/credential 未由本轮 Go 测试证明，不纳入完成声明。
+8. [已完成] 最终门禁：已重跑 `make verify-upstream test vet race smoke-standalone smoke-clean-archive`、生成物检查和 `git diff --check`，并确认 upstream 干净、现有 dirty 集合未被误覆盖。
+
+2026-09-02 本轮收口状态：使用仓外 `TMPDIR=/home/xxnuo/.cache/dsh-go-alpha3-tmp` 与 `GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha3-final2` 执行 `make verify-upstream test vet race smoke-standalone smoke-clean-archive`，退出码为 0；普通测试 `internal/harness` 用时 50.538 秒，完整 race 用时 239.427 秒，clean archive 中 `internal/harness` 用时 47.308 秒。catalog、inventory、public facade、standalone embedded runtime、archive build/test 和 `git diff --check` 均通过；上游仍固定在 `dd6322d604e00eec1ba5e0c8541159906a21094a` / `dsh-v0.1.2-alpha.3` 且工作树干净，本地 dirty 路径集合未增加，无残留测试进程。alpha.3 本轮收口完成。
+
+## dsh-v0.1.2-alpha.4 同步（2026-09-02）
+
+基线：嵌套且唯一可信的 `./deepseek-harness` 已位于 `4e84901e6471b79ec0338099867ebb4606d12bb5` / `dsh-v0.1.2-alpha.4`，工作树干净；Go 主仓库保留 alpha.3 的既有未提交移植结果，不回退或覆盖。alpha.3 到 alpha.4 的 first-parent 范围包含 12 个合入项、2371 个 changed file；文件数只用于定位，完成判断继续依据上游入口、Go 生产调用链、状态/错误/持久化/事件语义和行为测试。
+
+执行计划：
+
+1. [已完成] 固定基线并建立 first-parent 审计范围：确认 alpha.3 `dd6322d604e00eec1ba5e0c8541159906a21094a`、alpha.4 `4e84901e6471b79ec0338099867ebb4606d12bb5`、嵌套上游 clean，并记录现有 Go dirty 集合。
+2. [已完成] 逐项审计 `#2907` session log read API、`#1148` experimental Python code runtime、`#3367` invariant ownership cleanup、`#3250` steer service、`#3403` model-discovery profile headers、`#3382` default web-fetch、`#3411` smooth corners、`#3346` event-seq/log-offset brands、`#3415` turn preview、`#3418` PTC 文档、`#3391` conversation performance、`#3425` PTC workflow omission；完成性矩阵见下文。
+3. [已完成] 更新 `upstream.lock`、266-root 上游 inventory、runtime/client assets、动态 catalog、public facade 和版本/合同断言；生成物均来自固定 alpha.4 上游。inventory 分类为 `frontend=42`、`hybrid=9`、`ported=176`、`replaced=26`、`support=13`。
+4. [已完成] 实现 Session 显式 log read/seq-offset 边界、相邻 Agent 双向 steer 消息、model discovery profile headers/credential、默认 web-fetch 和 PTC preset roster，并加入行为测试；上游删除的 `tool-subagent-report`、report prompt/config 与仅为它服务的 activation setup registry 已从生产和 public facade 删除。
+5. [已完成] 先以显式退出码捕获完整门禁失败，修复 19 个普通测试暴露的 alpha.4 迁移遗漏并对同一失败集执行普通及 `-race` 回归；随后重跑 `make verify-upstream test vet race smoke-standalone smoke-clean-archive`，最终退出码为 0。
+6. [已完成] 已回填 first-parent 完成性矩阵、失败修复链、保留边界、最终命令与耗时，并完成 `git diff --check`、上游 clean/pin、生成物和残留进程终态检查。
+
+first-parent 完成性矩阵：
+
+1. `#2907` session log read API：Go `Session` 增加 `Seq()`、常量时间 `EventAt(SessionSeq)`、显式 `[from,to)` 的 `SnapshotEvents(SessionLogOffset...)`；快照会分离事件 data/surface/source slice，负数、倒序和越界位置被拒绝。`SessionStore.ReadFrom` 改用 `SessionLogOffset`。
+2. `#1148` experimental Python code runtime：上游 Python 资产移动至 `packages/experimental/code-runtime-python/py`，Go 的 runtime asset 同步脚本与测试同步改路；Go 已有 Python runtime 生产实现，本轮不把未挂载的上游 experimental composition 声称为默认启用。
+3. `#3367` invariant ownership cleanup：删除的是上游 package-owned invariant 源与陈旧 package surface；Go 保留集中式运行时 invariant 实现，只更新 inventory/catalog，不做行为删除。
+4. `#3250` steer service：`send_message` schema 改为 `agent_id`，支持 parent→direct continuable child 与 resident child→direct live parent；消息使用 `agent-message/relay/senderSessionId` 与固定前缀，running/idle 均走 next-step steer，self、sibling、非 resident、stale/one-shot 路由拒绝；child message 与 settlement 共用 FIFO next-step 队列。
+5. `#3403` model discovery headers：草稿 discovery 继承已配置 profile headers；草稿 key 缺失时惰性解析已存 credential，草稿 key 覆盖 profile Authorization；profile header 名和值在配置边界验证。
+6. `#3382` SDK/base default web fetch：`DefaultConfig` 默认 `WebFetchProvider=http` 且 `FetchEnabled=true`，embedded base/standard/cordis/PTC profile 均验证 `web_fetch` 可见。
+7. `#3411` smooth corners：仅 CSS/client 资产，随官方 frontend assets 更新；无 Go 后端生产语义。
+8. `#3346` event seq/log offset brands：新增不同 Go named types `SessionSeq`/`SessionLogOffset`，`Event.Seq` 使用事件身份类型；逻辑 header 使用 `isSeeded`，Session/inspection 单独携带精确 `InheritedEventCount`。v0 JSONL 仍用可选 `seedLength`：字段缺失表示 unseeded，显式 `0` 表示 seeded-empty。
+9. `#3415` turn rail preview：仅 client UI/CSS/tests，随官方 frontend assets 更新；既有 Go turn-outline projection 不额外声称 preview UI 行为。
+10. `#3418` PTC Cloudflare 文档：docs-only，无 Go 生产改动。
+11. `#3391` conversation performance：client list/render/search 性能改动，随官方 frontend assets 更新；Go 继续使用既有 session summary/search 生产路径，不按前端实现细节重写。
+12. `#3425` PTC disable workflow：PTC runtime 隐藏 `workflow`，保留 workflow worker thread 供 `ralph` 使用；standard/cordis 继续暴露 workflow，定向 profile 测试覆盖三种 preset。
+
+逐步失败与修复记录：
+
+1. 第一次 `make sync-runtime-assets` 失败于旧路径 `packages/code-runtime/code-runtime-python/py` 不存在；确认 upstream move 后改为 `packages/experimental/code-runtime-python/py`，同步与检查通过。
+2. 第一次 `make verify-upstream` 在 `TestUpstreamContractDefaultProfiles` 失败，指出 Go 合同仍包含上游已删除的 `tool-subagent-report`；完整删除 report 配置/工具/prompt/public API 与 activation setup 后门禁通过。
+3. Session named seq 类型首次编译暴露所有 int/seq 混用位置；逐处在日志身份与数组位置边界显式转换，`go test ./internal/harness ./cmd/dsh -run '^$'`、Session JSONL/上游 packed fixture 测试及完整普通测试均通过。
+4. 2026-09-02 已通过：`make verify-upstream`；`make test vet`（`internal/harness` 及全仓普通测试通过）；alpha.4 语义定向 `-race`（`internal/harness` 4.827 秒，`cmd/dsh` 1.101 秒）。
+5. 第一次用独立退出码文件执行完整组合门禁（`/home/xxnuo/.cache/dsh-alpha4-final.KRT422`）以退出码 2 结束，普通测试共暴露 19 个失败：旧 `subagent_id` 断言、Python `LogMessage` mirror 缺 `open/truncated`、动态 Session/Agent 仍使用 `seedLength` 且未接收 `inheritedEventCount`、named seq 在 projection/search/outline 的 `any`/数组边界未转为位置整数，以及 PTC 仍期待 `workflow`。逐项修复后，同一失败集合普通测试和完整 `-race` 定向测试均通过。
+6. 最终门禁使用仓外 `TMPDIR=/home/xxnuo/.cache/dsh-go-alpha4-tmp`、`GOTMPDIR=/home/xxnuo/.cache/dsh-go-alpha4-gotmp`，在 `/home/xxnuo/.cache/dsh-alpha4-final2.pdkM92` 捕获命令、日志和退出码；`make verify-upstream test vet race smoke-standalone smoke-clean-archive` 退出码为 0。普通测试 `internal/harness` 用时 51.672 秒；race 的根包、`cmd/dsh`、`internal/harness` 分别用时 39.044、16.040、254.477 秒；standalone smoke 用时 3.725 秒；clean archive 的根包、`cmd/dsh`、`internal/harness` 分别用时 2.274、13.101、47.444 秒，随后 archive build 通过。
+
+保留边界：experimental Python composition 只同步其运行时资产，不声称已成为 Go 默认 preset；`#3411` smooth corners 与 `#3415` turn rail preview 只由固定上游的官方 frontend 资产覆盖，本轮未另做浏览器像素级验收；`#3418` 为文档专属变更。最终 `git diff --check` 和生成物检查通过，嵌套上游仍干净并固定在 `4e84901e6471b79ec0338099867ebb4606d12bb5` / `dsh-v0.1.2-alpha.4`，inventory 为 266 个分类 root，未发现 report 旧生产符号、alpha.3 旧锁定值或残留门禁进程。alpha.4 本轮收口完成。

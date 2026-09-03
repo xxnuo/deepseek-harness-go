@@ -19,15 +19,13 @@ import (
 func dynamicSessionHeaderValue(header SessionHeader) map[string]any {
 	value := map[string]any{
 		"version": header.Version, "id": header.ID, "createdAt": header.CreatedAt,
+		"isSeeded": header.IsSeeded,
 	}
 	if header.CWD != "" {
 		value["cwd"] = header.CWD
 	}
 	if header.ParentSession != "" {
 		value["parentSession"] = header.ParentSession
-	}
-	if header.SeedLength != 0 || header.ParentSession != "" {
-		value["seedLength"] = header.SeedLength
 	}
 	if header.Origin != "" {
 		value["origin"] = header.Origin
@@ -45,7 +43,7 @@ func dynamicSessionHeaderValue(header SessionHeader) map[string]any {
 }
 
 func dynamicSessionEventValue(event Event) map[string]any {
-	value := map[string]any{"type": event.Type, "seq": event.Seq, "time": event.Time, "data": cloneJSON(event.Data)}
+	value := map[string]any{"type": event.Type, "seq": int(event.Seq), "time": event.Time, "data": cloneJSON(event.Data)}
 	if event.SourceEventSeqs != nil {
 		value["sourceEventSeqs"] = append([]int(nil), event.SourceEventSeqs...)
 	}
@@ -67,6 +65,7 @@ func dynamicCordisSessionValue(vm *goja.Runtime, session *Session) *goja.Object 
 		return dynamicSessionHeaderValue(session.Header)
 	}), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = value.DefineAccessorProperty("firstLiveSeq", vm.ToValue(func() int { session.mu.Lock(); defer session.mu.Unlock(); return session.firstLiveSeq }), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
+	_ = value.DefineAccessorProperty("inheritedEventCount", vm.ToValue(func() int { session.mu.Lock(); defer session.mu.Unlock(); return int(session.InheritedEventCount) }), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = value.DefineAccessorProperty("seq", vm.ToValue(func() int { session.mu.Lock(); defer session.mu.Unlock(); return len(session.Events) }), nil, goja.FLAG_FALSE, goja.FLAG_TRUE)
 	_ = value.DefineAccessorProperty("events", vm.ToValue(func() any {
 		session.mu.Lock()
@@ -166,7 +165,7 @@ func validateDynamicSessionEvent(typ string, seq int, surface any, sources []int
 		return fmt.Errorf("event %q cannot carry surface metadata", typ)
 	}
 	if sources != nil {
-		if err := validateSourceEventSeqs(Event{Type: typ, Seq: seq, SourceEventSeqs: sources}); err != nil {
+		if err := validateSourceEventSeqs(Event{Type: typ, Seq: SessionSeq(seq), SourceEventSeqs: sources}); err != nil {
 			return err
 		}
 	}
@@ -199,9 +198,10 @@ func (e *Engine) discardDynamicCordisPreparedSession(run *dynamicCordisRun, id s
 
 func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, options goja.Value) (*dynamicCordisPreparedSession, error) {
 	var input struct {
-		Meta       *SessionHeader `json:"meta"`
-		Seed       []any          `json:"seed"`
-		SeedSource string         `json:"seedSource"`
+		Meta                *SessionHeader    `json:"meta"`
+		InheritedEventCount *SessionLogOffset `json:"inheritedEventCount"`
+		Seed                []any             `json:"seed"`
+		SeedSource          string            `json:"seedSource"`
 	}
 	seedProvided, createdAtProvided, cwdProvided := false, false, false
 	if options != nil && !goja.IsUndefined(options) && !goja.IsNull(options) {
@@ -220,7 +220,7 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 			if !ok {
 				return nil, errors.New("sessions.prepare options: meta must be an object")
 			}
-			for _, key := range []string{"cwd", "parentSession", "createdAt", "seedLength", "origin", "delegationDepth", "agentPreset"} {
+			for _, key := range []string{"cwd", "parentSession", "createdAt", "isSeeded", "origin", "delegationDepth", "agentPreset"} {
 				if field := metaObject.Get(key); field != nil && !goja.IsUndefined(field) && goja.IsNull(field) {
 					return nil, fmt.Errorf("sessions.prepare options: meta.%s is invalid", key)
 				}
@@ -278,6 +278,23 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	if !createdAtProvided {
 		meta.CreatedAt = time.Now().UnixMilli()
 	}
+	inheritedEventCount := SessionLogOffset(0)
+	if input.InheritedEventCount != nil {
+		inheritedEventCount = *input.InheritedEventCount
+	}
+	if err := validateSessionLogOffset(inheritedEventCount); err != nil {
+		return nil, err
+	}
+	if meta.IsSeeded && !seedProvided {
+		return nil, errors.New("seeded session requires an explicit seed")
+	}
+	if meta.IsSeeded && input.InheritedEventCount == nil {
+		return nil, errors.New("seeded session requires an inherited event count")
+	}
+	if !meta.IsSeeded && inheritedEventCount != 0 {
+		return nil, errors.New("unseeded session inherited event count must be 0")
+	}
+	meta.SeedLength = int(inheritedEventCount)
 	if err := validateSessionHeader(meta); err != nil {
 		return nil, err
 	}
@@ -290,9 +307,9 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 		}
 	}
 	session := &Session{
-		Header: meta,
-		Model:  ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model},
-		store:  nil, invariants: e.invariants,
+		Header: meta, InheritedEventCount: inheritedEventCount,
+		Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model},
+		store: nil, invariants: e.invariants,
 		// A dynamically prepared session becomes eligible only when it is a
 		// fresh root publication. Seeded and persistence-backed sessions must
 		// never resample host settings.
@@ -313,6 +330,10 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 			session.mu.Unlock()
 			return nil, err
 		}
+	}
+	if int(inheritedEventCount) > len(session.Events) {
+		session.mu.Unlock()
+		return nil, errors.New("session inherited event count exceeds its event log")
 	}
 	session.firstLiveSeq = len(session.Events)
 	if seedProvided && (len(session.Events) == 0 || session.Events[len(session.Events)-1].Type != "session/end-seed") {
@@ -356,6 +377,7 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 	session := prepared.session
 	session.mu.Lock()
 	header := session.Header
+	inheritedEventCount := session.InheritedEventCount
 	events := append([]Event(nil), session.Events...)
 	firstLiveSeq := session.firstLiveSeq
 	priorStore := session.store
@@ -384,7 +406,7 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 				}
 			}
 		} else {
-			if err := store.Create(context.Background(), header); err != nil {
+			if err := store.Create(context.Background(), header, inheritedEventCount); err != nil {
 				return err
 			}
 			if len(events) > 0 {
@@ -502,7 +524,7 @@ func (e *Engine) dynamicCordisForkSession(run *dynamicCordisRun, sourceID string
 			return nil, fmt.Errorf("fork boundary %d does not exist in session %q", *boundary, sourceID)
 		}
 		for index, event := range events {
-			if event.Seq != index {
+			if int(event.Seq) != index {
 				return nil, fmt.Errorf("fork boundary %d does not match a contiguous event seq in session %q", *boundary, sourceID)
 			}
 		}
@@ -534,10 +556,10 @@ func (e *Engine) dynamicCordisForkSession(run *dynamicCordisRun, sourceID string
 		seedRows[index] = dynamicSessionEventValue(event)
 	}
 	metaMap := map[string]any{
-		"cwd": meta.CWD, "parentSession": sourceID, "seedLength": len(events),
+		"cwd": meta.CWD, "parentSession": sourceID, "isSeeded": true,
 	}
 	prepared, err := e.dynamicCordisPrepareSession(run, childID, run.runtime.ToValue(map[string]any{
-		"meta": metaMap, "seed": seedRows,
+		"meta": metaMap, "seed": seedRows, "inheritedEventCount": len(events),
 	}))
 	if err != nil {
 		return nil, err

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -153,6 +154,102 @@ func TestScheduleRulesReplayAndTimeZones(t *testing.T) {
 	}
 	if inherited, err := foldScheduleEvents(events, len(events)); err != nil || len(inherited.active) != 0 {
 		t.Fatalf("fork suffix = %#v, %v", inherited, err)
+	}
+}
+
+func TestScheduleProjectionMatchesReplayAndHonorsSeedBoundary(t *testing.T) {
+	definition := scheduleProjectionDefinition()
+	parent, err := scheduleAfterRecord("schedule-parent", "parent", 30, time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := scheduleAfterRecord("schedule-projection", "remind", 30, time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []Event{
+		{Type: "schedule/change", Seq: 0, Data: map[string]any{"version": 1, "operation": "create", "schedule": parent.value()}},
+		{Type: "schedule/change", Seq: 1, Data: map[string]any{"version": 1, "operation": "create", "schedule": record.value()}},
+		{Type: "schedule/change", Seq: 2, Data: map[string]any{"version": 1, "operation": "delete", "id": record.ID}},
+		{Type: "turn/start", Seq: 3},
+	}
+	header := SessionHeader{ID: "schedule-projection", SeedLength: 1}
+	state := definition.InitWithHeader(header).(scheduleProjectionState)
+	for _, event := range events {
+		state = definition.Apply(state, event).State.(scheduleProjectionState)
+	}
+	folded, err := foldScheduleEvents(events, header.SeedLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Active) != len(folded.active) || len(state.SeenIDs) != len(folded.seenOrder) {
+		t.Fatalf("projection state = %#v, replay = %#v", state, folded)
+	}
+	if got := definition.View(state); len(got.([]map[string]any)) != 0 {
+		t.Fatalf("projection view = %#v, want empty child suffix", got)
+	}
+	before := state
+	if got := definition.Apply(state, events[3]); !reflect.DeepEqual(got.State, before) {
+		t.Fatal("unrelated event changed schedule projection state")
+	}
+}
+
+func TestScheduleProjectionIsConditionallyRegisteredOnRuntimeConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace = t.TempDir(), t.TempDir()
+	cfg.Persist = true
+	cfg.Provider, cfg.Model = "echo", "echo"
+	cfg.ScheduleEnabled = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	id, err := e.CreateSession(context.Background(), cfg.Workspace, "schedule-projection-toggle", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := e.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := e.SessionProjectionSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := snapshot.Values["schedule"]; found {
+		t.Fatal("disabled Schedule projection was published")
+	}
+	next := e.Config()
+	next.ScheduleEnabled = true
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.appendEvent(session, "schedule/change", map[string]any{
+		"version": 1, "operation": "create", "schedule": map[string]any{
+			"id": "schedule-toggle", "kind": "after", "prompt": "toggle",
+			"afterSeconds": 30, "scheduledAt": "2026-08-05T12:00:30.000Z",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = e.SessionProjectionSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values, ok := snapshot.Values["schedule"].([]map[string]any); !ok || len(values) != 1 || values[0]["id"] != "schedule-toggle" {
+		t.Fatalf("enabled Schedule projection = %#v", snapshot.Values["schedule"])
+	}
+	next.ScheduleEnabled = false
+	if err := e.ApplyRuntimeConfig(next); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = e.SessionProjectionSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := snapshot.Values["schedule"]; found {
+		t.Fatal("disabled Schedule projection survived runtime config update")
 	}
 }
 

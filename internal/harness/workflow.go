@@ -1268,7 +1268,6 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 	}
 	session.mu.Lock()
 	sessionID, restriction := session.Header.ID, session.toolRestriction
-	reportVisible := session.Header.Origin == "subagent" && session.Header.Mode == "continuable" && session.attached
 	session.mu.Unlock()
 	e.mu.RLock()
 	tools := make(map[string]Tool, len(e.tools)+len(e.scopedTools[sessionID]))
@@ -1278,9 +1277,6 @@ func (e *Engine) codeToolsForSession(session *Session) (map[string]Tool, error) 
 		}
 		owner := e.toolOwners[name]
 		if owner != "" && owner != sessionID {
-			continue
-		}
-		if name == "report" && (!reportVisible || owner != "") {
 			continue
 		}
 		if owner == "" && !restriction.allows(name) {

@@ -302,7 +302,7 @@ func FoldSessionTitle(events []Event) (SessionTitleSnapshot, bool) {
 		}
 		return SessionTitleSnapshot{
 			Title: data.Title, MessageSeqs: append([]int(nil), data.MessageSeqs...), Source: cloneSessionTitleSource(data.Source),
-			EventSeq: event.Seq, UpdatedAt: event.Time,
+			EventSeq: int(event.Seq), UpdatedAt: event.Time,
 		}, true
 	}
 	return SessionTitleSnapshot{}, false
@@ -320,7 +320,7 @@ func cloneSessionTitleSource(source SessionTitleSource) SessionTitleSource {
 func collectSessionTitleMessages(events []Event, throughSeq *int) []SessionTitleUserMessage {
 	messages := make([]SessionTitleUserMessage, 0)
 	for _, event := range events {
-		if throughSeq != nil && event.Seq > *throughSeq {
+		if throughSeq != nil && int(event.Seq) > *throughSeq {
 			break
 		}
 		if event.Type != "user/message" {
@@ -359,7 +359,7 @@ func collectSessionTitleMessages(events []Event, throughSeq *int) []SessionTitle
 		if NormalizeSessionTitle(text, int(^uint(0)>>1)) == "" {
 			continue
 		}
-		messages = append(messages, SessionTitleUserMessage{Seq: event.Seq, Text: text})
+		messages = append(messages, SessionTitleUserMessage{Seq: int(event.Seq), Text: text})
 	}
 	return messages
 }
@@ -550,7 +550,8 @@ func (e *Engine) observeSessionTitleUserMessage(session *Session, event Event) {
 	if hasCurrent && current.Source.Kind == "user" {
 		return
 	}
-	messages := collectSessionTitleMessages(events, &event.Seq)
+	throughSeq := int(event.Seq)
+	messages := collectSessionTitleMessages(events, &throughSeq)
 
 	e.titleMu.Lock()
 	registration := e.titleProvider
@@ -560,7 +561,7 @@ func (e *Engine) observeSessionTitleUserMessage(session *Session, event Event) {
 		if shouldSchedule {
 			state := e.sessionTitleStateLocked(session.Header.ID)
 			revision := e.supersedeSessionTitleStateLocked(state)
-			state.pending = &sessionTitlePendingWork{registration: registration, revision: revision, throughSeq: event.Seq}
+			state.pending = &sessionTitlePendingWork{registration: registration, revision: revision, throughSeq: int(event.Seq)}
 		}
 	}
 	e.titleMu.Unlock()
@@ -713,7 +714,7 @@ func (e *Engine) ensureSessionTitleFallback(session *Session) (SessionTitleSnaps
 		return SessionTitleSnapshot{}, false, err
 	}
 	e.publishEvent(id, event)
-	return SessionTitleSnapshot{Title: title, MessageSeqs: []int{first.Seq}, Source: SessionTitleSource{Kind: "fallback"}, EventSeq: event.Seq, UpdatedAt: event.Time}, true, nil
+	return SessionTitleSnapshot{Title: title, MessageSeqs: []int{int(first.Seq)}, Source: SessionTitleSource{Kind: "fallback"}, EventSeq: int(event.Seq), UpdatedAt: event.Time}, true, nil
 }
 
 func (e *Engine) appendSessionTitle(session *Session, title string, messageSeqs []int, source SessionTitleSource) (Event, error) {

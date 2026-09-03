@@ -23,7 +23,7 @@ func TestPTCCompatibilityColdLoadsHistoricalCodeWithoutRewritingJSONL(t *testing
 	if !ok {
 		t.Fatal("historical header session has no JSONL location")
 	}
-	header, err := marshalSessionHeader(headerMeta)
+	header, err := marshalSessionHeader(headerMeta, SessionLogOffset(headerMeta.SeedLength))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestPTCCompatibilityColdLoadsHistoricalCodeWithoutRewritingJSONL(t *testing
 		Version: SessionFormatVersion, ID: "historical-code-event", CreatedAt: 2,
 		CWD: root, AgentPreset: "standard",
 	}
-	if err := store.Create(context.Background(), eventMeta); err != nil {
+	if err := store.Create(context.Background(), eventMeta, SessionLogOffset(eventMeta.SeedLength)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Append(context.Background(), eventMeta.ID, []Event{{
