@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -59,7 +60,10 @@ func (e *Engine) registerModelSubagentActivation(child *Session, parentID string
 	if seedLength >= 0 && seedLength <= len(events) {
 		descriptor, descriptorErr = FoldSubagentDescriptor(events[seedLength:])
 	}
-	if descriptorErr != nil || descriptor == nil || descriptor.Mode != "continuable" {
+	if descriptorErr != nil {
+		return nil, fmt.Errorf("subagent activation requires a valid continuable descriptor: %w", descriptorErr)
+	}
+	if descriptor == nil || descriptor.Mode != "continuable" {
 		return nil, errors.New("subagent activation requires a valid continuable descriptor")
 	}
 	provider := descriptor.Provider
@@ -117,6 +121,10 @@ func (e *Engine) startContinuableModelSubagentWithID(ctx context.Context, parent
 	if err := e.requireContinuablePersistence(); err != nil {
 		return "", "", err
 	}
+	job := &queuedPrompt{
+		id: newID("msg"), text: strings.TrimSpace(blockText(content)),
+		content: cloneContentBlocks(content), source: map[string]any{"kind": "user"},
+	}
 	unlock := e.lockModelSubagent(childID)
 	release := func() {
 		if unlock != nil {
@@ -125,7 +133,18 @@ func (e *Engine) startContinuableModelSubagentWithID(ctx context.Context, parent
 		}
 	}
 
-	childID, err := e.createModelSubagentWithIDLocked(ctx, parentID, childID, label, fork, "continuable", config, nil)
+	childID, err := e.createModelSubagentWithIDLocked(ctx, parentID, childID, label, fork, "continuable", config, func(child *Session) error {
+		child.mu.Lock()
+		defer child.mu.Unlock()
+		if _, err := appendEventLocked(child, "agent/inbox/spliced", map[string]any{
+			"target": "next-turn", "start": len(child.pending), "inserted": []any{job.message()},
+		}, nil, nil, false); err != nil {
+			return err
+		}
+		child.pending = append(child.pending, job)
+		child.parked = false
+		return nil
+	})
 	if err != nil {
 		release()
 		return "", "", err
@@ -137,23 +156,11 @@ func (e *Engine) startContinuableModelSubagentWithID(ctx context.Context, parent
 		e.rollbackCreatedModelSubagent(childID, child)
 		return "", "", err
 	}
-	if err := ctx.Err(); err != nil {
-		release()
-		_ = e.disposeModelSubagentActivation(activation)
-		e.rollbackCreatedModelSubagent(childID, child)
-		return "", "", err
-	}
-	messageID, err := e.enqueueTeamPrompt(child, cloneContentBlocks(content), map[string]any{"kind": "user"}, "next-turn", true)
-	if err != nil {
-		release()
-		_ = e.disposeModelSubagentActivation(activation)
-		e.rollbackCreatedModelSubagent(childID, child)
-		return "", "", err
-	}
 	e.markModelSubagentAnnounced(activation)
 	e.watchModelSubagentActivation(activation)
+	e.startSessionWorker(child)
 	release()
-	return childID, messageID, nil
+	return childID, job.id, nil
 }
 
 func (e *Engine) removeModelSubagentActivation(activation *modelSubagentActivation) {
@@ -399,9 +406,7 @@ func (e *Engine) finishModelSubagentActivation(activation *modelSubagentActivati
 	if err := e.WaitForIdle(context.Background(), activation.childID); err != nil {
 		failures = append(failures, err)
 	}
-	if flusher, ok := e.sessionStore.(SessionPersistenceFlusher); ok {
-		_ = flusher.Flush(context.Background(), activation.childID)
-	}
+	_ = e.flushSessionPersistence(context.Background(), activation.childID)
 	reason, output := e.modelSubagentActivationTerminal(activation)
 	if err := detachSDKSession(e, activation.childID); err != nil {
 		failures = append(failures, err)
@@ -564,9 +569,7 @@ func (e *Engine) disposeOneShotModelSubagent(childID string) error {
 	if err := e.WaitForIdle(context.Background(), childID); err != nil {
 		return err
 	}
-	if flusher, ok := e.sessionStore.(SessionPersistenceFlusher); ok {
-		_ = flusher.Flush(context.Background(), childID)
-	}
+	_ = e.flushSessionPersistence(context.Background(), childID)
 	return detachSDKSession(e, childID)
 }
 

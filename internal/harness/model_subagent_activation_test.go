@@ -699,17 +699,30 @@ type admissionFailingStore struct {
 	SessionStore
 }
 
-func (s *admissionFailingStore) Append(ctx context.Context, id string, events []Event) error {
+type admissionFailingHandle struct{ SessionHandle }
+
+func (h *admissionFailingHandle) Append(ctx context.Context, events []Event) error {
 	for _, event := range events {
 		if event.Type == "agent/inbox/spliced" {
 			return errors.New("inbox admission failed")
 		}
 	}
-	return s.SessionStore.Append(ctx, id, events)
+	return h.SessionHandle.Append(ctx, events)
 }
 
-func (s *admissionFailingStore) Delete(ctx context.Context, id string) error {
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+func (s *admissionFailingStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &admissionFailingHandle{SessionHandle: handle}, nil
+}
+
+func (s *admissionFailingStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, meta, inheritedEventCount))
+}
+
+func (s *admissionFailingStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
 }
 
 func TestContinuableModelSubagentRollsBackFailedAdmission(t *testing.T) {
@@ -744,11 +757,13 @@ func TestContinuableModelSubagentRollsBackFailedAdmission(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("resident sessions after rollback = %d", count)
 	}
-	snapshots, err := store.ListSnapshots(t.Context())
+	snapshots, err := store.List(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots) != 0 {
-		t.Fatalf("persisted sessions after rollback = %#v", snapshots)
+	for _, snapshot := range snapshots {
+		if snapshot.Header.ParentSession == parent {
+			t.Fatalf("persisted child after rollback = %#v", snapshot)
+		}
 	}
 }

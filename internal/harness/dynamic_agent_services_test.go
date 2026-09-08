@@ -8,7 +8,15 @@ import (
 )
 
 func TestDynamicCordisAgentServicesCreateQueryResumeAndDispose(t *testing.T) {
-	e := newIntegrationEngine(t)
+	cfg := DefaultConfig()
+	cfg.DataDir, cfg.Workspace = t.TempDir(), t.TempDir()
+	cfg.Provider, cfg.Model, cfg.Persist = "echo", "echo", true
+	cfg.SessionTitleLLM.Enabled = false
+	e, err := New(WithConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
 	sessionID, err := e.CreateSession(context.Background(), e.Config().Workspace, "cordis-agent-services", "")
 	if err != nil {
 		t.Fatal(err)
@@ -22,6 +30,7 @@ return {
       const created = await ctx.agents.create({
         sessionId: 'cordis-owned-agent',
         meta: { origin: 'subagent', delegationDepth: 1 },
+        seed: [],
         agentOptions: { provider: 'echo', model: 'echo', maxTokens: 64 }
       })
       const listed = ctx.agents.list().map(agent => agent.id)
@@ -107,9 +116,16 @@ func TestDynamicCordisAgentResumeReservationSerializesAndReleases(t *testing.T) 
 		t.Fatal(err)
 	}
 	target.mu.Lock()
-	target.attached = false
+	detachSessionLocked(target)
+	handle := target.store
+	target.store = nil
 	target.mu.Unlock()
-	if _, err := store.Load(t.Context(), targetID); err != nil {
+	if handle != nil {
+		if err := handle.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := inspectStoredSession(t.Context(), store, targetID, true); err != nil {
 		t.Fatalf("persisted target: %v", err)
 	}
 

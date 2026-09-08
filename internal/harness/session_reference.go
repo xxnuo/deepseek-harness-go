@@ -538,7 +538,7 @@ func (e *Engine) sessionReferenceSnapshot(ctx context.Context, id string) (sessi
 	if store == nil {
 		return sessionQuerySessionSnapshot{}, fmt.Errorf("SESSION_QUERY_SESSION_NOT_FOUND: session %q not found", id)
 	}
-	listed, err := store.ListSnapshots(ctx)
+	listed, err := store.List(ctx)
 	if err != nil {
 		return sessionQuerySessionSnapshot{}, err
 	}
@@ -556,7 +556,7 @@ func (e *Engine) sessionReferenceSnapshot(ctx context.Context, id string) (sessi
 		}
 		return sessionQuerySessionSnapshot{}, fmt.Errorf("SESSION_QUERY_SESSION_NOT_FOUND: session %q not found", id)
 	}
-	inspection, err := store.Inspect(ctx, id)
+	inspection, err := inspectStoredSession(ctx, store, id, true)
 	if err != nil {
 		return sessionQuerySessionSnapshot{}, err
 	}
@@ -768,7 +768,7 @@ func parseSessionReferenceContent(content []ContentBlock) ([]ContentBlock, []Ses
 func (e *Engine) sessionReferenceRecords(ctx context.Context) ([]SessionHeader, error) {
 	persisted := map[string]SessionHeader{}
 	if e.sessionStore != nil {
-		snapshots, err := e.sessionStore.ListSnapshots(ctx)
+		snapshots, err := e.sessionStore.List(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -833,7 +833,7 @@ func (e *Engine) sessionReferenceTitles(ctx context.Context, ids []string) ([]st
 	if len(unresolved) == 0 || e.sessionStore == nil {
 		return titles, nil
 	}
-	listed, err := e.sessionStore.ListSnapshots(ctx)
+	listed, err := e.sessionStore.List(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -866,7 +866,7 @@ func (e *Engine) sessionReferenceTitles(ctx context.Context, ids []string) ([]st
 					}
 					continue
 				}
-				inspection, inspectErr := e.sessionStore.Inspect(ctx, job.id)
+				inspection, inspectErr := inspectStoredSession(ctx, e.sessionStore, job.id, true)
 				if inspectErr != nil {
 					results <- titleResult{index: job.index}
 					continue

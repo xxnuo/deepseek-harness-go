@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type goalCompletionProvider struct {
@@ -409,7 +410,7 @@ func TestGoalToolFailurePersistsStructuredCode(t *testing.T) {
 	t.Fatal("missing goal tool result")
 }
 
-func TestGoalAbortDisarmsAfterStalePauseCAS(t *testing.T) {
+func TestGoalAbortPreservesNewRevisionAfterStalePauseCAS(t *testing.T) {
 	e := newGoalEngine(t, false)
 	id, err := e.CreateSession(context.Background(), e.Config().Workspace, "goal-abort", "")
 	if err != nil {
@@ -436,9 +437,93 @@ func TestGoalAbortDisarmsAfterStalePauseCAS(t *testing.T) {
 	}}
 	e.finishGoalTurn(s, item, 1)
 	after, err := e.GetGoal(id)
-	if err != nil || after == nil || after.Revision != before.Revision+1 || after.Phase != "active" || after.Activation != "disarmed" {
+	if err != nil || after == nil || after.Revision != before.Revision+1 || after.Phase != "active" || after.Activation != "armed" {
 		t.Fatalf("goal after stale aborted pause = %#v, %v", after, err)
 	}
+}
+
+func TestHostGoalPauseAbortsTurnAndKeepsImmediateResumeArmed(t *testing.T) {
+	e := newGoalEngine(t, false)
+	provider := &promptGateProvider{gates: map[string]chan struct{}{}, started: make(chan string, 2)}
+	e.RegisterProvider(provider)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "goal-host-pause", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: provider.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "pause then resume", 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	provider.gates[renderGoalRoundPrompt(goalState{ID: goal.ID, Revision: goal.Revision, Objective: goal.Objective, Phase: goal.Phase, MaxRounds: goal.MaxGoalRounds}, 1)] = make(chan struct{})
+	e.startSessionWorker(mustSession(t, e, id))
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first goal round did not start")
+	}
+	if _, err := e.GoalMutation(id, "pause", "", goal.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	paused, _ := e.GetGoal(id)
+	if _, err := e.GoalMutation(id, "resume", "", paused.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resumed goal round did not start")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := e.WaitForIdle(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := e.GetGoal(id)
+	if after == nil || after.Phase != "blocked" || after.RoundsStarted != 2 || after.BlockedReason == nil || after.BlockedReason.Code != "round-limit" {
+		t.Fatalf("goal after immediate resume = %#v", after)
+	}
+}
+
+func TestModelGoalPauseFinishesOwnTurn(t *testing.T) {
+	provider := &toolLoopProvider{}
+	e := newToolLoopEngine(t, provider)
+	id, err := e.CreateSession(t.Context(), e.Config().Workspace, "goal-model-pause", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.GoalMutation(id, "create", "pause myself", 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	goal, _ := e.GetGoal(id)
+	provider.calls = []ToolCall{{
+		ID: "model-pause", Name: "update_goal",
+		Arguments: json.RawMessage(`{"goal_id":"` + goal.ID + `","revision":1,"action":"pause"}`),
+	}}
+	if _, err := e.Run(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "pause this goal"}}}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := e.GetGoal(id)
+	if after == nil || after.Phase != "paused" || after.RoundsStarted != 0 {
+		t.Fatalf("model-paused goal = %#v", after)
+	}
+	s := mustSession(t, e, id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := len(s.Events) - 1; index >= 0; index-- {
+		if s.Events[index].Type != "turn/end" {
+			continue
+		}
+		data, _ := s.Events[index].Data.(map[string]any)
+		reason, _ := data["reason"].(map[string]any)
+		if reason["kind"] != "completed" {
+			t.Fatalf("model pause turn end = %#v", reason)
+		}
+		return
+	}
+	t.Fatal("missing model pause turn end")
 }
 
 func TestGoalFoldRejectsNonCanonicalChanges(t *testing.T) {

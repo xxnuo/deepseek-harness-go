@@ -19,28 +19,35 @@ type subagentListingStoreStub struct {
 	inspectIDs  []string
 }
 
-func (s *subagentListingStoreStub) ListSnapshots(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
+func (s *subagentListingStoreStub) List(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
 	if s.list != nil {
 		return s.list(ctx)
 	}
 	return append([]SessionPersistenceSnapshot(nil), s.snapshots...), nil
 }
 
-func (s *subagentListingStoreStub) Inspect(ctx context.Context, id string) (SessionInspection, error) {
+func (s *subagentListingStoreStub) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	if access != SessionAccessRead {
+		return nil, errors.New("subagent listing stub only supports read handles")
+	}
 	s.mu.Lock()
 	s.inspectIDs = append(s.inspectIDs, id)
 	s.mu.Unlock()
 	if s.inspect != nil {
-		return s.inspect(ctx, id)
+		inspection, err := s.inspect(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		return &sessionQueryHandleStub{inspection: inspection}, nil
 	}
 	if err := s.inspectErrs[id]; err != nil {
-		return SessionInspection{}, err
+		return nil, err
 	}
 	inspection, ok := s.inspections[id]
 	if !ok {
-		return SessionInspection{}, errors.New("session-not-found: " + id)
+		return nil, errors.New("session-not-found: " + id)
 	}
-	return inspection, nil
+	return &sessionQueryHandleStub{inspection: inspection}, nil
 }
 
 func (s *subagentListingStoreStub) Close() error { return nil }
@@ -206,7 +213,7 @@ func TestListModelAgentsUsesOnlyOwnSuffixCachedIdentity(t *testing.T) {
 	}
 	header := SessionHeader{
 		Version: SessionFormatVersion, ID: "cached-child", CreatedAt: 1,
-		ParentSession: parent, SeedLength: 3, Origin: "subagent",
+		ParentSession: parent, IsSeeded: true, SeedLength: 3, Origin: "subagent",
 	}
 	store := &subagentListingStoreStub{
 		snapshots: []SessionPersistenceSnapshot{{Header: header}},
@@ -218,11 +225,16 @@ func TestListModelAgentsUsesOnlyOwnSuffixCachedIdentity(t *testing.T) {
 		},
 	}
 	e.sessionStore = store
-	composition := e.sessionProjections.Signature()
+	identity, err := projectionIdentity(header, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.projectionCache = &sessionProjectionCache{medium: &projectionCacheMedium{records: map[string]projectionCacheRecord{
 		"cached-child": {
-			Identity: projectionIdentity(header), Seq: 0, Version: projectionValuesVersion,
-			Composition: composition, Values: map[string]any{"subagent": map[string]any{"mode": "continuable", "label": "ancestor", "seq": 0}},
+			Identity: identity,
+			Rows: ProjectionCheckpoint{"subagent": {
+				Version: 2, Seq: 0, Value: map[string]any{"mode": "continuable", "label": "ancestor", "seq": 0},
+			}},
 		},
 	}}}
 	defer func() { e.projectionCache = nil }()
@@ -241,8 +253,10 @@ func TestListModelAgentsUsesOnlyOwnSuffixCachedIdentity(t *testing.T) {
 	}
 
 	e.projectionCache.medium.records["cached-child"] = projectionCacheRecord{
-		Identity: projectionIdentity(header), Seq: 3, Version: projectionValuesVersion,
-		Composition: composition, Values: map[string]any{"subagent": map[string]any{"mode": "continuable", "label": "cached own", "seq": 3}},
+		Identity: identity,
+		Rows: ProjectionCheckpoint{"subagent": {
+			Version: 2, Seq: 3, Value: map[string]any{"mode": "continuable", "label": "cached own", "seq": 3},
+		}},
 	}
 	store.inspect = func(context.Context, string) (SessionInspection, error) {
 		return SessionInspection{}, errors.New("must not inspect own-suffix cache")

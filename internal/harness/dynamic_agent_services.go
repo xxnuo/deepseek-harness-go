@@ -1224,39 +1224,38 @@ func (e *Engine) dynamicCordisPrepareAgentSession(run *dynamicCordisRun, input d
 	vm := run.runtime
 	options := vm.NewObject()
 	var releaseReservation func()
+	var persistenceHandle SessionHandle
+	storedEventCount := 0
 	if resume {
 		var claimed bool
 		releaseReservation, claimed = e.claimDynamicAgentReservation(input.id)
 		if !claimed {
 			return nil, fmt.Errorf("agent %q is already live or being resumed", input.id)
 		}
-		var inspection SessionInspection
-		existing, err := e.getSession(input.id)
-		if err == nil {
+		if existing, err := e.getSession(input.id); err == nil {
 			existing.mu.Lock()
-			if existing.attached {
-				existing.mu.Unlock()
+			attached := existing.attached
+			existing.mu.Unlock()
+			if attached {
 				releaseReservation()
 				return nil, fmt.Errorf("agent %q is already live", input.id)
 			}
-			inspection.Meta = existing.Header
-			inspection.InheritedEventCount = existing.InheritedEventCount
-			inspection.Events = append([]Event(nil), existing.Events...)
-			existing.mu.Unlock()
-		} else {
-			e.mu.RLock()
-			store := e.sessionStore
-			e.mu.RUnlock()
-			if store == nil {
-				releaseReservation()
-				return nil, errors.New("cannot resume: session persistence is not configured")
-			}
-			inspection, err = store.Load(context.Background(), input.id)
-			if err != nil {
-				releaseReservation()
-				return nil, err
-			}
 		}
+		e.mu.RLock()
+		store := e.sessionStore
+		e.mu.RUnlock()
+		if store == nil {
+			releaseReservation()
+			return nil, errors.New("cannot resume: session persistence is not configured")
+		}
+		var inspection SessionInspection
+		var err error
+		persistenceHandle, inspection, err = openStoredSessionForWrite(context.Background(), store, input.id)
+		if err != nil {
+			releaseReservation()
+			return nil, err
+		}
+		storedEventCount = len(inspection.Events)
 		_ = options.Set("meta", inspection.Meta)
 		_ = options.Set("inheritedEventCount", inspection.InheritedEventCount)
 		_ = options.Set("seed", inspection.Events)
@@ -1274,11 +1273,16 @@ func (e *Engine) dynamicCordisPrepareAgentSession(run *dynamicCordisRun, input d
 	}
 	prepared, err := e.dynamicCordisPrepareSession(run, input.id, options)
 	if err != nil {
+		if persistenceHandle != nil {
+			_ = persistenceHandle.Close()
+		}
 		if releaseReservation != nil {
 			releaseReservation()
 		}
 		return nil, err
 	}
+	prepared.handle = persistenceHandle
+	prepared.storedEventCount = storedEventCount
 	prepared.reservationRelease = releaseReservation
 	if releaseReservation != nil {
 		run.disposers = append(run.disposers, func() {

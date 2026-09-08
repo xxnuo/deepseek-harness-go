@@ -26,23 +26,24 @@ func TestEngineDefaultSessionStoreLazyPersistenceAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, _ := engine.getSession(id)
-	location, ok := engine.sessionStore.Locate(session.Header)
-	if !ok || location.Kind != "jsonl" {
-		t.Fatalf("location = %#v, %v", location, ok)
+	store, ok := engine.sessionStore.(*JSONLSessionStore)
+	if !ok {
+		t.Fatalf("default store = %T", engine.sessionStore)
 	}
-	if _, err := os.Stat(location.Path); !errors.Is(err, os.ErrNotExist) {
+	path := store.pathFor(session.Header)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("blank session materialized: %v", err)
 	}
-	if got := engine.hookPayload(session, HookBridgeConfig{Dialect: HookDialectClaudeCode}, hookPointInput{})["transcript_path"]; got != location.Path {
-		t.Fatalf("hook transcript = %#v, want %q", got, location.Path)
+	if got := engine.hookPayload(session, HookBridgeConfig{Dialect: HookDialectClaudeCode}, hookPointInput{})["transcript_path"]; got != "" {
+		t.Fatalf("hook transcript = %#v, want empty", got)
 	}
-	if snapshots := engine.sessionQuerySnapshots(); len(snapshots) != 1 || snapshots[0].persisted {
+	if snapshots := engine.sessionQuerySnapshots(); len(snapshots) != 1 || !snapshots[0].persisted {
 		t.Fatalf("blank snapshots = %#v", snapshots)
 	}
 	if _, err := engine.appendEvent(session, "turn/start", map[string]any{"turn": 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(location.Path); err != nil {
+	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
 	}
 	if snapshots := engine.sessionQuerySnapshots(); len(snapshots) != 1 || !snapshots[0].persisted {
@@ -74,7 +75,27 @@ type appendFailingSessionStore struct {
 	err error
 }
 
-func (s *appendFailingSessionStore) Append(context.Context, string, []Event) error { return s.err }
+type appendFailingSessionHandle struct {
+	SessionHandle
+	err error
+}
+
+func (h *appendFailingSessionHandle) Append(context.Context, []Event) error { return h.err }
+
+func (s *appendFailingSessionStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &appendFailingSessionHandle{SessionHandle: handle, err: s.err}, nil
+}
+
+func (s *appendFailingSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, meta, inheritedEventCount))
+}
+
+func (s *appendFailingSessionStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
+}
 
 func TestEngineDoesNotPublishFailedPersistentAppend(t *testing.T) {
 	backend, err := NewJSONLSessionStore(filepath.Join(t.TempDir(), "sessions"))

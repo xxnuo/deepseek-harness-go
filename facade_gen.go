@@ -120,6 +120,8 @@ const DomainFacetUnsupported = core.DomainFacetUnsupported
 
 const DomainInvalidRecord = core.DomainInvalidRecord
 
+const DomainInvalidRecordsBackupAndSkip = core.DomainInvalidRecordsBackupAndSkip
+
 const DomainMissingKey = core.DomainMissingKey
 
 const E2BDir = core.E2BDir
@@ -152,6 +154,10 @@ const IndexInjectionStyle = core.IndexInjectionStyle
 
 const InvariantErrorCode = core.InvariantErrorCode
 
+const KVLayoutPerRecord = core.KVLayoutPerRecord
+
+const KVLayoutSingle = core.KVLayoutSingle
+
 const LSPFindReferences = core.LSPFindReferences
 
 const LSPGoToDefinition = core.LSPGoToDefinition
@@ -181,6 +187,10 @@ const SQLiteJournalPersist = core.SQLiteJournalPersist
 const SQLiteJournalTruncate = core.SQLiteJournalTruncate
 
 const SQLiteJournalWAL = core.SQLiteJournalWAL
+
+const SessionAccessRead = core.SessionAccessRead
+
+const SessionAccessWrite = core.SessionAccessWrite
 
 const SessionFormatVersion = core.SessionFormatVersion
 
@@ -464,6 +474,8 @@ type DomainGlobal = core.DomainGlobal
 
 type DomainGlobalSpec = core.DomainGlobalSpec
 
+type DomainInvalidRecordsPolicy = core.DomainInvalidRecordsPolicy
+
 type DomainSpec = core.DomainSpec
 
 type DomainTable = core.DomainTable
@@ -624,6 +636,8 @@ type InvariantRegistry = core.InvariantRegistry
 
 type InvariantScope = core.InvariantScope
 
+type JSONLSessionHandle = core.JSONLSessionHandle
+
 type JSONLSessionStore = core.JSONLSessionStore
 
 type JSONStorageBackend = core.JSONStorageBackend
@@ -633,6 +647,10 @@ type JSONStorageConfig = core.JSONStorageConfig
 type JobsConfig = core.JobsConfig
 
 type KVFacet = core.KVFacet
+
+type KVLayout = core.KVLayout
+
+type KVRecordBackupper = core.KVRecordBackupper
 
 type KVSnapshot = core.KVSnapshot
 
@@ -706,7 +724,13 @@ type ProjectionChange = core.ProjectionChange
 
 type ProjectionChangeListener = core.ProjectionChangeListener
 
+type ProjectionCheckpoint = core.ProjectionCheckpoint
+
+type ProjectionCheckpointRow = core.ProjectionCheckpointRow
+
 type ProjectionDefinition = core.ProjectionDefinition
+
+type ProjectionRestore = core.ProjectionRestore
 
 type ProjectionResult = core.ProjectionResult
 
@@ -782,7 +806,17 @@ type Server = core.Server
 
 type Session = core.Session
 
+type SessionAccess = core.SessionAccess
+
+type SessionAlreadyExistsError = core.SessionAlreadyExistsError
+
+type SessionAlreadyOwnedError = core.SessionAlreadyOwnedError
+
 type SessionConflictError = core.SessionConflictError
+
+type SessionHandle = core.SessionHandle
+
+type SessionHandleClosedError = core.SessionHandleClosedError
 
 type SessionHeader = core.SessionHeader
 
@@ -790,11 +824,11 @@ type SessionInspection = core.SessionInspection
 
 type SessionInvariant = core.SessionInvariant
 
-type SessionLocation = core.SessionLocation
-
 type SessionLogOffset = core.SessionLogOffset
 
-type SessionPersistenceFlusher = core.SessionPersistenceFlusher
+type SessionOwnershipLostError = core.SessionOwnershipLostError
+
+type SessionPersistenceNotFoundError = core.SessionPersistenceNotFoundError
 
 type SessionPersistenceRevision = core.SessionPersistenceRevision
 
@@ -804,7 +838,7 @@ type SessionProjectionCacheConfig = core.SessionProjectionCacheConfig
 
 type SessionProjectionRegistry = core.SessionProjectionRegistry
 
-type SessionRawArtifact = core.SessionRawArtifact
+type SessionReadOnlyError = core.SessionReadOnlyError
 
 type SessionReferenceCandidate = core.SessionReferenceCandidate
 

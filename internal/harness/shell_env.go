@@ -38,7 +38,7 @@ type shellEnvironmentRegistry struct {
 func newShellEnvironmentRegistry() *shellEnvironmentRegistry {
 	return &shellEnvironmentRegistry{
 		contributors: map[string]*shellEnvironmentContributor{},
-		keyOwners:    map[string]string{"DSH_SESSION_JSONL": "session-persistence"},
+		keyOwners:    map[string]string{},
 	}
 }
 
@@ -100,11 +100,7 @@ func (r *shellEnvironmentRegistry) register(owner *dynamicCordisRun, contributor
 
 func (r *shellEnvironmentRegistry) list() []shellEnvironmentVariableInfo {
 	r.mu.RLock()
-	rows := []shellEnvironmentVariableInfo{{
-		Contributor: "session-persistence",
-		Description: "Absolute target path of the current session JSONL when the active persistence backend provides one.",
-		Key:         "DSH_SESSION_JSONL",
-	}}
+	rows := []shellEnvironmentVariableInfo{}
 	for _, contributor := range r.contributors {
 		for key, description := range contributor.variables {
 			rows = append(rows, shellEnvironmentVariableInfo{Contributor: contributor.name, Description: description, Key: key})
@@ -202,13 +198,5 @@ func (e *Engine) trustedDSHEnvironmentForSession(sessionID string) map[string]st
 		return env
 	}
 	env["DSH_SESSION_ID"] = sessionID
-	if e.sessionStore == nil {
-		return env
-	}
-	if session, err := e.getSession(sessionID); err == nil {
-		if location, ok := e.sessionStore.Locate(session.Header); ok && location.Kind == "jsonl" && location.Path != "" {
-			env["DSH_SESSION_JSONL"] = location.Path
-		}
-	}
 	return env
 }

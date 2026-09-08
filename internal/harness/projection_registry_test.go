@@ -342,7 +342,155 @@ return {
 	}
 }
 
-func TestProjectionCacheRejectsDifferentRegistryComposition(t *testing.T) {
+type projectionRestoreTestState struct {
+	Inherited int   `json:"inherited"`
+	Seen      []int `json:"seen"`
+}
+
+func projectionRestoreTestDefinition(key string, visible bool, applies *int) ProjectionDefinition {
+	definition := ProjectionDefinition{
+		Key: key, StateVersion: 1,
+		InitWithHeader: func(header SessionHeader) any {
+			return projectionRestoreTestState{Inherited: header.SeedLength}
+		},
+		Apply: func(state any, event Event) ProjectionResult {
+			if applies != nil {
+				*applies++
+			}
+			next := state.(projectionRestoreTestState)
+			next.Seen = append(next.Seen, int(event.Seq))
+			return ProjectionResult{State: next, Changed: true}
+		},
+	}
+	if visible {
+		definition.View = func(state any) any { return state }
+	}
+	return definition
+}
+
+func TestSessionProjectionRegistryCheckpointRestoreAndHydrate(t *testing.T) {
+	registry := NewSessionProjectionRegistry()
+	if _, err := registry.Register(projectionRestoreTestDefinition("test/visible", true, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Register(projectionRestoreTestDefinition("test/host", false, nil)); err != nil {
+		t.Fatal(err)
+	}
+	header := SessionHeader{ID: "projection-restore", IsSeeded: true, SeedLength: 2}
+	session := &Session{Header: header, InheritedEventCount: 2}
+	event := Event{Type: "test/0", Seq: 0, Time: 1}
+	session.Events = append(session.Events, event)
+	if _, err := registry.Drive(session, event); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint, err := registry.Checkpoint(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint["test/visible"].Seq != 0 || checkpoint["test/host"].Seq != 0 {
+		t.Fatalf("checkpoint rows = %#v", checkpoint)
+	}
+	detached := checkpoint["test/visible"].Value.(projectionRestoreTestState)
+	detached.Seen[0] = 99
+	snapshot, err := registry.Snapshot(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.Values["test/visible"].(projectionRestoreTestState).Seen; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("checkpoint mutation corrupted live state: %#v", got)
+	}
+	if _, found := snapshot.Values["test/host"]; found {
+		t.Fatalf("host-only state leaked into snapshot: %#v", snapshot.Values)
+	}
+
+	floorRows := ProjectionCheckpoint{
+		"test/visible": {Version: 1, Seq: 10, Value: projectionRestoreTestState{}},
+		"test/host":    {Version: 1, Seq: 5, Value: projectionRestoreTestState{}},
+	}
+	if floor, ok := registry.RestoreFloor(floorRows); !ok || floor != 5 {
+		t.Fatalf("restore floor = %d, %t, want 5, true", floor, ok)
+	}
+	floorRows["test/visible"] = ProjectionCheckpointRow{Version: 2, Seq: 10, Value: projectionRestoreTestState{}}
+	if floor, ok := registry.RestoreFloor(floorRows); !ok || floor != 0 {
+		t.Fatalf("mismatched restore floor = %d, %t, want 0, true", floor, ok)
+	}
+
+	malformed := ProjectionCheckpoint{
+		"test/visible": {Version: 1, Seq: 0, Value: map[string]any{"inherited": 2, "seen": "bad"}},
+	}
+	if values, err := registry.ViewCheckpoint(malformed); err != nil || len(values) != 0 {
+		t.Fatalf("malformed checkpoint view = %#v, %v", values, err)
+	}
+
+	rows := ProjectionCheckpoint{
+		"test/visible": {Version: 1, Seq: 0, Value: projectionRestoreTestState{Inherited: 2, Seen: []int{0}}},
+		"test/host":    {Version: 1, Seq: 0, Value: projectionRestoreTestState{Inherited: 2, Seen: []int{0}}},
+	}
+	tail := []Event{{Type: "test/1", Seq: 1, Time: 2}, {Type: "test/2", Seq: 2, Time: 3}}
+	restored, err := registry.Restore(rows, tail, 1, header, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState := projectionRestoreTestState{Inherited: 2, Seen: []int{0, 1, 2}}
+	if got := restored.Snapshot.Values["test/visible"]; !reflect.DeepEqual(got, wantState) {
+		t.Fatalf("suffix restore visible state = %#v, want %#v", got, wantState)
+	}
+	if _, found := restored.Snapshot.Values["test/host"]; found {
+		t.Fatalf("host-only restored state leaked: %#v", restored.Snapshot.Values)
+	}
+	if got := restored.Checkpoint["test/host"].Value; !reflect.DeepEqual(got, wantState) {
+		t.Fatalf("host-only checkpoint state = %#v, want %#v", got, wantState)
+	}
+
+	mismatched := cloneProjectionCheckpointForTest(rows)
+	mismatched["test/host"] = ProjectionCheckpointRow{Version: 2, Seq: 0, Value: projectionRestoreTestState{}}
+	if _, err := registry.Restore(mismatched, tail, 1, header, 2); err == nil || !strings.Contains(err.Error(), "re-read from seq 0") {
+		t.Fatalf("suffix restore mismatch error = %v", err)
+	}
+	full := append([]Event{{Type: "test/0", Seq: 0, Time: 1}}, tail...)
+	refolded, err := registry.Restore(mismatched, full, 0, header, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := refolded.Checkpoint["test/host"].Value; !reflect.DeepEqual(got, wantState) {
+		t.Fatalf("full refolded host state = %#v, want %#v", got, wantState)
+	}
+
+	hydrateRegistry := NewSessionProjectionRegistry()
+	applies := 0
+	if _, err := hydrateRegistry.Register(projectionRestoreTestDefinition("test/hydrate", true, &applies)); err != nil {
+		t.Fatal(err)
+	}
+	hydratedSession := &Session{Header: header, InheritedEventCount: 2, Events: full}
+	hydrateRows := ProjectionCheckpoint{
+		"test/hydrate": {Version: 1, Seq: 0, Value: projectionRestoreTestState{Inherited: 2, Seen: []int{0}}},
+	}
+	first, err := hydrateRegistry.Hydrate(hydratedSession, hydrateRows, full, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applies != 2 || first.AsOfSeq != 2 {
+		t.Fatalf("first hydrate applies=%d snapshot=%#v", applies, first)
+	}
+	second, err := hydrateRegistry.Hydrate(hydratedSession, hydrateRows, full, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applies != 2 || !reflect.DeepEqual(first, second) {
+		t.Fatalf("repeat hydrate reapplied events: applies=%d first=%#v second=%#v", applies, first, second)
+	}
+}
+
+func cloneProjectionCheckpointForTest(source ProjectionCheckpoint) ProjectionCheckpoint {
+	clone := make(ProjectionCheckpoint, len(source))
+	for key, row := range source {
+		clone[key] = row
+	}
+	return clone
+}
+
+func TestProjectionCacheSkipsOnlyVersionMismatchedRows(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DataDir = t.TempDir()
 	cfg.Workspace = cfg.DataDir
@@ -360,9 +508,19 @@ func TestProjectionCacheRejectsDifferentRegistryComposition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispose, err := e.SessionProjections().Register(ProjectionDefinition{
-		Key: "test/cache-composition", StateVersion: 1,
-		Init:  func() any { return nil },
+	stableDispose, err := e.SessionProjections().Register(ProjectionDefinition{
+		Key: "test/cache-stable", StateVersion: 1,
+		Init:  func() any { return 1 },
+		Apply: func(state any, _ Event) ProjectionResult { return ProjectionResult{State: state} },
+		View:  func(state any) any { return state },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stableDispose()
+	driftDispose, err := e.SessionProjections().Register(ProjectionDefinition{
+		Key: "test/cache-drift", StateVersion: 1,
+		Init:  func() any { return 1 },
 		Apply: func(state any, _ Event) ProjectionResult { return ProjectionResult{State: state} },
 		View:  func(state any) any { return state },
 	})
@@ -375,10 +533,24 @@ func TestProjectionCacheRejectsDifferentRegistryComposition(t *testing.T) {
 	session, _ := e.getSession(id)
 	session.mu.Lock()
 	header := session.Header
-	lastSeq := len(session.Events) - 1
+	inheritedEventCount := session.InheritedEventCount
 	session.mu.Unlock()
-	dispose()
-	if _, ok := e.projectionCache.medium.snapshot(header, lastSeq, true, e.SessionProjections().Signature()); ok {
-		t.Fatal("cache row from the old projection composition was accepted")
+	driftDispose()
+	driftDispose, err = e.SessionProjections().Register(ProjectionDefinition{
+		Key: "test/cache-drift", StateVersion: 2,
+		Init:  func() any { return 2 },
+		Apply: func(state any, _ Event) ProjectionResult { return ProjectionResult{State: state} },
+		View:  func(state any) any { return state },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driftDispose()
+	snapshot, ok := e.projectionCache.medium.snapshot(e.SessionProjections(), header, inheritedEventCount)
+	if !ok || snapshot.Values["test/cache-stable"] != 1 {
+		t.Fatalf("version-scoped cache snapshot = %#v, ok=%t", snapshot, ok)
+	}
+	if _, found := snapshot.Values["test/cache-drift"]; found {
+		t.Fatalf("version-mismatched row was served: %#v", snapshot.Values)
 	}
 }

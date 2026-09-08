@@ -586,14 +586,14 @@ func TestToolResultPrunerPreservesRichBlockAndEventData(t *testing.T) {
 }
 
 type toolResultPruneFailStore struct {
-	SessionStore
+	testSessionHandleDefaults
 	mu     sync.Mutex
 	calls  int
 	failAt int
 	err    error
 }
 
-func (s *toolResultPruneFailStore) Append(context.Context, string, []Event) error {
+func (s *toolResultPruneFailStore) Append(context.Context, []Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -676,13 +676,13 @@ func TestToolResultPrunerKeepsCommittedPrefixWhenLaterReplacementFails(t *testin
 }
 
 type blockingToolResultPruneStore struct {
-	SessionStore
+	testSessionHandleDefaults
 	once    sync.Once
 	started chan struct{}
 	release chan struct{}
 }
 
-func (s *blockingToolResultPruneStore) Append(context.Context, string, []Event) error {
+func (s *blockingToolResultPruneStore) Append(context.Context, []Event) error {
 	s.once.Do(func() {
 		close(s.started)
 		<-s.release

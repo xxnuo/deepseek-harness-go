@@ -97,6 +97,35 @@ func TestOpenAIProviderFunctionCallingWireAndStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIProviderStreamDeltasKeepToolCallIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"one\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"two\",\"arguments\":\"\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":null,\"function\":{\"name\":null,\"arguments\":\"{\\\"b\\\":1}\"}},{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"\",\"arguments\":\"{\\\"a\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	provider := NewOpenAIProvider("test", server.URL, "", "test-model")
+	var deltas []Delta
+	completion, err := provider.Complete(t.Context(), ChatRequest{Model: "test-model"}, func(delta Delta) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deltas) != 2 || !reflect.DeepEqual(deltas[1].ToolCalls, []ToolCallDelta{
+		{Index: 1, ID: "call-b", Name: "two", ArgumentsDelta: `{"b":1}`},
+		{Index: 0, ID: "call-a", Name: "one", ArgumentsDelta: `{"a":1}`},
+	}) {
+		t.Fatalf("continuation deltas = %#v", deltas)
+	}
+	if len(completion.ToolCalls) != 2 || completion.ToolCalls[0].ID != "call-a" || completion.ToolCalls[0].Name != "one" || completion.ToolCalls[1].ID != "call-b" || completion.ToolCalls[1].Name != "two" {
+		t.Fatalf("completion calls = %#v", completion.ToolCalls)
+	}
+}
+
 func TestOpenAIProviderModelDiscoveryKeepsGatewayMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {

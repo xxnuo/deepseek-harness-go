@@ -3,7 +3,6 @@ package harness
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -15,7 +14,7 @@ func TestScrubbedChildEnvDropsAmbientCredentialsAndAllowsExplicitValues(t *testi
 	t.Setenv("HARNESS_TEST_PLAIN", "kept")
 
 	env := strings.Join(scrubbedChildEnv(map[string]string{
-		"DSH_SESSION_JSONL":   "/tmp/session.jsonl",
+		"DSH_EXPLICIT_TEST":   "trusted",
 		"EXPLICIT_TEST_TOKEN": "explicit",
 	}), "\n")
 	for _, absent := range []string{"DSH_ENV_TEST=", "HARNESS_TEST_API_KEY=", "HARNESS_TEST_PASSWORD="} {
@@ -23,7 +22,7 @@ func TestScrubbedChildEnvDropsAmbientCredentialsAndAllowsExplicitValues(t *testi
 			t.Fatalf("child environment leaked %q:\n%s", absent, env)
 		}
 	}
-	for _, present := range []string{"HARNESS_TEST_PLAIN=kept", "DSH_SESSION_JSONL=/tmp/session.jsonl", "EXPLICIT_TEST_TOKEN=explicit"} {
+	for _, present := range []string{"HARNESS_TEST_PLAIN=kept", "DSH_EXPLICIT_TEST=trusted", "EXPLICIT_TEST_TOKEN=explicit"} {
 		if !strings.Contains(env, present) {
 			t.Fatalf("child environment missed %q:\n%s", present, env)
 		}
@@ -49,7 +48,7 @@ func TestBuiltinShellRejectsEmptyDescription(t *testing.T) {
 	}
 }
 
-func TestShellEnvironmentForSessionUsesTrustedIdentityAndJSONLLocation(t *testing.T) {
+func TestShellEnvironmentForSessionUsesTrustedIdentity(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DataDir = t.TempDir()
 	cfg.Workspace = cfg.DataDir
@@ -64,17 +63,9 @@ func TestShellEnvironmentForSessionUsesTrustedIdentityAndJSONLLocation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := e.getSession(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	location, ok := e.sessionStore.Locate(session.Header)
-	if !ok || location.Kind != "jsonl" {
-		t.Fatalf("session location = %#v, %v", location, ok)
-	}
 	t.Setenv("DSH_SESSION_ID", "ambient-stale")
 	env := e.shellEnvironmentForSession(id)
-	if env["DSH_HOME"] != cfg.DataDir || env["DSH_SHELL"] != "1" || env["DSH_SESSION_ID"] != id || env["DSH_SESSION_JSONL"] != filepath.Clean(location.Path) {
+	if env["DSH_HOME"] != cfg.DataDir || env["DSH_SHELL"] != "1" || env["DSH_SESSION_ID"] != id {
 		t.Fatalf("trusted shell environment = %#v", env)
 	}
 	clean := strings.Join(scrubbedChildEnv(env), "\n")

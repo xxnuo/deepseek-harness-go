@@ -367,7 +367,7 @@ func TestDeepSeekPluginPackageInventoryResolvesMaterializedPresetPackages(t *tes
 	if err := os.MkdirAll(packageDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(`{"name":"@deepseek-ai/dsh-fixture","version":"0.1.2-alpha.4"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(`{"name":"@deepseek-ai/dsh-fixture","version":"0.1.2-alpha.5"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	presetRoot := filepath.Join(root, "presets")
@@ -400,7 +400,7 @@ func TestDeepSeekPluginPackageInventoryResolvesMaterializedPresetPackages(t *tes
 		t.Fatalf("inventory contribution = %#v", contribution)
 	}
 	want := []DeepSeekPluginPackageIdentity{
-		{Name: "@deepseek-ai/dsh-fixture", Version: "0.1.2-alpha.4"},
+		{Name: "@deepseek-ai/dsh-fixture", Version: "0.1.2-alpha.5"},
 		{Name: "host-package", Version: "1.0.0"},
 	}
 	if !reflect.DeepEqual(value.Packages, want) {

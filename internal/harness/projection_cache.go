@@ -6,16 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
 
-const (
-	sessionProjectionCacheVersion = 4
-	projectionValuesVersion       = 4
-)
+const sessionProjectionCacheVersion = 6
 
 type SessionProjectionCacheConfig struct {
 	WriteEveryEvents int
@@ -45,32 +41,38 @@ func validateSessionProjectionCacheConfig(config *SessionProjectionCacheConfig) 
 }
 
 type projectionCacheIdentity struct {
-	Version         int    `json:"version"`
-	ID              string `json:"id"`
-	CreatedAt       int64  `json:"createdAt"`
-	CWD             string `json:"cwd,omitempty"`
-	ParentSession   string `json:"parentSession,omitempty"`
-	SeedLength      int    `json:"seedLength,omitempty"`
-	DelegationDepth int    `json:"delegationDepth,omitempty"`
+	CreatedAt           int64             `json:"createdAt"`
+	CWD                 string            `json:"cwd,omitempty"`
+	IsSeeded            *bool             `json:"isSeeded,omitempty"`
+	InheritedEventCount *SessionLogOffset `json:"inheritedEventCount,omitempty"`
 }
 
 type projectionCacheRecord struct {
-	Identity    projectionCacheIdentity `json:"identity"`
-	Seq         int                     `json:"seq"`
-	Version     int                     `json:"version,omitempty"`
-	Composition string                  `json:"composition"`
-	Values      map[string]any          `json:"values"`
+	Identity projectionCacheIdentity `json:"identity"`
+	Rows     ProjectionCheckpoint    `json:"rows"`
 }
 
-func projectionIdentity(header SessionHeader) projectionCacheIdentity {
-	return projectionCacheIdentity{
-		Version: header.Version, ID: header.ID, CreatedAt: header.CreatedAt, CWD: header.CWD,
-		ParentSession: header.ParentSession, SeedLength: header.SeedLength, DelegationDepth: header.DelegationDepth,
+func projectionIdentity(header SessionHeader, inheritedEventCount SessionLogOffset) (projectionCacheIdentity, error) {
+	if !header.IsSeeded && inheritedEventCount != 0 {
+		return projectionCacheIdentity{}, errors.New("unseeded projection-cache identity inherited event count must be 0")
 	}
+	seeded := header.IsSeeded
+	return projectionCacheIdentity{
+		CreatedAt: header.CreatedAt, CWD: header.CWD,
+		IsSeeded: &seeded, InheritedEventCount: &inheritedEventCount,
+	}, nil
 }
 
 func sameProjectionIdentity(a, b projectionCacheIdentity) bool {
-	return a == b
+	seeded := func(value *bool) bool { return value != nil && *value }
+	inherited := func(value *SessionLogOffset) SessionLogOffset {
+		if value == nil {
+			return 0
+		}
+		return *value
+	}
+	return a.CreatedAt == b.CreatedAt && a.CWD == b.CWD &&
+		seeded(a.IsSeeded) == seeded(b.IsSeeded) && inherited(a.InheritedEventCount) == inherited(b.InheritedEventCount)
 }
 
 type projectionCacheMedium struct {
@@ -94,7 +96,7 @@ func acquireProjectionCacheMedium(root string) (*projectionCacheMedium, error) {
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(abs, "session_projcache.json")
+	path := filepath.Join(abs, "session_projcache")
 	sharedProjectionCacheMedia.Lock()
 	defer sharedProjectionCacheMedia.Unlock()
 	if medium := sharedProjectionCacheMedia.byPath[path]; medium != nil {
@@ -102,13 +104,6 @@ func acquireProjectionCacheMedium(root string) (*projectionCacheMedium, error) {
 		return medium, nil
 	}
 	backend, unit, err := openProjectionCacheStorage(abs)
-	if IsStorageError(err, StorageVersionMismatch) {
-		_ = backend.Close()
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return nil, removeErr
-		}
-		backend, unit, err = openProjectionCacheStorage(abs)
-	}
 	if err != nil {
 		if backend != nil {
 			_ = backend.Close()
@@ -123,9 +118,21 @@ func acquireProjectionCacheMedium(root string) (*projectionCacheMedium, error) {
 	records := make(map[string]projectionCacheRecord, len(snapshot.Tables["sessions"]))
 	for id, raw := range snapshot.Tables["sessions"] {
 		record, decodeErr := decodeProjectionCacheRecord(raw)
-		if decodeErr == nil {
-			records[id] = record
+		if decodeErr != nil {
+			backupper, ok := unit.(KVRecordBackupper)
+			if !ok {
+				_ = backend.Close()
+				return nil, decodeErr
+			}
+			moved, backupErr := backupper.BackupRecord(context.Background(), "sessions", id)
+			if backupErr != nil {
+				_ = backend.Close()
+				return nil, backupErr
+			}
+			log.Printf("deepseek-harness: projection cache record %q failed schema validation; moved to %q and treated as absent: %v", id, moved, decodeErr)
+			continue
 		}
+		records[id] = record
 	}
 	medium := &projectionCacheMedium{path: path, backend: backend, unit: unit, records: records, refs: 1}
 	sharedProjectionCacheMedia.byPath[path] = medium
@@ -139,6 +146,7 @@ func openProjectionCacheStorage(root string) (*JSONStorageBackend, KVUnit, error
 	}
 	unit, err := backend.Open(context.Background(), KVUnitDescriptor{
 		Name: "session_projcache", Version: sessionProjectionCacheVersion, Tables: []string{"sessions"},
+		Layout: KVLayoutPerRecord, CompatibleVersions: []int{3, 4, 5},
 	})
 	return backend, unit, err
 }
@@ -159,14 +167,53 @@ func decodeProjectionCacheRecord(value any) (projectionCacheRecord, error) {
 	if err != nil {
 		return projectionCacheRecord{}, err
 	}
-	var record projectionCacheRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		return projectionCacheRecord{}, err
+	var raw struct {
+		Identity json.RawMessage            `json:"identity"`
+		Rows     map[string]json.RawMessage `json:"rows"`
 	}
-	if record.Identity.CreatedAt < 0 || record.Seq < -1 || record.Version != projectionValuesVersion || record.Composition == "" || record.Values == nil {
+	if err := json.Unmarshal(data, &raw); err != nil || raw.Identity == nil || raw.Rows == nil {
 		return projectionCacheRecord{}, errors.New("invalid projection cache record")
 	}
+	var identity struct {
+		CreatedAt           *int64            `json:"createdAt"`
+		CWD                 string            `json:"cwd,omitempty"`
+		IsSeeded            *bool             `json:"isSeeded,omitempty"`
+		InheritedEventCount *SessionLogOffset `json:"inheritedEventCount,omitempty"`
+	}
+	if err := json.Unmarshal(raw.Identity, &identity); err != nil || identity.CreatedAt == nil || *identity.CreatedAt < 0 || identity.InheritedEventCount != nil && *identity.InheritedEventCount < 0 {
+		return projectionCacheRecord{}, errors.New("invalid projection cache identity")
+	}
+	record := projectionCacheRecord{
+		Identity: projectionCacheIdentity{
+			CreatedAt: *identity.CreatedAt, CWD: identity.CWD,
+			IsSeeded: identity.IsSeeded, InheritedEventCount: identity.InheritedEventCount,
+		},
+		Rows: make(ProjectionCheckpoint, len(raw.Rows)),
+	}
+	for key, rawRow := range raw.Rows {
+		var row struct {
+			Version *int            `json:"ver"`
+			Seq     *int            `json:"seq"`
+			Value   json.RawMessage `json:"val"`
+		}
+		if err := json.Unmarshal(rawRow, &row); err != nil || row.Version == nil || *row.Version < 0 || row.Seq == nil || *row.Seq < -1 || row.Value == nil {
+			return projectionCacheRecord{}, fmt.Errorf("invalid projection cache row %q", key)
+		}
+		var value any
+		if err := json.Unmarshal(row.Value, &value); err != nil {
+			return projectionCacheRecord{}, fmt.Errorf("invalid projection cache row %q: %w", key, err)
+		}
+		record.Rows[key] = ProjectionCheckpointRow{Version: *row.Version, Seq: *row.Seq, Value: value}
+	}
 	return record, nil
+}
+
+func decodeProjectionCacheRecordJSON(data []byte) (projectionCacheRecord, error) {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return projectionCacheRecord{}, err
+	}
+	return decodeProjectionCacheRecord(value)
 }
 
 func cloneProjectionRecord(record projectionCacheRecord) (projectionCacheRecord, error) {
@@ -174,11 +221,7 @@ func cloneProjectionRecord(record projectionCacheRecord) (projectionCacheRecord,
 	if err != nil {
 		return projectionCacheRecord{}, err
 	}
-	var detached projectionCacheRecord
-	if err := json.Unmarshal(data, &detached); err != nil {
-		return projectionCacheRecord{}, err
-	}
-	return detached, nil
+	return decodeProjectionCacheRecordJSON(data)
 }
 
 func (medium *projectionCacheMedium) put(ctx context.Context, id string, record projectionCacheRecord) error {
@@ -192,7 +235,7 @@ func (medium *projectionCacheMedium) put(ctx context.Context, id string, record 
 	current, exists := medium.records[id]
 	medium.mu.RUnlock()
 	if exists {
-		if sameProjectionIdentity(current.Identity, detached.Identity) && current.Seq > detached.Seq {
+		if sameProjectionIdentity(current.Identity, detached.Identity) && projectionCheckpointCut(current.Rows) > projectionCheckpointCut(detached.Rows) {
 			return nil
 		}
 		if !sameProjectionIdentity(current.Identity, detached.Identity) && current.Identity.CreatedAt > detached.Identity.CreatedAt {
@@ -208,32 +251,60 @@ func (medium *projectionCacheMedium) put(ctx context.Context, id string, record 
 	return nil
 }
 
-func (medium *projectionCacheMedium) snapshot(header SessionHeader, lastSeq int, exact bool, composition string) (ProjectionSnapshot, bool) {
-	medium.mu.RLock()
-	record, ok := medium.records[header.ID]
-	medium.mu.RUnlock()
-	if !ok || record.Composition != composition || !sameProjectionIdentity(record.Identity, projectionIdentity(header)) || record.Seq > lastSeq || exact && record.Seq != lastSeq {
-		return ProjectionSnapshot{}, false
+func projectionCheckpointCut(rows ProjectionCheckpoint) int {
+	cut := -1
+	for _, row := range rows {
+		if row.Seq > cut {
+			cut = row.Seq
+		}
 	}
-	detached, err := cloneProjectionRecord(record)
-	if err != nil {
-		return ProjectionSnapshot{}, false
-	}
-	return ProjectionSnapshot{AsOfSeq: detached.Seq, Values: detached.Values}, true
+	return cut
 }
 
-func (medium *projectionCacheMedium) identitySnapshot(header SessionHeader, composition string) (ProjectionSnapshot, bool) {
+func (medium *projectionCacheMedium) record(header SessionHeader, inheritedEventCount SessionLogOffset) (projectionCacheRecord, bool) {
+	expected, err := projectionIdentity(header, inheritedEventCount)
+	if err != nil {
+		return projectionCacheRecord{}, false
+	}
 	medium.mu.RLock()
 	record, ok := medium.records[header.ID]
 	medium.mu.RUnlock()
-	if !ok || record.Composition != composition || !sameProjectionIdentity(record.Identity, projectionIdentity(header)) {
-		return ProjectionSnapshot{}, false
+	if !ok || !sameProjectionIdentity(record.Identity, expected) {
+		return projectionCacheRecord{}, false
 	}
 	detached, err := cloneProjectionRecord(record)
 	if err != nil {
+		return projectionCacheRecord{}, false
+	}
+	return detached, true
+}
+
+func (medium *projectionCacheMedium) snapshot(registry *SessionProjectionRegistry, header SessionHeader, inheritedEventCount SessionLogOffset, keys ...string) (ProjectionSnapshot, bool) {
+	record, ok := medium.record(header, inheritedEventCount)
+	if !ok {
 		return ProjectionSnapshot{}, false
 	}
-	return ProjectionSnapshot{AsOfSeq: detached.Seq, Values: detached.Values}, true
+	values, err := registry.ViewCheckpoint(record.Rows, keys...)
+	if err != nil || len(values) == 0 {
+		return ProjectionSnapshot{}, false
+	}
+	asOfSeq := -1
+	first := true
+	for key := range values {
+		row, ok := record.Rows[key]
+		if !ok {
+			return ProjectionSnapshot{}, false
+		}
+		if first || row.Seq < asOfSeq {
+			asOfSeq = row.Seq
+			first = false
+		}
+	}
+	return ProjectionSnapshot{AsOfSeq: asOfSeq, Values: values}, true
+}
+
+func (medium *projectionCacheMedium) identitySnapshot(registry *SessionProjectionRegistry, header SessionHeader, inheritedEventCount SessionLogOffset) (ProjectionSnapshot, bool) {
+	return medium.snapshot(registry, header, inheritedEventCount, "subagent")
 }
 
 type projectionCacheDirty struct {
@@ -292,6 +363,14 @@ func (cache *sessionProjectionCache) observe(session *Session, event Event) {
 	cache.mu.Unlock()
 }
 
+func (cache *sessionProjectionCache) created(session *Session) {
+	cache.mu.Lock()
+	if !cache.closed {
+		cache.startWriteLocked(session, "create")
+	}
+	cache.mu.Unlock()
+}
+
 func (cache *sessionProjectionCache) flushTimer(session *Session, timer *time.Timer) {
 	cache.mu.Lock()
 	state := cache.dirty[session]
@@ -324,25 +403,72 @@ func (cache *sessionProjectionCache) markCleanLocked(state *projectionCacheDirty
 }
 
 func (cache *sessionProjectionCache) writeSession(ctx context.Context, session *Session) error {
-	snapshot, composition, err := cache.registry.snapshotForCache(session)
+	rows, err := cache.registry.Checkpoint(session)
 	if err != nil {
 		return err
 	}
 	session.mu.Lock()
-	record := projectionCacheRecord{
-		Identity: projectionIdentity(session.Header), Seq: snapshot.AsOfSeq,
-		Version: projectionValuesVersion, Composition: composition, Values: snapshot.Values,
-	}
+	header := session.Header
+	inheritedEventCount := session.InheritedEventCount
 	id := session.Header.ID
 	session.mu.Unlock()
-	return cache.medium.put(ctx, id, record)
+	identity, err := projectionIdentity(header, inheritedEventCount)
+	if err != nil {
+		return err
+	}
+	session.mu.Lock()
+	handle := session.store
+	session.mu.Unlock()
+	if handle != nil {
+		if err := handle.Flush(ctx); err != nil {
+			return err
+		}
+	}
+	return cache.medium.put(ctx, id, projectionCacheRecord{Identity: identity, Rows: rows})
 }
 
-func (cache *sessionProjectionCache) putSnapshot(ctx context.Context, header SessionHeader, snapshot ProjectionSnapshot, composition string) error {
-	return cache.medium.put(ctx, header.ID, projectionCacheRecord{
-		Identity: projectionIdentity(header), Seq: snapshot.AsOfSeq, Version: projectionValuesVersion,
-		Composition: composition, Values: snapshot.Values,
-	})
+func (cache *sessionProjectionCache) cachedSnapshot(header SessionHeader, inheritedEventCount SessionLogOffset, keys ...string) (ProjectionSnapshot, bool) {
+	return cache.medium.snapshot(cache.registry, header, inheritedEventCount, keys...)
+}
+
+func (cache *sessionProjectionCache) hydratePrepared(session *Session, events []Event) (ProjectionSnapshot, error) {
+	session.mu.Lock()
+	header := session.Header
+	inheritedEventCount := session.InheritedEventCount
+	session.mu.Unlock()
+	checkpoint := ProjectionCheckpoint{}
+	if record, ok := cache.medium.record(header, inheritedEventCount); ok {
+		checkpoint = record.Rows
+	}
+	snapshot, err := cache.registry.Hydrate(session, checkpoint, events, 0)
+	if err == nil || len(checkpoint) == 0 {
+		return snapshot, err
+	}
+	return cache.registry.Hydrate(session, ProjectionCheckpoint{}, events, 0)
+}
+
+func (cache *sessionProjectionCache) coldSnapshot(ctx context.Context, header SessionHeader, inheritedEventCount SessionLogOffset, events []Event) (ProjectionSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return ProjectionSnapshot{}, err
+	}
+	checkpoint := ProjectionCheckpoint{}
+	if record, ok := cache.medium.record(header, inheritedEventCount); ok {
+		checkpoint = record.Rows
+	}
+	restored, err := cache.registry.Restore(checkpoint, events, 0, header, inheritedEventCount)
+	if err != nil && len(checkpoint) > 0 {
+		restored, err = cache.registry.Restore(ProjectionCheckpoint{}, events, 0, header, inheritedEventCount)
+	}
+	if err != nil {
+		return ProjectionSnapshot{}, err
+	}
+	identity, identityErr := projectionIdentity(header, inheritedEventCount)
+	if identityErr == nil {
+		if putErr := cache.medium.put(ctx, header.ID, projectionCacheRecord{Identity: identity, Rows: restored.Checkpoint}); putErr != nil {
+			log.Printf("deepseek-harness: session projection cache cold-read write-back for %q failed: %v", header.ID, putErr)
+		}
+	}
+	return restored.Snapshot, nil
 }
 
 func (cache *sessionProjectionCache) close(sessions []*Session) error {
@@ -370,22 +496,12 @@ func (e *Engine) SessionProjectionSnapshot(ctx context.Context, id string) (Proj
 	if err != nil {
 		return ProjectionSnapshot{}, err
 	}
-	session.mu.Lock()
-	header := session.Header
-	lastSeq := len(session.Events) - 1
-	if e.projectionCache != nil {
-		if cached, ok := e.projectionCache.medium.snapshot(header, lastSeq, true, e.sessionProjections.Signature()); ok {
-			session.mu.Unlock()
-			return cached, nil
-		}
-	}
-	session.mu.Unlock()
-	snapshot, composition, err := e.sessionProjections.snapshotForCache(session)
+	snapshot, err := e.sessionProjections.Snapshot(session)
 	if err != nil {
 		return ProjectionSnapshot{}, err
 	}
 	if e.projectionCache != nil {
-		if err := e.projectionCache.putSnapshot(ctx, header, snapshot, composition); err != nil {
+		if err := e.projectionCache.writeSession(ctx, session); err != nil {
 			log.Printf("deepseek-harness: session projection cache cold-read write-back for %q failed: %v", id, err)
 		}
 	}

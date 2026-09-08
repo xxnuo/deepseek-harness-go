@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -737,6 +738,12 @@ func subagentJSONNumber(value any) (float64, bool) {
 		number = float64(value)
 	case float64:
 		number = value
+	case json.Number:
+		parsed, err := value.Float64()
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
 	default:
 		return 0, false
 	}
@@ -764,7 +771,7 @@ func isLosslessSubagentJSON(value any, seen map[uintptr]bool) bool {
 	switch value := value.(type) {
 	case string, bool:
 		return true
-	case float32, float64, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+	case json.Number, float32, float64, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		_, ok := subagentJSONNumber(value)
 		return ok
 	case map[string]any:

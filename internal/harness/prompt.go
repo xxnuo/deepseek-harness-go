@@ -922,7 +922,7 @@ func presetToolNames(plugin string, config *yaml.Node) []string {
 		return []string{"list_agents"}
 	case "@deepseek-ai/dsh-experimental-tool-agent-team":
 		return []string{
-			"spawn_teammate", "send_message", "followup_task", "list_agents", "wait_agent", "interrupt_agent",
+			"spawn_teammate", "send_message", "list_agents", "wait_agent", "interrupt_agent",
 			"team_task_create", "team_task_list", "team_task_get", "team_task_update",
 		}
 	case "@deepseek-ai/dsh-tool-subagent":

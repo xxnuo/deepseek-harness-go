@@ -11,7 +11,7 @@ func descriptorEvent(data any) Event { return Event{Type: "subagent/descriptor",
 
 func TestFoldSubagentDescriptorUsesFirstDescriptor(t *testing.T) {
 	first := map[string]any{
-		"version": SubagentDescriptorVersion, "mode": "continuable", "provider": "spawn", "label": "first",
+		"version": json.Number("2"), "mode": "continuable", "provider": "spawn", "label": "first",
 		"agentProvider": "deepseek", "agentModel": "chat", "persona": "reviewer",
 		"toolFilter": map[string]any{"allow": []any{"read"}, "deny": []string{"bash"}},
 	}

@@ -53,7 +53,7 @@ func (e *Engine) prepareSubagentListing(ctx context.Context) (subagentListingRun
 	}
 	corpus := map[string]subagentListingRecord{}
 	if e.sessionStore != nil {
-		snapshots, err := e.sessionStore.ListSnapshots(ctx)
+		snapshots, err := e.sessionStore.List(ctx)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return subagentListingRuntime{}, ctxErr
@@ -227,7 +227,7 @@ func (e *Engine) resolveLiveSubagentCandidate(position subagentPositionedRecord,
 func (e *Engine) resolveColdSubagentCandidate(ctx context.Context, position subagentPositionedRecord, hasChildren bool) (subagentListingEntry, error) {
 	header := position.record.header
 	if e.projectionCache != nil {
-		if snapshot, ok := e.projectionCache.medium.identitySnapshot(header, e.sessionProjections.Signature()); ok {
+		if snapshot, ok := e.projectionCache.medium.identitySnapshot(e.sessionProjections, header, SessionLogOffset(header.SeedLength)); ok {
 			identity, valid := subagentIdentityFromProjection(snapshot.Values["subagent"])
 			if valid && identity != nil && identity.seq >= header.SeedLength {
 				return subagentChildListingEntry(position, identity, "inactive", hasChildren), nil
@@ -237,7 +237,7 @@ func (e *Engine) resolveColdSubagentCandidate(ctx context.Context, position suba
 	if err := ctx.Err(); err != nil {
 		return subagentListingEntry{}, err
 	}
-	inspection, err := e.sessionStore.Inspect(ctx, header.ID)
+	inspection, err := inspectStoredSession(ctx, e.sessionStore, header.ID, true)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return subagentListingEntry{}, ctxErr

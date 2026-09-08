@@ -18,20 +18,52 @@ type sessionQueryStoreStub struct {
 	list        func(context.Context) ([]SessionPersistenceSnapshot, error)
 }
 
-func (s *sessionQueryStoreStub) ListSnapshots(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
+type sessionQueryHandleStub struct {
+	testSessionHandleDefaults
+	inspection SessionInspection
+}
+
+func (h *sessionQueryHandleStub) ID() string { return h.inspection.Meta.ID }
+
+func (h *sessionQueryHandleStub) Header() SessionHeader { return h.inspection.Meta }
+
+func (h *sessionQueryHandleStub) InheritedEventCount() SessionLogOffset {
+	return h.inspection.InheritedEventCount
+}
+
+func (*sessionQueryHandleStub) Access() SessionAccess { return SessionAccessRead }
+
+func (h *sessionQueryHandleStub) Read(ctx context.Context, _ ...SessionLogOffset) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return cloneSessionEvents(h.inspection.Events), nil
+}
+
+func (h *sessionQueryHandleStub) Append(context.Context, []Event) error {
+	return &SessionReadOnlyError{SessionID: h.ID(), Operation: "append"}
+}
+
+func (s *sessionQueryStoreStub) List(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
 	if s.list != nil {
 		return s.list(ctx)
 	}
 	return append([]SessionPersistenceSnapshot(nil), s.snapshots...), nil
 }
 
-func (s *sessionQueryStoreStub) Inspect(_ context.Context, id string) (SessionInspection, error) {
+func (s *sessionQueryStoreStub) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if access != SessionAccessRead {
+		return nil, errors.New("session query stub only supports read handles")
+	}
 	s.inspectIDs = append(s.inspectIDs, id)
 	inspection, ok := s.inspections[id]
 	if !ok {
-		return SessionInspection{}, fmt.Errorf("session-not-found: %s", id)
+		return nil, &SessionPersistenceNotFoundError{SessionID: id}
 	}
-	return inspection, nil
+	return &sessionQueryHandleStub{inspection: inspection}, nil
 }
 
 func (s *sessionQueryStoreStub) Close() error { return nil }

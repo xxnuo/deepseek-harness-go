@@ -15,20 +15,48 @@ type blockingSessionReferenceStore struct {
 	started chan struct{}
 }
 
-func (s *blockingSessionReferenceStore) ListSnapshots(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
+type blockingSessionReferenceHandle struct {
+	testSessionHandleDefaults
+	store *blockingSessionReferenceStore
+}
+
+func (h *blockingSessionReferenceHandle) ID() string { return h.store.header.ID }
+
+func (h *blockingSessionReferenceHandle) Header() SessionHeader { return h.store.header }
+
+func (*blockingSessionReferenceHandle) Access() SessionAccess { return SessionAccessRead }
+
+func (h *blockingSessionReferenceHandle) Read(ctx context.Context, _ ...SessionLogOffset) ([]Event, error) {
+	select {
+	case h.store.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (h *blockingSessionReferenceHandle) Append(context.Context, []Event) error {
+	return &SessionReadOnlyError{SessionID: h.ID(), Operation: "append"}
+}
+
+func (s *blockingSessionReferenceStore) List(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return []SessionPersistenceSnapshot{{Header: s.header}}, nil
 }
 
-func (s *blockingSessionReferenceStore) Inspect(ctx context.Context, _ string) (SessionInspection, error) {
-	select {
-	case s.started <- struct{}{}:
-	default:
+func (s *blockingSessionReferenceStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	<-ctx.Done()
-	return SessionInspection{}, ctx.Err()
+	if id != s.header.ID {
+		return nil, &SessionPersistenceNotFoundError{SessionID: id}
+	}
+	if access != SessionAccessRead {
+		return nil, errors.New("session reference stub only supports read handles")
+	}
+	return &blockingSessionReferenceHandle{store: s}, nil
 }
 
 func (s *blockingSessionReferenceStore) Close() error { return nil }

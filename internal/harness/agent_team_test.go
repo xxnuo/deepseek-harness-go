@@ -63,7 +63,13 @@ type failingTeamFlushStore struct {
 	failure error
 }
 
-func (s *blockingTeamFlushStore) Flush(ctx context.Context, id string) error {
+type blockingTeamFlushHandle struct {
+	SessionHandle
+	store *blockingTeamFlushStore
+}
+
+func (h *blockingTeamFlushHandle) Flush(ctx context.Context) error {
+	s, id := h.store, h.ID()
 	s.mu.Lock()
 	selected := s.blockID != "" && id == s.blockID || s.except != "" && id != s.except
 	block := selected && !s.blocked
@@ -75,14 +81,31 @@ func (s *blockingTeamFlushStore) Flush(ctx context.Context, id string) error {
 	if block {
 		<-s.release
 	}
-	return s.SessionStore.(SessionPersistenceFlusher).Flush(ctx, id)
+	return h.SessionHandle.Flush(ctx)
 }
 
-func (s *blockingTeamFlushStore) Delete(ctx context.Context, id string) error {
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+func (s *blockingTeamFlushStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &blockingTeamFlushHandle{SessionHandle: handle, store: s}, nil
 }
 
-func (s *failingTeamFlushStore) Flush(ctx context.Context, id string) error {
+func (s *blockingTeamFlushStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, meta, inheritedEventCount))
+}
+
+func (s *blockingTeamFlushStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
+}
+
+type failingTeamFlushHandle struct {
+	SessionHandle
+	store *failingTeamFlushStore
+}
+
+func (h *failingTeamFlushHandle) Flush(ctx context.Context) error {
+	s, id := h.store, h.ID()
 	s.mu.Lock()
 	failure := error(nil)
 	if id == s.failID && s.failure != nil {
@@ -93,14 +116,25 @@ func (s *failingTeamFlushStore) Flush(ctx context.Context, id string) error {
 	if failure != nil {
 		return failure
 	}
-	return s.SessionStore.(SessionPersistenceFlusher).Flush(ctx, id)
+	return h.SessionHandle.Flush(ctx)
 }
 
-func (s *failingTeamFlushStore) Delete(ctx context.Context, id string) error {
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+func (s *failingTeamFlushStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &failingTeamFlushHandle{SessionHandle: handle, store: s}, nil
 }
 
-func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) error {
+func (s *failingTeamFlushStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, meta, inheritedEventCount))
+}
+
+func (s *failingTeamFlushStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
+}
+
+func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
 	if meta.ParentSession == "" {
 		return s.SessionStore.Create(ctx, meta, inheritedEventCount)
 	}
@@ -117,14 +151,6 @@ func (s *blockingTeamCreateStore) Create(ctx context.Context, meta SessionHeader
 	return s.SessionStore.Create(context.Background(), meta, inheritedEventCount)
 }
 
-func (s *blockingTeamCreateStore) Flush(ctx context.Context, id string) error {
-	return s.SessionStore.(SessionPersistenceFlusher).Flush(ctx, id)
-}
-
-func (s *blockingTeamCreateStore) Delete(ctx context.Context, id string) error {
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
-}
-
 func teamErrorCode(err error) string {
 	var target *TeamError
 	if errors.As(err, &target) {
@@ -139,12 +165,12 @@ func TestFoldTeamStrictLifecycleAndForeignForkEvents(t *testing.T) {
 			"version": 99, "teamId": "other", "member": map[string]any{"ignored": true},
 		}},
 		{Type: "team/member", Data: map[string]any{
-			"version": 1, "teamId": "root", "member": map[string]any{
+			"version": teamEventVersion, "teamId": "root", "member": map[string]any{
 				"id": "child", "name": "worker", "description": "work", "provider": "spawn", "context": "fresh", "phase": "provisioning",
 			},
 		}},
 		{Type: "team/member", Data: map[string]any{
-			"version": 1, "teamId": "root", "member": map[string]any{
+			"version": teamEventVersion, "teamId": "root", "member": map[string]any{
 				"id": "child", "name": "worker", "description": "work", "provider": "spawn", "context": "fresh", "phase": "active",
 			},
 		}},
@@ -157,7 +183,7 @@ func TestFoldTeamStrictLifecycleAndForeignForkEvents(t *testing.T) {
 		t.Fatalf("fold = %#v", fold)
 	}
 	bad := []Event{{Type: "team/member", Data: map[string]any{
-		"version": 1, "teamId": "root", "member": map[string]any{
+		"version": teamEventVersion, "teamId": "root", "member": map[string]any{
 			"id": "child", "name": "worker", "description": "work", "provider": "spawn", "context": "fresh", "phase": "active",
 		},
 	}}}
@@ -165,7 +191,7 @@ func TestFoldTeamStrictLifecycleAndForeignForkEvents(t *testing.T) {
 		t.Fatalf("active-first fold error = %v", err)
 	}
 	foreignMalformed := []Event{{Type: "team/task", Data: map[string]any{
-		"version": 1, "teamId": "other", "task": map[string]any{
+		"version": teamEventVersion, "teamId": "other", "task": map[string]any{
 			"id": "task-1", "revision": 1, "subject": 42, "description": "work", "status": "pending",
 			"blockedBy": []any{}, "writeScopes": []any{},
 		},
@@ -177,11 +203,11 @@ func TestFoldTeamStrictLifecycleAndForeignForkEvents(t *testing.T) {
 
 func TestFoldTeamStrictContentBlocksPreservePluginVariants(t *testing.T) {
 	message := map[string]any{
-		"id": "message-1", "senderId": "root", "senderName": "lead", "targetId": "child", "delivery": "quiet",
+		"id": "message-1", "senderId": "root", "senderName": "lead", "targetId": "child",
 		"content": []any{map[string]any{"type": "plugin/custom", "payload": map[string]any{"value": 1.0}}},
 	}
 	fold, err := FoldTeam("root", []Event{{Type: "team/message/queued", Data: map[string]any{
-		"version": 1, "teamId": "root", "message": message,
+		"version": teamEventVersion, "teamId": "root", "message": message,
 	}}})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +234,7 @@ func TestFoldTeamStrictContentBlocksPreservePluginVariants(t *testing.T) {
 		candidate := cloneJSON(message).(map[string]any)
 		candidate["content"] = []any{block}
 		if _, err := FoldTeam("root", []Event{{Type: "team/message/queued", Data: map[string]any{
-			"version": 1, "teamId": "root", "message": candidate,
+			"version": teamEventVersion, "teamId": "root", "message": candidate,
 		}}}); err == nil || !strings.Contains(err.Error(), "payload is invalid") {
 			t.Fatalf("malformed core block %#v error = %v", block, err)
 		}
@@ -217,7 +243,7 @@ func TestFoldTeamStrictContentBlocksPreservePluginVariants(t *testing.T) {
 
 func TestFoldTeamNumericTaskIDsUseJavaScriptNumberSemantics(t *testing.T) {
 	fold, err := FoldTeam("root", []Event{{Type: "team/task", Data: map[string]any{
-		"version": 1, "teamId": "root", "task": map[string]any{
+		"version": teamEventVersion, "teamId": "root", "task": map[string]any{
 			"id": "task-0007", "revision": 1, "subject": "work", "description": "work", "status": "pending",
 			"blockedBy": []any{}, "writeScopes": []any{},
 		},
@@ -226,7 +252,7 @@ func TestFoldTeamNumericTaskIDsUseJavaScriptNumberSemantics(t *testing.T) {
 		t.Fatalf("numeric allocation = %#v, %v", fold, err)
 	}
 	if _, err := FoldTeam("root", []Event{{Type: "team/task", Data: map[string]any{
-		"version": 1, "teamId": "root", "task": map[string]any{
+		"version": teamEventVersion, "teamId": "root", "task": map[string]any{
 			"id": "task-9007199254740992", "revision": 1, "subject": "work", "description": "work", "status": "pending",
 			"blockedBy": []any{}, "writeScopes": []any{},
 		},
@@ -259,7 +285,7 @@ func TestAgentTeamInvariantRejectsInvalidCandidateBeforeAppend(t *testing.T) {
 	before := len(session.Events)
 	session.mu.Unlock()
 	_, err = engine.appendEventWithMetadata(session, "team/member", map[string]any{
-		"version": 1, "teamId": id, "member": map[string]any{
+		"version": teamEventVersion, "teamId": id, "member": map[string]any{
 			"id": "child", "name": "worker", "description": "work", "provider": "spawn", "context": "fresh", "phase": "active",
 		},
 	}, nil, nil, false)
@@ -312,20 +338,20 @@ func TestTeamServiceRunsTeammateMailboxAndTaskBoard(t *testing.T) {
 		t.Fatalf("initial teammate history = %#v", childHistory)
 	}
 
-	quiet, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-		Target: "worker-one", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "quiet context"}},
+	firstMessage, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
+		Target: "worker-one", Content: []ContentBlock{{Type: "text", Text: "first update"}},
 	})
-	if err != nil || quiet.Status != "queued" {
-		t.Fatalf("quiet = %#v, %v", quiet, err)
+	if err != nil || firstMessage.Status != "accepted" {
+		t.Fatalf("first send = %#v, %v", firstMessage, err)
 	}
-	if status := sessionTeamStatus(mustSession(t, engine, child)); status != "inactive" {
-		t.Fatalf("quiet message woke child: %s", status)
+	if err := engine.WaitForIdle(waitCtx, child); err != nil {
+		t.Fatal(err)
 	}
-	followup, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-		Target: "worker-one", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "follow up"}},
+	secondMessage, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
+		Target: "worker-one", Content: []ContentBlock{{Type: "text", Text: "second update"}},
 	})
-	if err != nil || followup.Status != "accepted" {
-		t.Fatalf("followup = %#v, %v", followup, err)
+	if err != nil || secondMessage.Status != "accepted" {
+		t.Fatalf("second send = %#v, %v", secondMessage, err)
 	}
 	waitCtx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
@@ -337,11 +363,11 @@ func TestTeamServiceRunsTeammateMailboxAndTaskBoard(t *testing.T) {
 	for _, entry := range history {
 		encoded += contentValueText(entry.Event.Data)
 	}
-	if !strings.Contains(encoded, "quiet context") || !strings.Contains(encoded, "follow up") {
+	if !strings.Contains(encoded, "first update") || !strings.Contains(encoded, "second update") {
 		t.Fatalf("mailbox history = %q", encoded)
 	}
 	if _, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-		Target: "lead", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "self"}},
+		Target: "lead", Content: []ContentBlock{{Type: "text", Text: "self"}},
 	}); teamErrorCode(err) != "TEAM_SELF_MESSAGE" {
 		t.Fatalf("self-send error = %v", err)
 	}
@@ -564,7 +590,7 @@ func TestAgentTeamMessageLimitUsesJavaScriptJSONStringifyBytes(t *testing.T) {
 	content := []ContentBlock{{Type: "text", Text: strings.Repeat("<>&", 20)}}
 	fake := TeamMessageSnapshot{
 		ID: "team-message-00000000000000000000000000000000", SenderID: "root", SenderName: "lead", TargetID: "target",
-		Delivery: teamMessageQuiet, Content: content,
+		Content: content,
 	}
 	var encoded bytes.Buffer
 	encoder := json.NewEncoder(&encoded)
@@ -600,7 +626,7 @@ func TestAgentTeamMessageLimitUsesJavaScriptJSONStringifyBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := engine.AgentTeams().SendMessage(context.Background(), rootID, SendTeamMessageRequest{
-		Target: "target", Delivery: teamMessageQuiet, Content: content,
+		Target: "target", Content: content,
 	})
 	if err != nil || (result.Status != "accepted" && result.Status != "queued") {
 		t.Fatalf("JavaScript-sized message = %#v, %v", result, err)
@@ -655,7 +681,7 @@ func TestAgentTeamLiveTeammateAuthorityAndInterrupt(t *testing.T) {
 		t.Fatalf("live teammate claim = %#v, %v", task, err)
 	}
 	message, err := engine.AgentTeams().SendMessage(context.Background(), childID, SendTeamMessageRequest{
-		Target: "lead", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "live report"}},
+		Target: "lead", Content: []ContentBlock{{Type: "text", Text: "live report"}},
 	})
 	if err != nil || message.Status != "accepted" {
 		t.Fatalf("live teammate message = %#v, %v", message, err)
@@ -810,7 +836,7 @@ func TestAgentTeamMailboxAdmissionAndTargetOrdering(t *testing.T) {
 		firstDone := make(chan error, 1)
 		go func() {
 			_, err := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-				Target: "capacity-worker", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "first"}},
+				Target: "capacity-worker", Content: []ContentBlock{{Type: "text", Text: "first"}},
 			})
 			firstDone <- err
 		}()
@@ -820,7 +846,7 @@ func TestAgentTeamMailboxAdmissionAndTargetOrdering(t *testing.T) {
 			t.Fatal("first delivery did not reach target durability")
 		}
 		if _, err := engine.AgentTeams().SendMessage(t.Context(), root, SendTeamMessageRequest{
-			Target: "capacity-worker", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "second"}},
+			Target: "capacity-worker", Content: []ContentBlock{{Type: "text", Text: "second"}},
 		}); teamErrorCode(err) != "TEAM_MAILBOX_FULL" {
 			t.Fatalf("blocked-delivery capacity error = %v", err)
 		}
@@ -876,7 +902,7 @@ func TestAgentTeamMailboxAdmissionAndTargetOrdering(t *testing.T) {
 		alphaDone := make(chan error, 1)
 		go func() {
 			_, sendErr := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-				Target: "alpha-target", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "alpha work"}},
+				Target: "alpha-target", Content: []ContentBlock{{Type: "text", Text: "alpha work"}},
 			})
 			alphaDone <- sendErr
 		}()
@@ -888,7 +914,7 @@ func TestAgentTeamMailboxAdmissionAndTargetOrdering(t *testing.T) {
 		betaDone := make(chan error, 1)
 		go func() {
 			value, sendErr := engine.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-				Target: "beta-target", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "beta work"}},
+				Target: "beta-target", Content: []ContentBlock{{Type: "text", Text: "beta work"}},
 			})
 			if sendErr == nil && value.Status != "accepted" {
 				sendErr = fmt.Errorf("beta status = %s", value.Status)
@@ -951,7 +977,7 @@ func TestAgentTeamMailboxTargetFlushFailureRecoversWithoutDuplicate(t *testing.T
 	store.failID, store.failure = spawned.Member.ID, sentinel
 	store.mu.Unlock()
 	queued, err := engine.AgentTeams().SendMessage(t.Context(), root, SendTeamMessageRequest{
-		Target: "flush-worker", Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "recover exactly once"}},
+		Target: "flush-worker", Content: []ContentBlock{{Type: "text", Text: "recover exactly once"}},
 	})
 	if err != nil || queued.Status != "queued" {
 		t.Fatalf("failed target flush result = %#v, %v", queued, err)
@@ -1145,12 +1171,15 @@ func TestAgentTeamToolsAreCompleteAndExecutable(t *testing.T) {
 		registered[schema.Name] = true
 	}
 	for _, name := range []string{
-		"spawn_teammate", "send_message", "followup_task", "list_agents", "wait_agent", "interrupt_agent",
+		"spawn_teammate", "send_message", "list_agents", "wait_agent", "interrupt_agent",
 		"team_task_create", "team_task_list", "team_task_get", "team_task_update",
 	} {
 		if !registered[name] {
 			t.Fatalf("missing Team tool %q", name)
 		}
+	}
+	if registered["followup_task"] {
+		t.Fatal("legacy followup_task remained registered")
 	}
 	waitOutput := engine.tools["wait_agent"].Schema.Output
 	properties, _ := waitOutput["properties"].(map[string]any)
@@ -1228,14 +1257,17 @@ func TestAgentTeamMailboxRecoversAcrossJSONL(t *testing.T) {
 			t.Fatal(err)
 		}
 		queued, err := second.AgentTeams().SendMessage(context.Background(), root, SendTeamMessageRequest{
-			Target: "persisted-worker", Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "recover me"}},
+			Target: "persisted-worker", Content: []ContentBlock{{Type: "text", Text: "recover me"}},
 		})
-		if err != nil || queued.Status != "queued" {
-			t.Fatalf("queued = %#v, %v", queued, err)
+		if err != nil || queued.Status != "accepted" {
+			t.Fatalf("cold-resume send = %#v, %v", queued, err)
 		}
-		if _, err := second.CreateSession(context.Background(), dataDir, child, ""); err != nil {
+		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := second.WaitForIdle(resumeCtx, child); err != nil {
+			resumeCancel()
 			t.Fatal(err)
 		}
+		resumeCancel()
 		rootSession := mustSession(t, second, root)
 		rootSession.mu.Lock()
 		rootEvents := append([]Event(nil), rootSession.Events...)
@@ -1253,6 +1285,70 @@ func TestAgentTeamMailboxRecoversAcrossJSONL(t *testing.T) {
 	})
 }
 
+func TestAgentTeamColdResumePreservesDurableMailboxOrder(t *testing.T) {
+	engine := newAgentTeamEngine(t, t.TempDir())
+	defer engine.Close()
+	rootID, err := engine.CreateSession(t.Context(), engine.Config().Workspace, "ordered-mailbox-root", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawned, err := engine.AgentTeams().SpawnTeammate(t.Context(), rootID, SpawnTeammateRequest{
+		Name: "ordered-worker", Description: "ordered worker", Prompt: []ContentBlock{{Type: "text", Text: "initial"}},
+		Context: "fresh", Provider: "spawn",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	if err := engine.WaitForIdle(waitCtx, spawned.Member.ID); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	waitForModelSubagentDetached(t, engine, spawned.Member.ID)
+
+	root := mustSession(t, engine, rootID)
+	earlier := TeamMessageSnapshot{
+		ID: "earlier-message", SenderID: rootID, SenderName: teamLeadName, TargetID: spawned.Member.ID,
+		Content: []ContentBlock{{Type: "text", Text: "earlier steer"}},
+	}
+	if err := engine.agentTeams.append(root, "team/message/queued", teamMessageQueuedEvent{
+		Version: teamEventVersion, TeamID: rootID, Message: earlier,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	later, err := engine.AgentTeams().SendMessage(t.Context(), rootID, SendTeamMessageRequest{
+		Target: "ordered-worker", Content: []ContentBlock{{Type: "text", Text: "later steer"}},
+	})
+	if err != nil || later.Status != "accepted" {
+		t.Fatalf("later send = %#v, %v", later, err)
+	}
+
+	target := mustSession(t, engine, spawned.Member.ID)
+	target.mu.Lock()
+	received := []string{}
+	for _, event := range target.Events {
+		if event.Type != "agent/inbox/spliced" {
+			continue
+		}
+		data, _ := event.Data.(map[string]any)
+		inserted, _ := data["inserted"].([]any)
+		for _, raw := range inserted {
+			message, _ := raw.(map[string]any)
+			source, _ := message["source"].(map[string]any)
+			if source["kind"] == "team-message" {
+				if id, _ := source["messageId"].(string); id != "" {
+					received = append(received, id)
+				}
+			}
+		}
+	}
+	target.mu.Unlock()
+	if want := []string{earlier.ID, later.MessageID}; !reflect.DeepEqual(received, want) {
+		t.Fatalf("cold-resume mailbox order = %v, want %v", received, want)
+	}
+}
+
 func TestAgentTeamAcknowledgesTargetSideReceipt(t *testing.T) {
 	engine := newAgentTeamEngine(t, t.TempDir())
 	defer engine.Close()
@@ -1263,14 +1359,14 @@ func TestAgentTeamAcknowledgesTargetSideReceipt(t *testing.T) {
 	root := mustSession(t, engine, rootID)
 	message := TeamMessageSnapshot{
 		ID: "receipt-message", SenderID: "sender", SenderName: "sender", TargetID: rootID,
-		Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "already recorded"}},
+		Content: []ContentBlock{{Type: "text", Text: "already recorded"}},
 	}
 	if _, err := engine.appendEventWithMetadata(root, "team/message/queued", teamMessageQueuedEvent{
 		Version: teamEventVersion, TeamID: rootID, Message: message,
 	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.sessionStore.(SessionPersistenceFlusher).Flush(context.Background(), rootID); err != nil {
+	if err := engine.flushSessionPersistence(context.Background(), rootID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := engine.appendEventWithMetadata(root, "user/message", map[string]any{
@@ -1324,7 +1420,7 @@ func TestAgentTeamDispatchRechecksLiveReceiptAfterFlush(t *testing.T) {
 	root := mustSession(t, engine, rootID)
 	message := TeamMessageSnapshot{
 		ID: "receipt-race-message", SenderID: "peer", SenderName: "peer", TargetID: rootID,
-		Delivery: teamMessageQuiet, Content: []ContentBlock{{Type: "text", Text: "remove during flush"}},
+		Content: []ContentBlock{{Type: "text", Text: "remove during flush"}},
 	}
 	if err := engine.agentTeams.append(root, "team/message/queued", teamMessageQueuedEvent{
 		Version: teamEventVersion, TeamID: rootID, Message: message,
@@ -1353,7 +1449,7 @@ func TestAgentTeamDispatchRechecksLiveReceiptAfterFlush(t *testing.T) {
 	}
 	done := make(chan dispatchResult, 1)
 	go func() {
-		accepted, err := engine.agentTeams.dispatchLocked(context.Background(), root, message, false)
+		accepted, err := engine.agentTeams.dispatchLocked(context.Background(), root, message)
 		done <- dispatchResult{accepted: accepted, err: err}
 	}()
 	select {
@@ -1450,14 +1546,14 @@ func TestAgentTeamCloseAwaitsAdmittedReceiptAcknowledgement(t *testing.T) {
 	root := mustSession(t, engine, rootID)
 	message := TeamMessageSnapshot{
 		ID: "dispose-receipt-message", SenderID: "sender", SenderName: "sender", TargetID: rootID,
-		Delivery: teamMessageWakeup, Content: []ContentBlock{{Type: "text", Text: "await acknowledgement"}},
+		Content: []ContentBlock{{Type: "text", Text: "await acknowledgement"}},
 	}
 	if _, err := engine.appendEventWithMetadata(root, "team/message/queued", teamMessageQueuedEvent{
 		Version: teamEventVersion, TeamID: rootID, Message: message,
 	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Flush(context.Background(), rootID); err != nil {
+	if err := engine.flushSessionPersistence(context.Background(), rootID); err != nil {
 		t.Fatal(err)
 	}
 	store.mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -262,7 +263,33 @@ type policyAppendFailOnceSessionStore struct {
 	deleted []string
 }
 
-func (s *policyAppendFailOnceSessionStore) Append(ctx context.Context, id string, events []Event) error {
+type rollbackTrackingSessionHandle struct {
+	SessionHandle
+	appendErr error
+	closed    func(string)
+	once      sync.Once
+}
+
+func (h *rollbackTrackingSessionHandle) Append(ctx context.Context, events []Event) error {
+	if h.appendErr != nil {
+		return h.appendErr
+	}
+	return h.SessionHandle.Append(ctx, events)
+}
+
+func (h *rollbackTrackingSessionHandle) Close() error {
+	h.once.Do(func() { h.closed(h.ID()) })
+	return h.SessionHandle.Close()
+}
+
+type policyAppendFailOnceSessionHandle struct {
+	SessionHandle
+	store *policyAppendFailOnceSessionStore
+	once  sync.Once
+}
+
+func (h *policyAppendFailOnceSessionHandle) Append(ctx context.Context, events []Event) error {
+	s := h.store
 	if s.fail {
 		for _, event := range events {
 			if event.Type == subagentModelSelectionPolicyEvent {
@@ -271,21 +298,31 @@ func (s *policyAppendFailOnceSessionStore) Append(ctx context.Context, id string
 			}
 		}
 	}
-	return s.SessionStore.Append(ctx, id, events)
+	return h.SessionHandle.Append(ctx, events)
 }
 
-func (s *policyAppendFailOnceSessionStore) Delete(ctx context.Context, id string) error {
-	s.deleted = append(s.deleted, id)
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+func (h *policyAppendFailOnceSessionHandle) Close() error {
+	h.once.Do(func() { h.store.deleted = append(h.store.deleted, h.ID()) })
+	return h.SessionHandle.Close()
 }
 
-func (s *rollbackTrackingSessionStore) Append(context.Context, string, []Event) error {
-	return s.appendErr
+func (s *policyAppendFailOnceSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	handle, err := s.SessionStore.Create(ctx, meta, inheritedEventCount)
+	if err != nil {
+		return nil, err
+	}
+	return &policyAppendFailOnceSessionHandle{SessionHandle: handle, store: s}, nil
 }
 
-func (s *rollbackTrackingSessionStore) Delete(ctx context.Context, id string) error {
-	s.deleted = append(s.deleted, id)
-	return s.SessionStore.(sessionStoreCreateRollback).Delete(ctx, id)
+func (s *rollbackTrackingSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	handle, err := s.SessionStore.Create(ctx, meta, inheritedEventCount)
+	if err != nil {
+		return nil, err
+	}
+	return &rollbackTrackingSessionHandle{
+		SessionHandle: handle, appendErr: s.appendErr,
+		closed: func(id string) { s.deleted = append(s.deleted, id) },
+	}, nil
 }
 
 func TestDynamicCordisEnterRollsBackFailedPersistentCreate(t *testing.T) {
@@ -325,9 +362,11 @@ return {
 	if !reflect.DeepEqual(store.deleted, []string{"rollback-child"}) {
 		t.Fatalf("rolled back ids = %#v", store.deleted)
 	}
-	if err := backend.Create(t.Context(), SessionHeader{Version: SessionFormatVersion, ID: "rollback-child", CreatedAt: 1}, 0); err != nil {
+	recreated, err := backend.Create(t.Context(), SessionHeader{Version: SessionFormatVersion, ID: "rollback-child", CreatedAt: 1}, 0)
+	if err != nil {
 		t.Fatalf("persistence registration remained: %v", err)
 	}
+	_ = recreated.Close()
 }
 
 func TestDynamicCordisEnterRollsBackFailedModelSelectionPolicy(t *testing.T) {
@@ -401,7 +440,7 @@ func TestDynamicCordisEnterRollsBackFailedModelSelectionPolicy(t *testing.T) {
 	attached := prepared.session.attached
 	enteredStore := prepared.session.store
 	prepared.session.mu.Unlock()
-	if !attached || enteredStore != store || !prepared.entered {
+	if !attached || enteredStore == nil || enteredStore.Access() != SessionAccessWrite || !prepared.entered {
 		t.Fatalf("retry enter state: attached=%v store=%v entered=%v", attached, enteredStore, prepared.entered)
 	}
 	e.dynamicCordisDetachPrepared(run, prepared)
@@ -440,10 +479,14 @@ func TestDynamicCordisPersistenceRestoreReusesArtifactAndQueues(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := initial.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
+			writer, err := initial.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength))
+			if err != nil {
 				t.Fatal(err)
 			}
-			if err := initial.Append(t.Context(), id, events); err != nil {
+			if err := writer.Append(t.Context(), events); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
 				t.Fatal(err)
 			}
 			if err := initial.Close(); err != nil {
@@ -526,7 +569,7 @@ return {
 			if _, err := e.getSession(id); err == nil {
 				t.Fatal("detached restored session remained live")
 			}
-			inspection, err := store.Load(t.Context(), id)
+			inspection, err := inspectStoredSession(t.Context(), store, id, true)
 			if err != nil {
 				t.Fatalf("artifact was removed on detach: %v", err)
 			}
@@ -543,7 +586,7 @@ return {
 			}) {
 				t.Fatalf("persisted agent = %#v", resumedValue)
 			}
-			inspection, err = store.Load(t.Context(), id)
+			inspection, err = inspectStoredSession(t.Context(), store, id, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -554,29 +597,34 @@ return {
 	}
 }
 
-func TestJSONLSessionStoreDeleteRemovesMaterializedSession(t *testing.T) {
+func TestJSONLSessionHandleClosePreservesMaterializedSession(t *testing.T) {
 	store, err := NewJSONLSessionStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	meta := SessionHeader{Version: SessionFormatVersion, ID: "delete-materialized", CreatedAt: 1}
-	if err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
+	meta := SessionHeader{Version: SessionFormatVersion, ID: "close-materialized", CreatedAt: 1}
+	writer, err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Append(t.Context(), meta.ID, []Event{{Type: "plugin/test", Seq: 0, Time: 1, Data: nil, Ignorable: true}}); err != nil {
+	if err := writer.Append(t.Context(), []Event{{Type: "plugin/test", Seq: 0, Time: 1, Data: nil, Ignorable: true}}); err != nil {
 		t.Fatal(err)
 	}
-	location, _ := store.Locate(meta)
-	if err := store.Delete(t.Context(), meta.ID); err != nil {
+	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(location.Path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("materialized artifact remained: %v", err)
+	if _, err := os.Stat(store.pathFor(meta)); err != nil {
+		t.Fatalf("materialized artifact disappeared: %v", err)
 	}
-	if err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err != nil {
-		t.Fatalf("session remained registered: %v", err)
+	if _, err := store.Create(t.Context(), meta, SessionLogOffset(meta.SeedLength)); err == nil {
+		t.Fatal("duplicate create succeeded after materialized handle close")
 	}
+	reopened, err := store.Open(t.Context(), meta.ID, SessionAccessWrite)
+	if err != nil {
+		t.Fatalf("write ownership was not released: %v", err)
+	}
+	_ = reopened.Close()
 }
 
 func TestDynamicCordisAnnounceFailureRollsBackAndDisposes(t *testing.T) {

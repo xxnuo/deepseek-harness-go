@@ -38,6 +38,19 @@ type ProjectionChange struct {
 	Seq   int
 }
 
+type ProjectionCheckpointRow struct {
+	Version int `json:"ver"`
+	Seq     int `json:"seq"`
+	Value   any `json:"val"`
+}
+
+type ProjectionCheckpoint map[string]ProjectionCheckpointRow
+
+type ProjectionRestore struct {
+	Snapshot   ProjectionSnapshot
+	Checkpoint ProjectionCheckpoint
+}
+
 // ProjectionChangeListener observes client-visible projection transitions.
 type ProjectionChangeListener func(session *Session, change ProjectionChange)
 
@@ -53,6 +66,8 @@ type projectionRegistration struct {
 	definition ProjectionDefinition
 	cells      map[*Session]*projectionCell
 	refs       int
+	stateType  reflect.Type
+	nullable   bool
 }
 
 // SessionProjectionRegistry owns projection definitions and their per-session
@@ -125,7 +140,8 @@ func (r *SessionProjectionRegistry) register(definition ProjectionDefinition, ru
 }
 
 func (r *SessionProjectionRegistry) registerNow(definition ProjectionDefinition, runtimeReady bool) (func(), error) {
-	if err := validateProjectionDefinition(definition); err != nil {
+	initial, err := validateProjectionDefinition(definition)
+	if err != nil {
 		return nil, err
 	}
 	r.mu.Lock()
@@ -143,6 +159,8 @@ func (r *SessionProjectionRegistry) registerNow(definition ProjectionDefinition,
 			definition: definition,
 			cells:      map[*Session]*projectionCell{},
 			refs:       1,
+			stateType:  reflect.TypeOf(initial),
+			nullable:   projectionStateNullable(initial),
 		}
 		r.order = append(r.order, definition.Key)
 		if definition.dynamicRuntime {
@@ -179,33 +197,46 @@ func (r *SessionProjectionRegistry) registerNow(definition ProjectionDefinition,
 	}, nil
 }
 
-func validateProjectionDefinition(definition ProjectionDefinition) error {
+func validateProjectionDefinition(definition ProjectionDefinition) (any, error) {
 	if definition.Key == "" {
-		return errors.New("session projection key is required")
+		return nil, errors.New("session projection key is required")
 	}
 	if definition.StateVersion < 0 {
-		return fmt.Errorf("session projection %q stateVersion must be non-negative", definition.Key)
+		return nil, fmt.Errorf("session projection %q stateVersion must be non-negative", definition.Key)
 	}
 	if definition.Init == nil && definition.InitWithHeader == nil || definition.Apply == nil {
-		return fmt.Errorf("session projection %q requires init and apply", definition.Key)
+		return nil, fmt.Errorf("session projection %q requires init and apply", definition.Key)
 	}
 	state, err := callProjectionInit(definition, SessionHeader{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateProjectionJSON(definition.Key+" state", state); err != nil {
-		return err
+		return nil, err
 	}
 	if definition.View != nil {
 		value, err := callProjectionView(definition, state)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := validateProjectionJSON(definition.Key+" view", value); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return state, nil
+}
+
+func projectionStateNullable(value any) bool {
+	if value == nil {
+		return true
+	}
+	state := reflect.ValueOf(value)
+	switch state.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return state.IsNil()
+	default:
+		return false
+	}
 }
 
 func validateProjectionJSON(name string, value any) error {
@@ -321,6 +352,301 @@ func (r *SessionProjectionRegistry) snapshotForCache(session *Session) (Projecti
 		return ProjectionSnapshot{}, "", err
 	}
 	return snapshot, composition, snapshotErr
+}
+
+func (r *SessionProjectionRegistry) Checkpoint(session *Session) (ProjectionCheckpoint, error) {
+	if session == nil {
+		return nil, errors.New("session projection checkpoint requires a session")
+	}
+	var rows ProjectionCheckpoint
+	err := r.execute(false, func() error {
+		session.mu.Lock()
+		events := append([]Event(nil), session.Events...)
+		session.mu.Unlock()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		rows = make(ProjectionCheckpoint, len(r.registrations))
+		for _, key := range r.order {
+			registration := r.registrations[key]
+			if registration == nil {
+				continue
+			}
+			cell, err := r.cellForLocked(registration, session, events)
+			if err != nil {
+				return err
+			}
+			value, err := cloneProjectionValue(cell.state)
+			if err != nil {
+				return fmt.Errorf("session projection %q checkpoint state: %w", key, err)
+			}
+			rows[key] = ProjectionCheckpointRow{Version: registration.definition.StateVersion, Seq: cell.observedSeq, Value: value}
+		}
+		return nil
+	})
+	return rows, err
+}
+
+func (r *SessionProjectionRegistry) RestoreFloor(checkpoint ProjectionCheckpoint) (SessionLogOffset, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var floor int
+	found := false
+	for _, key := range r.order {
+		registration := r.registrations[key]
+		if registration == nil {
+			continue
+		}
+		need := 0
+		if row, ok := checkpoint[key]; ok && row.Version == registration.definition.StateVersion {
+			need = max(row.Seq+1, 0)
+		}
+		if !found || need < floor {
+			floor = need
+		}
+		found = true
+	}
+	if !found {
+		return 0, false
+	}
+	return SessionLogOffset(max(floor-1, 0)), true
+}
+
+func (r *SessionProjectionRegistry) ViewCheckpoint(checkpoint ProjectionCheckpoint, keys ...string) (map[string]any, error) {
+	selected := map[string]bool(nil)
+	if len(keys) > 0 {
+		selected = make(map[string]bool, len(keys))
+		for _, key := range keys {
+			selected[key] = true
+		}
+	}
+	var values map[string]any
+	err := r.execute(false, func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		values = map[string]any{}
+		for _, key := range r.order {
+			registration := r.registrations[key]
+			if registration == nil || registration.definition.View == nil || selected != nil && !selected[key] {
+				continue
+			}
+			row, ok := checkpoint[key]
+			if !ok || row.Version != registration.definition.StateVersion {
+				continue
+			}
+			state, err := decodeProjectionState(registration, row.Value)
+			if err != nil {
+				continue
+			}
+			value, err := callProjectionView(registration.definition, state)
+			if err != nil {
+				return err
+			}
+			values[key] = value
+		}
+		return nil
+	})
+	return values, err
+}
+
+func (r *SessionProjectionRegistry) Restore(
+	checkpoint ProjectionCheckpoint,
+	events []Event,
+	baseSeq SessionLogOffset,
+	header SessionHeader,
+	inheritedEventCount SessionLogOffset,
+) (ProjectionRestore, error) {
+	if baseSeq < 0 {
+		return ProjectionRestore{}, errors.New("session projection restore baseSeq must be non-negative")
+	}
+	cloned := append([]Event(nil), events...)
+	var restored ProjectionRestore
+	err := r.execute(false, func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		var err error
+		restored, err = r.restoreNow(checkpoint, cloned, baseSeq, header, inheritedEventCount)
+		return err
+	})
+	return restored, err
+}
+
+func (r *SessionProjectionRegistry) restoreNow(
+	checkpoint ProjectionCheckpoint,
+	events []Event,
+	baseSeq SessionLogOffset,
+	header SessionHeader,
+	inheritedEventCount SessionLogOffset,
+) (ProjectionRestore, error) {
+	header.SeedLength = int(inheritedEventCount)
+	endSeq := int(baseSeq) - 1
+	if len(events) > 0 {
+		endSeq = int(events[len(events)-1].Seq)
+	}
+	beforeBase := int(baseSeq) - 1
+	values := map[string]any{}
+	refreshed := make(ProjectionCheckpoint, len(r.registrations))
+	for _, key := range r.order {
+		registration := r.registrations[key]
+		if registration == nil {
+			continue
+		}
+		row, hasRow := checkpoint[key]
+		usable := hasRow && row.Version == registration.definition.StateVersion && row.Seq >= beforeBase && row.Seq <= endSeq
+		if !usable && baseSeq > 0 {
+			return ProjectionRestore{}, fmt.Errorf("session projection %q cannot restore from seq %d: its checkpoint row is missing, version-mismatched, or beyond the supplied log end; re-read from seq 0", key, baseSeq)
+		}
+		var state any
+		var err error
+		from := beforeBase
+		if usable {
+			state, err = decodeProjectionState(registration, row.Value)
+			from = row.Seq
+		} else {
+			state, err = callProjectionInit(registration.definition, header)
+		}
+		if err != nil {
+			return ProjectionRestore{}, err
+		}
+		for index := from - int(baseSeq) + 1; index < len(events); index++ {
+			if index < 0 {
+				continue
+			}
+			expectedSeq := int(baseSeq) + index
+			event := events[index]
+			if int(event.Seq) != expectedSeq {
+				return ProjectionRestore{}, fmt.Errorf("session projection %q cannot restore across missing seq %d", key, expectedSeq)
+			}
+			result, err := callProjectionApply(registration.definition, state, event)
+			if err != nil {
+				return ProjectionRestore{}, err
+			}
+			state = result.State
+		}
+		if registration.definition.View != nil {
+			value, err := callProjectionView(registration.definition, state)
+			if err != nil {
+				return ProjectionRestore{}, err
+			}
+			values[key] = value
+		}
+		detached, err := cloneProjectionValue(state)
+		if err != nil {
+			return ProjectionRestore{}, err
+		}
+		refreshed[key] = ProjectionCheckpointRow{Version: registration.definition.StateVersion, Seq: endSeq, Value: detached}
+	}
+	return ProjectionRestore{
+		Snapshot:   ProjectionSnapshot{AsOfSeq: endSeq, Values: values},
+		Checkpoint: refreshed,
+	}, nil
+}
+
+func (r *SessionProjectionRegistry) Hydrate(session *Session, checkpoint ProjectionCheckpoint, events []Event, baseSeq SessionLogOffset) (ProjectionSnapshot, error) {
+	if session == nil {
+		return ProjectionSnapshot{}, errors.New("session projection hydrate requires a session")
+	}
+	cloned := append([]Event(nil), events...)
+	var snapshot ProjectionSnapshot
+	err := r.execute(false, func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		endSeq := int(baseSeq) - 1
+		if len(cloned) > 0 {
+			endSeq = int(cloned[len(cloned)-1].Seq)
+		}
+		complete := true
+		for _, registration := range r.registrations {
+			if registration.cells[session] == nil || registration.cells[session].observedSeq != endSeq {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			values := map[string]any{}
+			for _, key := range r.order {
+				registration := r.registrations[key]
+				if registration == nil || registration.definition.View == nil {
+					continue
+				}
+				value, err := callProjectionView(registration.definition, registration.cells[session].state)
+				if err != nil {
+					return err
+				}
+				values[key] = value
+			}
+			snapshot = ProjectionSnapshot{AsOfSeq: endSeq, Values: values}
+			return nil
+		}
+		restored, err := r.restoreNow(checkpoint, cloned, baseSeq, session.Header, session.InheritedEventCount)
+		if err != nil {
+			return err
+		}
+		for key, row := range restored.Checkpoint {
+			registration := r.registrations[key]
+			if registration == nil {
+				continue
+			}
+			current := registration.cells[session]
+			if current != nil && current.observedSeq > row.Seq {
+				continue
+			}
+			state, err := decodeProjectionState(registration, row.Value)
+			if err != nil {
+				return err
+			}
+			registration.cells[session] = &projectionCell{state: state, observedSeq: row.Seq}
+		}
+		snapshot = restored.Snapshot
+		return nil
+	})
+	return snapshot, err
+}
+
+func cloneProjectionValue(value any) (any, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	target := reflect.New(reflect.TypeOf(value))
+	if err := json.Unmarshal(data, target.Interface()); err != nil {
+		return nil, err
+	}
+	return target.Elem().Interface(), nil
+}
+
+func decodeProjectionState(registration *projectionRegistration, value any) (any, error) {
+	if value == nil {
+		if registration.nullable {
+			if registration.stateType == nil {
+				return nil, nil
+			}
+			return reflect.Zero(registration.stateType).Interface(), nil
+		}
+		return nil, fmt.Errorf("session projection %q checkpoint state is null", registration.definition.Key)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	if registration.stateType == nil {
+		var decoded any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	}
+	target := reflect.New(registration.stateType)
+	if err := json.Unmarshal(data, target.Interface()); err != nil {
+		return nil, fmt.Errorf("session projection %q checkpoint state: %w", registration.definition.Key, err)
+	}
+	state := target.Elem().Interface()
+	if err := validateProjectionJSON(registration.definition.Key+" checkpoint state", state); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
 func (r *SessionProjectionRegistry) snapshotNow(session *Session, events []Event) (ProjectionSnapshot, error) {

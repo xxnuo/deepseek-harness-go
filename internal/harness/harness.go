@@ -902,7 +902,8 @@ type Session struct {
 	planIntent                     *planModeIntent
 	scheduleMu                     sync.Mutex
 	mu                             sync.Mutex
-	store                          SessionStore
+	store                          SessionHandle
+	storedEventCount               int
 	invariants                     *InvariantRegistry
 }
 
@@ -1427,12 +1428,6 @@ func New(opts ...Option) (*Engine, error) {
 		}
 		e.sessionStore = store
 		e.cfg.SessionStore = store
-		if e.agentTeams != nil {
-			if _, ok := store.(SessionPersistenceFlusher); !ok {
-				_ = e.Close()
-				return nil, &TeamError{Code: "TEAM_PERSISTENCE_UNAVAILABLE", Message: "Agent Teams requires durable session flush support"}
-			}
-		}
 		if cfg.SessionProjectionCache != nil {
 			e.projectionCache, err = newSessionProjectionCache(cfg.DataDir, *cfg.SessionProjectionCache, e.sessionProjections)
 			if err != nil {
@@ -2134,7 +2129,7 @@ var shippedToolNames = map[string]bool{
 	"job_output":         true, "job_list": true, "job_kill": true,
 	"skill": true, "get_goal": true, "create_goal": true, "update_goal": true,
 	"send_message": true, "interrupt_agent": true, "list_agents": true,
-	"spawn_teammate": true, "followup_task": true, "wait_agent": true,
+	"spawn_teammate": true, "wait_agent": true,
 	"team_task_create": true, "team_task_list": true, "team_task_get": true, "team_task_update": true,
 	"subagent": true, "subagent_fork": true, "ask_user_question": true, "exit_plan_mode": true,
 	"subagent_codex": true, "subagent_claude_code": true,
@@ -2436,12 +2431,12 @@ func newID(prefix string) string {
 }
 
 func (e *Engine) load() error {
-	headers, err := e.sessionStore.List(context.Background())
+	snapshots, err := e.sessionStore.List(context.Background())
 	if err != nil {
 		return err
 	}
-	for _, header := range headers {
-		inspection, err := e.sessionStore.Load(context.Background(), header.ID)
+	for _, snapshot := range snapshots {
+		inspection, err := inspectStoredSession(context.Background(), e.sessionStore, snapshot.Header.ID, true)
 		if err != nil {
 			continue
 		}
@@ -2453,13 +2448,18 @@ func (e *Engine) load() error {
 			Header: inspection.Meta, Title: sessionTitleFromEvents(inspection.Events),
 			Events: append([]Event(nil), inspection.Events...), InheritedEventCount: inspection.InheritedEventCount,
 			firstLiveSeq: len(inspection.Events),
-			pending:      pending, steering: steering, published: true, store: e.sessionStore, invariants: e.invariants,
+			pending:      pending, steering: steering, published: true, invariants: e.invariants,
 		}
 		if err := e.invariants.ValidateSession(s.Header, s.Events); err != nil {
 			return fmt.Errorf("session %q: %w", s.Header.ID, err)
 		}
 		if title, ok := FoldSessionTitle(s.Events); ok {
 			s.Title = NormalizeSessionTitle(title.Title, e.cfg.SessionTitle.MaxTitleBytes)
+		}
+		if e.projectionCache != nil {
+			if _, hydrateErr := e.projectionCache.hydratePrepared(s, s.Events); hydrateErr != nil {
+				log.Printf("deepseek-harness: hydrate cached projections for %q: %v", s.Header.ID, hydrateErr)
+			}
 		}
 		s.Model = ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}
 		if selection, ok := latestLoggedModel(s.Events); ok {
@@ -2808,6 +2808,40 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 			return "", fmt.Errorf("session-conflict: session %q metadata does not match", id)
 		}
 		wasAttached := existing.attached
+		if !wasAttached && e.sessionStore != nil {
+			handle, inspection, openErr := openStoredSessionForWrite(ctx, e.sessionStore, id)
+			if openErr != nil {
+				existing.mu.Unlock()
+				return "", openErr
+			}
+			if !sessionQueryHeadersCompatible(existing.Header, inspection.Meta) {
+				_ = handle.Close()
+				existing.mu.Unlock()
+				return "", fmt.Errorf("session-conflict: persisted header for session %q changed", id)
+			}
+			pending, steering, restoreErr := restorePromptQueues(inspection.Events)
+			if restoreErr != nil {
+				_ = handle.Close()
+				existing.mu.Unlock()
+				return "", restoreErr
+			}
+			if validateErr := e.invariants.ValidateSession(inspection.Meta, inspection.Events); validateErr != nil {
+				_ = handle.Close()
+				existing.mu.Unlock()
+				return "", fmt.Errorf("session %q: %w", id, validateErr)
+			}
+			existing.Header = inspection.Meta
+			existing.InheritedEventCount = inspection.InheritedEventCount
+			existing.Events = cloneSessionEvents(inspection.Events)
+			existing.firstLiveSeq = len(inspection.Events)
+			existing.storedEventCount = len(inspection.Events)
+			existing.pending, existing.steering = pending, steering
+			existing.Title = sessionTitleFromEvents(inspection.Events)
+			existing.store = handle
+			if selection, ok := latestLoggedModel(inspection.Events); ok {
+				existing.Model = selection
+			}
+		}
 		attachSessionLocked(existing)
 		existing.published = true
 		startWorker := !existing.Running && (len(existing.pending) > 0 || len(existing.steering) > 0)
@@ -2847,7 +2881,15 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	}
 	now := time.Now().UnixMilli()
 	meta.Version, meta.CreatedAt = SessionFormatVersion, now
-	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, InheritedEventCount: SessionLogOffset(meta.SeedLength), published: !deferPublish, presetRuntime: presetRuntime, store: e.sessionStore, invariants: e.invariants, subagentModelSelectionEligible: meta.Origin != "subagent" && meta.ParentSession == ""}
+	var persistence SessionHandle
+	if e.sessionStore != nil {
+		var createErr error
+		persistence, createErr = e.sessionStore.Create(ctx, meta, SessionLogOffset(meta.SeedLength))
+		if createErr != nil {
+			return "", createErr
+		}
+	}
+	s := &Session{Header: meta, Model: ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model}, InheritedEventCount: SessionLogOffset(meta.SeedLength), published: false, presetRuntime: presetRuntime, store: persistence, invariants: e.invariants, subagentModelSelectionEligible: meta.Origin != "subagent" && meta.ParentSession == ""}
 	var modelSelectionEvent Event
 	modelSelectionRecorded := false
 	if e.hasSubagentModelSelectionToolLocked() {
@@ -2856,17 +2898,14 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		s.mu.Unlock()
 	}
 	attachSessionLocked(s)
-	if s.store != nil {
-		if err := s.store.Create(ctx, meta, s.InheritedEventCount); err != nil {
-			return "", err
-		}
-	}
 	s.mu.Lock()
 	var recordErr error
 	modelSelectionEvent, modelSelectionRecorded, recordErr = e.recordSubagentModelSelectionPolicyLocked(s)
 	s.mu.Unlock()
 	if recordErr != nil {
-		rollbackSessionStoreCreate(s.store, id)
+		if s.store != nil {
+			_ = s.store.Close()
+		}
 		return "", recordErr
 	}
 	if pinPermission {
@@ -2883,17 +2922,31 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 		} {
 			if _, err := appendEventLocked(s, item.typ, item.data, nil, nil, false); err != nil {
 				s.mu.Unlock()
-				rollbackSessionStoreCreate(s.store, id)
+				if s.store != nil {
+					_ = s.store.Close()
+				}
 				return "", err
 			}
 		}
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
+	if !deferPublish && s.store != nil && len(s.Events) > 0 {
+		if err := s.store.Append(ctx, cloneSessionEvents(s.Events)); err != nil {
+			s.mu.Unlock()
+			_ = s.store.Close()
+			return "", err
+		}
+		s.storedEventCount = len(s.Events)
+	}
 	s.firstLiveSeq = len(s.Events)
+	s.published = !deferPublish
 	s.mu.Unlock()
 	e.sessions[id] = s
 	e.mu.Unlock()
+	if !deferPublish && e.projectionCache != nil {
+		e.projectionCache.created(s)
+	}
 	if modelSelectionRecorded {
 		e.publishEvent(id, modelSelectionEvent)
 	}
@@ -2909,21 +2962,33 @@ func (e *Engine) createSessionWithPresetAdoption(ctx context.Context, meta Sessi
 	return id, nil
 }
 
-func (e *Engine) publishDeferredSession(s *Session) {
+func (e *Engine) publishDeferredSession(s *Session) error {
 	if s == nil {
-		return
+		return nil
 	}
 	s.mu.Lock()
+	if s.store != nil && s.storedEventCount < len(s.Events) {
+		suffix := cloneSessionEvents(s.Events[s.storedEventCount:])
+		if err := s.store.Append(context.Background(), suffix); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		s.storedEventCount += len(suffix)
+	}
 	attachSessionLocked(s)
 	s.published = true
 	s.firstLiveSeq = len(s.Events)
 	s.mu.Unlock()
+	if e.projectionCache != nil {
+		e.projectionCache.created(s)
+	}
 	e.emitHost(map[string]any{"type": "host/session-added", "sessionId": s.Header.ID, "blank": true, "cwd": s.Header.CWD, "agentPreset": s.Header.AgentPreset})
 	e.emitDynamicCordisScopedContained(s.Header.ID, "session/created", dynamicSessionView(s))
 	e.startSessionHooks(s, "startup")
 	if e.cfg.ScheduleEnabled {
 		e.startScheduleRuntime(s)
 	}
+	return nil
 }
 
 func writeJSONLine(w io.Writer, value any) error {
@@ -2999,10 +3064,11 @@ func appendSeedEventLocked(s *Session, event Event) (Event, error) {
 			return Event{}, err
 		}
 	}
-	if s.store != nil {
-		if err := s.store.Append(context.Background(), s.Header.ID, []Event{event}); err != nil {
+	if s.store != nil && s.published {
+		if err := s.store.Append(context.Background(), []Event{event}); err != nil {
 			return Event{}, err
 		}
+		s.storedEventCount++
 	}
 	resetRepeatToolChain(s, event.Type, event.Data)
 	s.Events = append(s.Events, event)
@@ -3041,10 +3107,11 @@ func appendEventLocked(s *Session, typ string, data, surfaceOp any, sourceEventS
 			return Event{}, err
 		}
 	}
-	if s.store != nil {
-		if err := s.store.Append(context.Background(), s.Header.ID, []Event{event}); err != nil {
+	if s.store != nil && s.published {
+		if err := s.store.Append(context.Background(), []Event{event}); err != nil {
 			return Event{}, err
 		}
+		s.storedEventCount++
 	}
 	resetRepeatToolChain(s, typ, data)
 	s.Events = append(s.Events, event)
@@ -3361,6 +3428,7 @@ func (e *Engine) sessionSummary(s *Session) (SessionSummary, bool) {
 		updated = lastPromptAt
 	}
 	header := s.Header
+	inheritedEventCount := s.InheritedEventCount
 	attached := s.attached
 	running := s.Running
 	lastSeq := len(s.Events) - 1
@@ -3368,7 +3436,7 @@ func (e *Engine) sessionSummary(s *Session) (SessionSummary, bool) {
 	var snapshot ProjectionSnapshot
 	cached := false
 	if !attached && e.projectionCache != nil {
-		snapshot, cached = e.projectionCache.medium.snapshot(header, lastSeq, false, e.sessionProjections.Signature())
+		snapshot, cached = e.projectionCache.cachedSnapshot(header, inheritedEventCount)
 	}
 	if !cached {
 		var snapshotErr error

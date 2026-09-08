@@ -107,7 +107,7 @@ func goalToolGuidance(blockedAfter int) string {
 }
 
 func (e *Engine) GoalMutation(id, op, objective string, rev, maxRounds int) (map[string]any, error) {
-	return e.goalMutationWithOrigin(nil, id, "", op, objective, nil, rev, maxRounds)
+	return e.goalMutationWithInitiator(nil, "", id, "", op, objective, nil, rev, maxRounds)
 }
 
 func (e *Engine) goalMutation(id, goalID, op, objective, blockedReason string, rev, maxRounds int) (map[string]any, error) {
@@ -115,14 +115,30 @@ func (e *Engine) goalMutation(id, goalID, op, objective, blockedReason string, r
 	if op == "block" {
 		reason = &GoalBlockReason{Code: "model-reported", Message: blockedReason}
 	}
-	return e.goalMutationWithOrigin(nil, id, goalID, op, objective, reason, rev, maxRounds)
+	return e.goalMutationWithInitiator(nil, "", id, goalID, op, objective, reason, rev, maxRounds)
+}
+
+func (e *Engine) goalMutationFromAgent(initiator, id, goalID, op, objective, blockedReason string, rev, maxRounds int) (map[string]any, error) {
+	var reason *GoalBlockReason
+	if op == "block" {
+		reason = &GoalBlockReason{Code: "model-reported", Message: blockedReason}
+	}
+	return e.goalMutationWithInitiator(nil, initiator, id, goalID, op, objective, reason, rev, maxRounds)
 }
 
 func (e *Engine) goalMutationWithReason(id, goalID, op, objective string, reason *GoalBlockReason, rev, maxRounds int) (map[string]any, error) {
-	return e.goalMutationWithOrigin(nil, id, goalID, op, objective, reason, rev, maxRounds)
+	return e.goalMutationWithInitiator(nil, "", id, goalID, op, objective, reason, rev, maxRounds)
 }
 
 func (e *Engine) goalMutationWithOrigin(origin *dynamicCordisRun, id, goalID, op, objective string, reason *GoalBlockReason, rev, maxRounds int) (map[string]any, error) {
+	initiator := ""
+	if origin != nil {
+		initiator = dynamicCordisAgentOwner(origin)
+	}
+	return e.goalMutationWithInitiator(origin, initiator, id, goalID, op, objective, reason, rev, maxRounds)
+}
+
+func (e *Engine) goalMutationWithInitiator(origin *dynamicCordisRun, initiator, id, goalID, op, objective string, reason *GoalBlockReason, rev, maxRounds int) (map[string]any, error) {
 	s, err := e.getSession(id)
 	if err != nil {
 		return nil, err
@@ -301,6 +317,14 @@ func (e *Engine) goalMutationWithOrigin(origin *dynamicCordisRun, id, goalID, op
 	}
 	e.publishEventFrom(origin, id, event)
 	e.emitGoalChangedFrom(origin, s, op, goal)
+	if op == "pause" && initiator != id {
+		s.mu.Lock()
+		running := s.Running
+		s.mu.Unlock()
+		if running {
+			_ = e.CancelAgent(id, AgentCancelCause{Kind: "user"}, CancelAgentOptions{KeepInbox: true})
+		}
+	}
 	return map[string]any{"ref": map[string]any{"id": goal.ID, "revision": goal.Revision}}, nil
 }
 
@@ -519,10 +543,11 @@ func appendUserMessagesLocked(s *Session, messages []map[string]any) ([]Event, e
 			return nil, err
 		}
 	}
-	if s.store != nil {
-		if err := s.store.Append(context.Background(), s.Header.ID, events); err != nil {
+	if s.store != nil && s.published {
+		if err := s.store.Append(context.Background(), events); err != nil {
 			return nil, err
 		}
+		s.storedEventCount += len(events)
 	}
 	for _, event := range events {
 		resetRepeatToolChain(s, event.Type, event.Data)
@@ -555,10 +580,12 @@ func (e *Engine) finishGoalTurn(s *Session, item *queuedPrompt, turn int) {
 	s.mu.Unlock()
 	switch reason {
 	case "aborted":
-		_, _ = e.goalMutation(s.Header.ID, goalID, "pause", "", "", revision, 0)
-		// A concurrent human mutation can make the pause CAS stale. The
-		// aborted turn must still lose process-local continuation authority.
-		e.disarmGoal(s.Header.ID)
+		e.mu.RLock()
+		goal, exists := e.goals[s.Header.ID]
+		e.mu.RUnlock()
+		if exists && goal.ID == goalID && goal.Revision == revision && goal.Phase == "active" && goal.Activation == "armed" {
+			_, _ = e.goalMutationFromAgent(s.Header.ID, s.Header.ID, goalID, "pause", "", "", revision, 0)
+		}
 	case "error", "max-tokens":
 		e.disarmGoal(s.Header.ID)
 	}

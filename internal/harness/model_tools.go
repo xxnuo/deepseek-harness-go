@@ -274,7 +274,7 @@ func builtinCreateGoalTool(e *Engine) Tool {
 			if err := requireDirectHumanGoalTurn(e, exec.Call.SessionID); err != nil {
 				return ToolResult{}, err
 			}
-			if _, err := e.goalMutation(exec.Call.SessionID, "", "create", in.Objective, "", 0, in.MaxGoalRounds); err != nil {
+			if _, err := e.goalMutationFromAgent(exec.Call.SessionID, exec.Call.SessionID, "", "create", in.Objective, "", 0, in.MaxGoalRounds); err != nil {
 				return ToolResult{}, goalToolDomainError(err)
 			}
 			goal, _ := e.GetGoal(exec.Call.SessionID)
@@ -374,7 +374,7 @@ func builtinUpdateGoalTool(e *Engine) Tool {
 			if getErr != nil {
 				return ToolResult{}, getErr
 			}
-			if _, err := e.goalMutation(exec.Call.SessionID, in.GoalID, op, in.Objective, in.BlockedReason, in.Revision, in.MaxGoalRounds); err != nil {
+			if _, err := e.goalMutationFromAgent(exec.Call.SessionID, exec.Call.SessionID, in.GoalID, op, in.Objective, in.BlockedReason, in.Revision, in.MaxGoalRounds); err != nil {
 				return ToolResult{}, goalToolDomainError(err)
 			}
 			goal, _ := e.GetGoal(exec.Call.SessionID)
@@ -919,8 +919,10 @@ func (e *Engine) createModelSubagentWithIDLocked(ctx context.Context, parentID, 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := e.publishDeferredSession(child); err != nil {
+		return "", err
+	}
 	committed = true
-	e.publishDeferredSession(child)
 	return childID, nil
 }
 
@@ -940,7 +942,13 @@ func (e *Engine) rollbackUnpublishedModelSubagent(childID string, child *Session
 	}
 	_ = e.saveStateLocked()
 	e.mu.Unlock()
-	rollbackSessionStoreCreate(child.store, childID)
+	child.mu.Lock()
+	handle := child.store
+	child.store = nil
+	child.mu.Unlock()
+	if handle != nil {
+		_ = handle.Close()
+	}
 }
 
 func (e *Engine) rollbackCreatedModelSubagent(childID string, child *Session) {
@@ -954,7 +962,6 @@ func (e *Engine) rollbackCreatedModelSubagent(childID string, child *Session) {
 	}
 	_ = e.saveStateLocked()
 	e.mu.Unlock()
-	rollbackSessionStoreCreate(child.store, childID)
 }
 
 func startBackgroundInProcessSubagent(e *Engine, owner, label, prompt string, fork bool, config SubagentToolConfig) (string, error) {

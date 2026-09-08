@@ -140,11 +140,6 @@ func (e *Engine) hookPayload(session *Session, config HookBridgeConfig, input ho
 	if config.Dialect == HookDialectCodex {
 		transcript = nil
 	}
-	if e.sessionStore != nil {
-		if location, ok := e.sessionStore.Locate(header); ok && location.Path != "" {
-			transcript = location.Path
-		}
-	}
 	base := map[string]any{
 		"session_id": id, "transcript_path": transcript, "cwd": cwd, "hook_event_name": input.point,
 	}

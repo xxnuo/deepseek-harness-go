@@ -45,7 +45,13 @@ type workflowRecordingFailStore struct {
 	fail bool
 }
 
-func (s *workflowRecordingFailStore) Append(ctx context.Context, id string, events []Event) error {
+type workflowRecordingFailHandle struct {
+	SessionHandle
+	store *workflowRecordingFailStore
+}
+
+func (h *workflowRecordingFailHandle) Append(ctx context.Context, events []Event) error {
+	s := h.store
 	s.mu.Lock()
 	fail := s.fail
 	s.mu.Unlock()
@@ -56,7 +62,22 @@ func (s *workflowRecordingFailStore) Append(ctx context.Context, id string, even
 			}
 		}
 	}
-	return s.SessionStore.Append(ctx, id, events)
+	return h.SessionHandle.Append(ctx, events)
+}
+
+func (s *workflowRecordingFailStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &workflowRecordingFailHandle{SessionHandle: handle, store: s}, nil
+}
+
+func (s *workflowRecordingFailStore) Create(ctx context.Context, header SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, header, inheritedEventCount))
+}
+
+func (s *workflowRecordingFailStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
 }
 
 func (p *concurrentWorkflowProvider) Name() string                     { return p.name }

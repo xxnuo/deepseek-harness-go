@@ -197,6 +197,9 @@ func builtinReadImageTool(e *Engine) Tool {
 				}, "width", "height"),
 			}, "attachmentId", "mediaType", "bytes", "width", "height")}, "path", "image"),
 		},
+		PresentationMeta: func(_ ToolCall, value any) (any, error) {
+			return map[string]any{"path": value.(map[string]any)["path"]}, nil
+		},
 		IsConcurrencySafe: alwaysConcurrencySafe,
 		Execute: func(ctx context.Context, call ToolCall) (ToolResult, error) {
 			var in input

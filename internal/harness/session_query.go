@@ -289,7 +289,7 @@ func (e *Engine) sessionQueryAuthorizeIDsContext(ctx context.Context, callerCWD 
 	if e.sessionStore == nil {
 		return authorized, nil
 	}
-	persisted, err := e.sessionStore.ListSnapshots(ctx)
+	persisted, err := e.sessionStore.List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +316,7 @@ func (e *Engine) sessionQuerySnapshotsContext(ctx context.Context) ([]sessionQue
 	}
 	persisted := map[string]SessionPersistenceSnapshot{}
 	if e.sessionStore != nil {
-		snapshots, err := e.sessionStore.ListSnapshots(ctx)
+		snapshots, err := e.sessionStore.List(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +359,7 @@ func (e *Engine) sessionQuerySnapshotsContext(ctx context.Context) ([]sessionQue
 			snapshot.persisted = true
 			delete(persisted, snapshot.header.ID)
 			if !snapshot.live {
-				inspection, err := e.sessionStore.Inspect(ctx, snapshot.header.ID)
+				inspection, err := inspectStoredSession(ctx, e.sessionStore, snapshot.header.ID, true)
 				if err != nil {
 					return nil, err
 				}
@@ -380,7 +380,7 @@ func (e *Engine) sessionQuerySnapshotsContext(ctx context.Context) ([]sessionQue
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		inspection, err := e.sessionStore.Inspect(ctx, id)
+		inspection, err := inspectStoredSession(ctx, e.sessionStore, id, true)
 		if err != nil {
 			return nil, err
 		}

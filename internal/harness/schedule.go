@@ -198,11 +198,7 @@ func flushSchedulePersistence(ctx context.Context, session *Session) error {
 	if session.store == nil {
 		return errors.New("schedule persistence is unavailable")
 	}
-	flusher, ok := session.store.(SessionPersistenceFlusher)
-	if !ok {
-		return errors.New("schedule persistence has no durability checkpoint")
-	}
-	return flusher.Flush(ctx, session.Header.ID)
+	return session.store.Flush(ctx)
 }
 
 func scheduleCorruptError() map[string]any {

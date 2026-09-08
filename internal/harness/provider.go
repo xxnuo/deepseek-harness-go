@@ -1225,7 +1225,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 				if part.Function.Arguments != "" {
 					call.Arguments = append(call.Arguments, part.Function.Arguments...)
 				}
-				toolDeltas = append(toolDeltas, ToolCallDelta{Index: part.Index, ID: part.ID, Name: part.Function.Name, ArgumentsDelta: part.Function.Arguments})
+				toolDeltas = append(toolDeltas, ToolCallDelta{Index: part.Index, ID: call.ID, Name: call.Name, ArgumentsDelta: part.Function.Arguments})
 			}
 			if d.Content != "" || d.Reasoning != "" || len(toolDeltas) > 0 || finish != "" {
 				if err := onDelta(Delta{Text: d.Content, Reasoning: d.Reasoning, ToolCalls: toolDeltas, Finish: finish}); err != nil {

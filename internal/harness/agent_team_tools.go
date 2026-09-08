@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const noActiveTeamPeerMessage = "No other Team member is running or provisioning. wait_agent cannot make progress or wake inactive teammates. Re-list with list_agents and team_task_list, then use followup_task to wake each required inactive teammate before waiting again."
+const noActiveTeamPeerMessage = "No other Team member is running or provisioning. wait_agent cannot make progress or wake inactive teammates. Re-list with list_agents and team_task_list, then use send_message to wake each required inactive teammate before waiting again."
 
 const agentTeamPolicy = `Agent Teams is available in this session, but create teammates only when the user explicitly asks to use Agent Teams or teammates.
 
@@ -16,10 +16,10 @@ The Team Lead and all teammates share the same working directory and filesystem.
 
 Prefer read/edit/write for file changes. If a file operation returns FS_STALE_VERSION, read the current file, rebase your intended change onto the new content, and retry. Bash, formatters, code generators, and scripts are not fully protected by the filesystem version guard; coordinate them explicitly and have the Lead review the final diff and run tests.
 
-Use send_message for quiet information that must not start an idle teammate. Use followup_task when the target should run another turn. A delivered peer item starts with its stable message id and sender name. A successful send is already durable even when its result says queued; do not resend it. Shared-task workflow is list, get, claim with the current revision, perform the work, then complete. Task readiness never starts an owner. Before wait_agent, use list_agents and make sure another required member is running or provisioning; use followup_task first when the required member is inactive. wait_agent observes only changes after that call starts, never wakes a member, and returns noProgress immediately when no other member can produce a change. Re-list after wakeup or timeout. The Lead must wait for required teammates before giving the final answer.`
+send_message steers a running target at its nearest step boundary, starts an idle target, and cold-resumes an inactive teammate. A delivered peer item starts with its stable message id and sender name. A successful send is already durable even when its result says queued; do not resend it. Shared-task workflow is list, get, claim with the current revision, perform the work, then complete. Task readiness never starts an owner. Before wait_agent, use list_agents and make sure another required member is running or provisioning; use send_message first when the required member is inactive. wait_agent observes only changes after that call starts, never wakes a member, and returns noProgress immediately when no other member can produce a change. Re-list after wakeup or timeout. The Lead must wait for required teammates before giving the final answer.`
 
 var agentTeamToolNames = map[string]bool{
-	"spawn_teammate": true, "send_message": true, "followup_task": true, "list_agents": true,
+	"spawn_teammate": true, "send_message": true, "list_agents": true,
 	"wait_agent": true, "interrupt_agent": true, "team_task_create": true, "team_task_list": true,
 	"team_task_get": true, "team_task_update": true,
 }
@@ -92,8 +92,7 @@ func teamTaskViewSchema() map[string]any {
 func builtinAgentTeamTools(e *Engine) []Tool {
 	return []Tool{
 		builtinSpawnTeammateTool(e),
-		builtinTeamMessageTool(e, "send_message", teamMessageQuiet),
-		builtinTeamMessageTool(e, "followup_task", teamMessageWakeup),
+		builtinTeamMessageTool(e),
 		builtinTeamListAgentsTool(e),
 		builtinTeamWaitAgentTool(e),
 		builtinTeamInterruptAgentTool(e),
@@ -159,18 +158,14 @@ func builtinSpawnTeammateTool(e *Engine) Tool {
 	}
 }
 
-func builtinTeamMessageTool(e *Engine, name, delivery string) Tool {
+func builtinTeamMessageTool(e *Engine) Tool {
 	type input struct {
 		Target  string `json:"target"`
 		Message string `json:"message"`
 	}
-	description := "Send durable information to another Team member without starting an idle member."
-	if delivery == teamMessageWakeup {
-		description = "Send a durable follow-up task to another Team member and start a turn when needed."
-	}
 	return Tool{
 		Schema: ToolSchema{
-			Name: name, Description: description,
+			Name: "send_message", Description: "Send one durable message to another Team member. A running target receives it at the nearest step boundary; an idle target starts a turn; an inactive teammate cold-resumes.",
 			Parameters: objectSchema(map[string]any{
 				"target":  map[string]any{"type": "string", "description": "Team member name, or lead."},
 				"message": map[string]any{"type": "string", "description": "Self-contained message for the target."},
@@ -188,7 +183,7 @@ func builtinTeamMessageTool(e *Engine, name, delivery string) Tool {
 				return ToolResult{}, err
 			}
 			value, err := e.agentTeams.SendMessage(ctx, call.SessionID, SendTeamMessageRequest{
-				Target: in.Target, Content: []ContentBlock{{Type: "text", Text: in.Message}}, Delivery: delivery,
+				Target: in.Target, Content: []ContentBlock{{Type: "text", Text: in.Message}},
 			})
 			if err != nil {
 				return ToolResult{}, err

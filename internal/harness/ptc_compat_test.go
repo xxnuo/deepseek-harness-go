@@ -19,39 +19,37 @@ func TestPTCCompatibilityColdLoadsHistoricalCodeWithoutRewritingJSONL(t *testing
 		Version: SessionFormatVersion, ID: "historical-code-header", CreatedAt: 1,
 		CWD: root, AgentPreset: "code",
 	}
-	headerLocation, ok := store.Locate(headerMeta)
-	if !ok {
-		t.Fatal("historical header session has no JSONL location")
-	}
+	headerPath := store.pathFor(headerMeta)
 	header, err := marshalSessionHeader(headerMeta, SessionLogOffset(headerMeta.SeedLength))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(headerLocation.Path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(headerPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(headerLocation.Path, append(header, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(headerPath, append(header, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	eventMeta := SessionHeader{
 		Version: SessionFormatVersion, ID: "historical-code-event", CreatedAt: 2,
 		CWD: root, AgentPreset: "standard",
 	}
-	if err := store.Create(context.Background(), eventMeta, SessionLogOffset(eventMeta.SeedLength)); err != nil {
+	eventWriter, err := store.Create(context.Background(), eventMeta, SessionLogOffset(eventMeta.SeedLength))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Append(context.Background(), eventMeta.ID, []Event{{
+	if err := eventWriter.Append(context.Background(), []Event{{
 		Type: "agent-preset/selected", Seq: 0, Time: 3,
 		Data: map[string]any{"agentPreset": "code"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	eventLocation, ok := store.Locate(eventMeta)
-	if !ok {
-		t.Fatal("historical event session has no JSONL location")
+	if err := eventWriter.Close(); err != nil {
+		t.Fatal(err)
 	}
+	eventPath := store.pathFor(eventMeta)
 	before := map[string][]byte{}
-	for name, path := range map[string]string{"header": headerLocation.Path, "event": eventLocation.Path} {
+	for name, path := range map[string]string{"header": headerPath, "event": eventPath} {
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
 			t.Fatal(readErr)
@@ -92,7 +90,7 @@ func TestPTCCompatibilityColdLoadsHistoricalCodeWithoutRewritingJSONL(t *testing
 			t.Fatalf("%s historical presets header=%q raw=%q effective=%q", check.name, headerPreset, rawPreset, effectivePreset)
 		}
 	}
-	for name, path := range map[string]string{"header": headerLocation.Path, "event": eventLocation.Path} {
+	for name, path := range map[string]string{"header": headerPath, "event": eventPath} {
 		after, readErr := os.ReadFile(path)
 		if readErr != nil {
 			t.Fatal(readErr)
@@ -131,11 +129,11 @@ func TestPTCCompatibilityWritesCanonicalPresetForNewSessions(t *testing.T) {
 		t.Fatalf("new session retained legacy preset: header=%q effective=%q", session.Header.AgentPreset, sessionAgentPreset(session.Header, session.Events))
 	}
 	session.mu.Unlock()
-	location, ok := e.sessionStore.Locate(session.Header)
+	store, ok := e.sessionStore.(*JSONLSessionStore)
 	if !ok {
-		t.Fatal("new session has no persistence location")
+		t.Fatalf("session store = %T", e.sessionStore)
 	}
-	data, err := os.ReadFile(location.Path)
+	data, err := os.ReadFile(store.pathFor(session.Header))
 	if err != nil {
 		t.Fatal(err)
 	}

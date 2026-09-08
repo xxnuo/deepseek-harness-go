@@ -20,19 +20,44 @@ type scheduleFlushStore struct {
 	outcomes []error
 }
 
-func (s *scheduleFlushStore) Flush(ctx context.Context, _ string) error {
+type scheduleFlushHandle struct {
+	SessionHandle
+	store *scheduleFlushStore
+}
+
+func (h *scheduleFlushHandle) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s := h.store
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.flushes++
 	if len(s.outcomes) == 0 {
-		return nil
+		s.mu.Unlock()
+		return h.SessionHandle.Flush(ctx)
 	}
 	err := s.outcomes[0]
 	s.outcomes = s.outcomes[1:]
+	s.mu.Unlock()
+	if err == nil {
+		return h.SessionHandle.Flush(ctx)
+	}
 	return err
+}
+
+func (s *scheduleFlushStore) wrap(handle SessionHandle, err error) (SessionHandle, error) {
+	if err != nil {
+		return nil, err
+	}
+	return &scheduleFlushHandle{SessionHandle: handle, store: s}, nil
+}
+
+func (s *scheduleFlushStore) Create(ctx context.Context, header SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Create(ctx, header, inheritedEventCount))
+}
+
+func (s *scheduleFlushStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	return s.wrap(s.SessionStore.Open(ctx, id, access))
 }
 
 func (s *scheduleFlushStore) count() int {

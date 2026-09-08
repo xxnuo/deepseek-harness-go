@@ -3,8 +3,6 @@ package harness
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,8 +20,10 @@ import (
 type SessionPersistenceRevision string
 
 type SessionPersistenceSnapshot struct {
-	Header   SessionHeader
-	Revision SessionPersistenceRevision
+	Header     SessionHeader
+	Revision   SessionPersistenceRevision
+	EventCount *int
+	SizeBytes  *int64
 }
 
 type SessionInspection struct {
@@ -32,66 +32,102 @@ type SessionInspection struct {
 	Events              []Event
 }
 
-type SessionLocation struct {
-	Kind string
-	Path string
-}
+type SessionAccess string
 
-type SessionRawArtifact struct {
-	Meta                SessionHeader
-	InheritedEventCount SessionLogOffset
-	Filename            string
-	Content             string
-}
+const (
+	SessionAccessRead  SessionAccess = "read"
+	SessionAccessWrite SessionAccess = "write"
+)
 
-type SessionStore interface {
-	Locate(SessionHeader) (SessionLocation, bool)
-	SupportsRawArtifacts() bool
-	ReadRaw(context.Context, string) (SessionRawArtifact, bool, error)
-	Create(context.Context, SessionHeader, SessionLogOffset) error
-	Append(context.Context, string, []Event) error
-	Load(context.Context, string) (SessionInspection, error)
-	Inspect(context.Context, string) (SessionInspection, error)
-	ReadFrom(context.Context, string, SessionLogOffset) (SessionInspection, error)
-	List(context.Context) ([]SessionHeader, error)
-	ListSnapshots(context.Context) ([]SessionPersistenceSnapshot, error)
+type SessionHandle interface {
+	ID() string
+	Header() SessionHeader
+	InheritedEventCount() SessionLogOffset
+	Access() SessionAccess
+	Read(context.Context, ...SessionLogOffset) ([]Event, error)
+	Append(context.Context, []Event) error
+	Flush(context.Context) error
 	Close() error
 }
 
-// SessionPersistenceFlusher proves that accepted writes for one live session
-// reached the store's durable backend.
-type SessionPersistenceFlusher interface {
-	Flush(context.Context, string) error
+type SessionStore interface {
+	Create(context.Context, SessionHeader, SessionLogOffset) (SessionHandle, error)
+	Open(context.Context, string, SessionAccess) (SessionHandle, error)
+	Flush(context.Context) error
+	Stat(context.Context, string) (SessionPersistenceSnapshot, bool, error)
+	List(context.Context) ([]SessionPersistenceSnapshot, error)
+	Close() error
 }
 
-type sessionStoreCreateRollback interface {
-	Delete(context.Context, string) error
+type SessionPersistenceNotFoundError struct{ SessionID string }
+
+func (e *SessionPersistenceNotFoundError) Error() string {
+	return fmt.Sprintf("session %q not found", e.SessionID)
 }
 
-func rollbackSessionStoreCreate(store SessionStore, id string) {
-	if rollback, ok := store.(sessionStoreCreateRollback); ok {
-		_ = rollback.Delete(context.Background(), id)
-	}
+type SessionAlreadyExistsError struct{ SessionID string }
+
+func (e *SessionAlreadyExistsError) Error() string {
+	return fmt.Sprintf("session %q already exists", e.SessionID)
+}
+
+type SessionAlreadyOwnedError struct{ SessionID string }
+
+func (e *SessionAlreadyOwnedError) Error() string {
+	return fmt.Sprintf("session %q is already owned by an active write handle", e.SessionID)
+}
+
+type SessionReadOnlyError struct {
+	SessionID string
+	Operation string
+}
+
+func (e *SessionReadOnlyError) Error() string {
+	return fmt.Sprintf("session %q: %s is not available on a read handle", e.SessionID, e.Operation)
+}
+
+type SessionOwnershipLostError struct{ SessionID string }
+
+func (e *SessionOwnershipLostError) Error() string {
+	return fmt.Sprintf("session %q: write ownership was lost; close this handle and reopen", e.SessionID)
+}
+
+type SessionHandleClosedError struct {
+	SessionID string
+	Operation string
+}
+
+func (e *SessionHandleClosedError) Error() string {
+	return fmt.Sprintf("session %q: %s on a closed handle", e.SessionID, e.Operation)
 }
 
 type JSONLSessionStore struct {
 	root string
 
-	mu      sync.Mutex
-	states  map[string]jsonlSessionState
-	paths   map[string]string
-	locks   map[string]*sync.Mutex
-	ops     sync.WaitGroup
-	closing bool
-	closed  bool
-	done    chan struct{}
+	mu       sync.Mutex
+	writers  map[string]*JSONLSessionHandle
+	pending  map[string]jsonlPendingSession
+	handles  map[*JSONLSessionHandle]struct{}
+	paths    map[string]string
+	locks    map[string]*sync.Mutex
+	memo     map[string]jsonlSessionMemo
+	memoLRU  []string
+	revision uint64
+	ops      sync.WaitGroup
+	closing  bool
+	closed   bool
+	done     chan struct{}
 }
 
-type jsonlSessionState struct {
-	meta                SessionHeader
+type jsonlPendingSession struct {
+	header              SessionHeader
 	inheritedEventCount SessionLogOffset
-	cursor              int
-	materialized        bool
+	revision            SessionPersistenceRevision
+}
+
+type jsonlSessionMemo struct {
+	revision SessionPersistenceRevision
+	scan     jsonlSessionScan
 }
 
 func NewJSONLSessionStore(root string) (*JSONLSessionStore, error) {
@@ -103,36 +139,16 @@ func NewJSONLSessionStore(root string) (*JSONLSessionStore, error) {
 		return nil, err
 	}
 	return &JSONLSessionStore{
-		root: abs, states: map[string]jsonlSessionState{}, paths: map[string]string{},
-		locks: map[string]*sync.Mutex{}, done: make(chan struct{}),
+		root: abs, writers: map[string]*JSONLSessionHandle{}, pending: map[string]jsonlPendingSession{},
+		handles: map[*JSONLSessionHandle]struct{}{}, paths: map[string]string{}, locks: map[string]*sync.Mutex{},
+		memo: map[string]jsonlSessionMemo{}, done: make(chan struct{}),
 	}, nil
 }
 
-func (s *JSONLSessionStore) Locate(meta SessionHeader) (SessionLocation, bool) {
-	return SessionLocation{Kind: "jsonl", Path: s.pathFor(meta)}, true
-}
-
-func (s *JSONLSessionStore) SupportsRawArtifacts() bool { return true }
-
-func (s *JSONLSessionStore) Flush(ctx context.Context, id string) error {
+func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) (SessionHandle, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	s.mu.Lock()
-	_, live := s.states[id]
-	closed := s.closing || s.closed
-	s.mu.Unlock()
-	if closed {
-		return storageError(StorageClosed, "JSONL session store is closed")
-	}
-	if !live {
-		return fmt.Errorf("session-not-found: %s", id)
-	}
-	// JSONL Append is synchronous, so there is no deferred write queue.
-	return nil
-}
-
-func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader, inheritedEventCount SessionLogOffset) error {
 	if meta.SeedLength != 0 && inheritedEventCount == 0 {
 		inheritedEventCount = SessionLogOffset(meta.SeedLength)
 	}
@@ -141,273 +157,170 @@ func (s *JSONLSessionStore) Create(ctx context.Context, meta SessionHeader, inhe
 	}
 	meta.SeedLength = int(inheritedEventCount)
 	if err := validateSessionHeader(meta); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateSessionLogOffset(inheritedEventCount); err != nil {
-		return err
+		return nil, err
 	}
 	if !meta.IsSeeded && inheritedEventCount != 0 {
-		return errors.New("unseeded session cannot have inherited events")
+		return nil, errors.New("unseeded session cannot have inherited events")
 	}
 	unlock, err := s.begin(ctx, meta.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer unlock()
 	if _, _, found, err := s.findArtifact(ctx, meta.ID); err != nil {
-		return err
+		return nil, err
 	} else if found {
-		return fmt.Errorf("session %q already exists in persistence", meta.ID)
+		return nil, &SessionAlreadyExistsError{SessionID: meta.ID}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.states[meta.ID]; exists {
-		return fmt.Errorf("session %q is already registered in persistence", meta.ID)
+	if _, exists := s.writers[meta.ID]; exists {
+		return nil, &SessionAlreadyExistsError{SessionID: meta.ID}
 	}
-	s.states[meta.ID] = jsonlSessionState{meta: meta, inheritedEventCount: inheritedEventCount}
-	return nil
+	s.revision++
+	s.pending[meta.ID] = jsonlPendingSession{
+		header: meta, inheritedEventCount: inheritedEventCount,
+		revision: SessionPersistenceRevision(fmt.Sprintf("memory:jsonl:%d", s.revision)),
+	}
+	handle := &JSONLSessionHandle{
+		store: s, id: meta.ID, header: meta, inheritedEventCount: inheritedEventCount,
+		access: SessionAccessWrite,
+	}
+	s.writers[meta.ID] = handle
+	s.handles[handle] = struct{}{}
+	return handle, nil
 }
 
-func (s *JSONLSessionStore) Delete(ctx context.Context, id string) error {
+func (s *JSONLSessionStore) Open(ctx context.Context, id string, access SessionAccess) (SessionHandle, error) {
+	if access != SessionAccessRead && access != SessionAccessWrite {
+		return nil, fmt.Errorf("unsupported session access %q", access)
+	}
 	unlock, err := s.begin(ctx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer unlock()
 	s.mu.Lock()
-	state, live := s.states[id]
-	path := s.paths[id]
-	delete(s.states, id)
-	delete(s.paths, id)
-	s.mu.Unlock()
-	if live && path == "" {
-		path = s.pathFor(state.meta)
-	}
-	if path != "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *JSONLSessionStore) Append(ctx context.Context, id string, events []Event) error {
-	unlock, err := s.begin(ctx, id)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	s.mu.Lock()
-	state, live := s.states[id]
-	s.mu.Unlock()
-	if live {
-		if len(events) == 0 {
-			return nil
-		}
-		if err := validateSessionEventBatch(events, state.cursor); err != nil {
-			return err
-		}
-		if !state.materialized {
-			path := s.pathFor(state.meta)
-			if err := s.materialize(path, state.meta, state.inheritedEventCount, events); err != nil {
-				return err
-			}
-			state.materialized = true
-			s.mu.Lock()
-			s.paths[id] = path
-			s.mu.Unlock()
-		} else {
-			_, path, found, err := s.findArtifact(ctx, id)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return fmt.Errorf("live session %q disappeared from persistence", id)
-			}
-			if err := appendJSONLLines(path, events); err != nil {
-				return err
-			}
-		}
-		state.cursor += len(events)
-		s.mu.Lock()
-		s.states[id] = state
+	pending, isPending := s.pending[id]
+	_, owned := s.writers[id]
+	if access == SessionAccessWrite && owned {
 		s.mu.Unlock()
-		return nil
+		return nil, &SessionAlreadyOwnedError{SessionID: id}
 	}
-	meta, path, found, err := s.findArtifact(ctx, id)
-	if err != nil {
-		return err
+	if access == SessionAccessWrite {
+		s.writers[id] = nil
 	}
-	if !found {
-		return fmt.Errorf("session %q is not registered in persistence", id)
-	}
-	if len(events) == 0 {
-		return nil
-	}
-	scan, err := scanJSONLSession(path, id)
-	if err != nil {
-		return err
-	}
-	closers := interruptedSessionClosers(scan.events)
-	if err := s.repair(path, scan, closers); err != nil {
-		return err
-	}
-	expected := len(scan.events) + len(closers)
-	if err := validateSessionEventBatch(events, expected); err != nil {
-		return err
-	}
-	if err := appendJSONLLines(path, events); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.states[id] = jsonlSessionState{meta: meta, inheritedEventCount: SessionLogOffset(meta.SeedLength), cursor: expected + len(events), materialized: true}
 	s.mu.Unlock()
-	return nil
-}
-
-func (s *JSONLSessionStore) Load(ctx context.Context, id string) (SessionInspection, error) {
-	unlock, err := s.begin(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	defer unlock()
-	_, path, found, err := s.findArtifact(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	if !found {
-		return SessionInspection{}, fmt.Errorf("session-not-found: %s", id)
-	}
-	scan, err := scanJSONLSession(path, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	s.mu.Lock()
-	state, live := s.states[id]
-	s.mu.Unlock()
-	closers := interruptedSessionClosers(scan.events)
-	if live && state.materialized {
-		if scan.committedBytes != len(scan.raw) || len(closers) > 0 {
-			return SessionInspection{}, fmt.Errorf("cannot crash-repair live session %q", id)
+	if isPending {
+		if access == SessionAccessWrite {
+			s.releaseWriteClaim(id)
+			return nil, &SessionAlreadyOwnedError{SessionID: id}
 		}
-		return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: append([]Event(nil), scan.events...)}, nil
+		handle := &JSONLSessionHandle{
+			store: s, id: id, header: pending.header, inheritedEventCount: pending.inheritedEventCount,
+			access: SessionAccessRead,
+		}
+		s.adoptHandle(handle)
+		return handle, nil
 	}
-	if err := s.repair(path, scan, closers); err != nil {
-		return SessionInspection{}, err
+	scan, path, err := s.readStoredLogLocked(ctx, id)
+	if err != nil {
+		if access == SessionAccessWrite {
+			s.releaseWriteClaim(id)
+		}
+		return nil, err
 	}
-	events := append(append([]Event(nil), scan.events...), closers...)
-	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: events}, nil
+	handle := &JSONLSessionHandle{
+		store: s, id: id, header: scan.meta, inheritedEventCount: scan.inheritedEventCount,
+		access: access, materialized: true, path: path,
+	}
+	if access == SessionAccessWrite {
+		handle.events = cloneSessionEvents(scan.events)
+		handle.cursor = len(scan.events)
+		if scan.committedBytes < len(scan.raw) {
+			handle.tornTruncateTo = scan.committedBytes
+			handle.hasTornTail = true
+		}
+	}
+	s.adoptHandle(handle)
+	return handle, nil
 }
 
-func (s *JSONLSessionStore) Inspect(ctx context.Context, id string) (SessionInspection, error) {
-	unlock, err := s.begin(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	defer unlock()
-	_, path, found, err := s.findArtifact(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	if !found {
-		return SessionInspection{}, fmt.Errorf("session-not-found: %s", id)
-	}
-	scan, err := scanJSONLSession(path, id)
-	if err != nil {
-		return SessionInspection{}, err
+func (s *JSONLSessionStore) Flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	s.mu.Lock()
-	state, live := s.states[id]
+	writers := make([]*JSONLSessionHandle, 0, len(s.writers))
+	for _, writer := range s.writers {
+		if writer != nil {
+			writers = append(writers, writer)
+		}
+	}
 	s.mu.Unlock()
-	events := append([]Event(nil), scan.events...)
-	if !live || !state.materialized {
-		events = append(events, interruptedSessionClosers(scan.events)...)
-	}
-	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: events}, nil
-}
-
-func (s *JSONLSessionStore) ReadFrom(ctx context.Context, id string, fromSeq SessionLogOffset) (SessionInspection, error) {
-	if fromSeq < 0 {
-		return SessionInspection{}, errors.New("fromSeq must be non-negative")
-	}
-	unlock, err := s.begin(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	defer unlock()
-	_, path, found, err := s.findArtifact(ctx, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	if !found {
-		return SessionInspection{}, fmt.Errorf("session-not-found: %s", id)
-	}
-	scan, err := scanJSONLSession(path, id)
-	if err != nil {
-		return SessionInspection{}, err
-	}
-	if int(fromSeq) >= len(scan.events) {
-		return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: []Event{}}, nil
-	}
-	return SessionInspection{Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount, Events: append([]Event(nil), scan.events[int(fromSeq):]...)}, nil
-}
-
-func (s *JSONLSessionStore) ReadRaw(ctx context.Context, id string) (SessionRawArtifact, bool, error) {
-	unlock, err := s.begin(ctx, id)
-	if err != nil {
-		return SessionRawArtifact{}, false, err
-	}
-	defer unlock()
-	_, path, found, err := s.findArtifact(ctx, id)
-	if err != nil || !found {
-		return SessionRawArtifact{}, false, err
-	}
-	scan, err := scanJSONLSession(path, id)
-	if err != nil {
-		return SessionRawArtifact{}, false, err
-	}
-	return SessionRawArtifact{
-		Meta: scan.meta, InheritedEventCount: scan.inheritedEventCount,
-		Filename: "session.jsonl", Content: string(scan.raw[:scan.committedBytes]),
-	}, true, nil
-}
-
-func (s *JSONLSessionStore) List(ctx context.Context) ([]SessionHeader, error) {
-	unlock, err := s.begin(ctx, "\x00list")
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	artifacts, err := s.listArtifacts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	headers := make([]SessionHeader, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		headers = append(headers, artifact.header)
-	}
-	return headers, nil
-}
-
-func (s *JSONLSessionStore) ListSnapshots(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
-	unlock, err := s.begin(ctx, "\x00list")
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	artifacts, err := s.listArtifacts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	snapshots := make([]SessionPersistenceSnapshot, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		data, err := os.ReadFile(artifact.path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
+	var failures []error
+	for _, writer := range writers {
+		if err := writer.Flush(ctx); err != nil {
+			var closed *SessionHandleClosedError
+			if !errors.As(err, &closed) {
+				failures = append(failures, fmt.Errorf("session %q: %w", writer.id, err))
 			}
-			return nil, err
 		}
+	}
+	return errors.Join(failures...)
+}
+
+func (s *JSONLSessionStore) Stat(ctx context.Context, id string) (SessionPersistenceSnapshot, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SessionPersistenceSnapshot{}, false, err
+	}
+	s.mu.Lock()
+	pending, ok := s.pending[id]
+	s.mu.Unlock()
+	if ok {
+		return SessionPersistenceSnapshot{Header: pending.header, Revision: pending.revision}, true, nil
+	}
+	unlock, err := s.begin(ctx, id)
+	if err != nil {
+		return SessionPersistenceSnapshot{}, false, err
+	}
+	defer unlock()
+	header, path, found, err := s.findArtifact(ctx, id)
+	if err != nil || !found {
+		return SessionPersistenceSnapshot{}, false, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return SessionPersistenceSnapshot{}, false, nil
+		}
+		return SessionPersistenceSnapshot{}, false, err
+	}
+	size := info.Size()
+	return SessionPersistenceSnapshot{Header: header, Revision: jsonlFileRevision(path, info), SizeBytes: &size}, true, nil
+}
+
+func (s *JSONLSessionStore) List(ctx context.Context) ([]SessionPersistenceSnapshot, error) {
+	unlock, err := s.begin(ctx, "\x00list")
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	s.mu.Lock()
+	pending := make(map[string]jsonlPendingSession, len(s.pending))
+	for id, entry := range s.pending {
+		pending[id] = entry
+	}
+	s.mu.Unlock()
+	artifacts, err := s.listArtifacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapshots := make([]SessionPersistenceSnapshot, 0, len(artifacts)+len(pending))
+	for _, artifact := range artifacts {
 		info, err := os.Stat(artifact.path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -415,15 +328,21 @@ func (s *JSONLSessionStore) ListSnapshots(ctx context.Context) ([]SessionPersist
 			}
 			return nil, err
 		}
-		digest := sha256.Sum256(data)
+		size := info.Size()
 		snapshots = append(snapshots, SessionPersistenceSnapshot{
-			Header: artifact.header,
-			Revision: SessionPersistenceRevision(fmt.Sprintf(
-				"jsonl:%s:%d:%d:%v:%s",
-				artifact.path, info.Size(), info.ModTime().UnixNano(), info.Sys(), hex.EncodeToString(digest[:]),
-			)),
+			Header: artifact.header, Revision: jsonlFileRevision(artifact.path, info), SizeBytes: &size,
 		})
+		delete(pending, artifact.header.ID)
 	}
+	for _, entry := range pending {
+		snapshots = append(snapshots, SessionPersistenceSnapshot{Header: entry.header, Revision: entry.revision})
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].Header.CreatedAt != snapshots[j].Header.CreatedAt {
+			return snapshots[i].Header.CreatedAt < snapshots[j].Header.CreatedAt
+		}
+		return snapshots[i].Header.ID < snapshots[j].Header.ID
+	})
 	return snapshots, nil
 }
 
@@ -436,13 +355,23 @@ func (s *JSONLSessionStore) Close() error {
 		return nil
 	}
 	s.closing = true
+	handles := make([]*JSONLSessionHandle, 0, len(s.handles))
+	for handle := range s.handles {
+		handles = append(handles, handle)
+	}
 	s.mu.Unlock()
+	var failures []error
+	for _, handle := range handles {
+		if err := handle.Close(); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	s.ops.Wait()
 	s.mu.Lock()
 	s.closed = true
 	close(s.done)
 	s.mu.Unlock()
-	return nil
+	return errors.Join(failures...)
 }
 
 func (s *JSONLSessionStore) begin(ctx context.Context, id string) (func(), error) {
@@ -471,6 +400,432 @@ func (s *JSONLSessionStore) begin(ctx context.Context, id string) (func(), error
 		lock.Unlock()
 		s.ops.Done()
 	}, nil
+}
+
+func jsonlFileRevision(path string, info fs.FileInfo) SessionPersistenceRevision {
+	return SessionPersistenceRevision(fmt.Sprintf("jsonl:%s:%d:%d:%v", path, info.Size(), info.ModTime().UnixNano(), info.Sys()))
+}
+
+func (s *JSONLSessionStore) adoptHandle(handle *JSONLSessionHandle) {
+	s.mu.Lock()
+	s.handles[handle] = struct{}{}
+	if handle.access == SessionAccessWrite {
+		s.writers[handle.id] = handle
+	}
+	s.mu.Unlock()
+}
+
+func (s *JSONLSessionStore) releaseWriteClaim(id string) {
+	s.mu.Lock()
+	delete(s.writers, id)
+	s.mu.Unlock()
+}
+
+func (s *JSONLSessionStore) releaseHandle(handle *JSONLSessionHandle, materialized bool) {
+	s.mu.Lock()
+	delete(s.handles, handle)
+	if handle.access == SessionAccessWrite && s.writers[handle.id] == handle {
+		delete(s.writers, handle.id)
+		if !materialized {
+			delete(s.pending, handle.id)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *JSONLSessionStore) invalidateMemo(id string) {
+	s.mu.Lock()
+	delete(s.memo, id)
+	for index, candidate := range s.memoLRU {
+		if candidate == id {
+			s.memoLRU = append(s.memoLRU[:index], s.memoLRU[index+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *JSONLSessionStore) readStoredLog(ctx context.Context, id string) (jsonlSessionScan, string, error) {
+	unlock, err := s.begin(ctx, id)
+	if err != nil {
+		return jsonlSessionScan{}, "", err
+	}
+	defer unlock()
+	return s.readStoredLogLocked(ctx, id)
+}
+
+func (s *JSONLSessionStore) readStoredLogLocked(ctx context.Context, id string) (jsonlSessionScan, string, error) {
+	_, path, found, err := s.findArtifact(ctx, id)
+	if err != nil {
+		return jsonlSessionScan{}, "", err
+	}
+	if !found {
+		return jsonlSessionScan{}, "", &SessionPersistenceNotFoundError{SessionID: id}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return jsonlSessionScan{}, "", &SessionPersistenceNotFoundError{SessionID: id}
+		}
+		return jsonlSessionScan{}, "", err
+	}
+	revision := jsonlFileRevision(path, info)
+	s.mu.Lock()
+	if memo, ok := s.memo[id]; ok && memo.revision == revision {
+		s.mu.Unlock()
+		return cloneJSONLSessionScan(memo.scan), path, nil
+	}
+	s.mu.Unlock()
+	var scan jsonlSessionScan
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return jsonlSessionScan{}, "", err
+		}
+		before, err := os.Stat(path)
+		if err != nil {
+			return jsonlSessionScan{}, "", err
+		}
+		revision = jsonlFileRevision(path, before)
+		scan, err = scanJSONLSession(path, id)
+		if err != nil {
+			return jsonlSessionScan{}, "", err
+		}
+		after, err := os.Stat(path)
+		if err != nil {
+			return jsonlSessionScan{}, "", err
+		}
+		if revision == jsonlFileRevision(path, after) || attempt == 1 {
+			break
+		}
+	}
+	s.mu.Lock()
+	s.memo[id] = jsonlSessionMemo{revision: revision, scan: cloneJSONLSessionScan(scan)}
+	for index, candidate := range s.memoLRU {
+		if candidate == id {
+			s.memoLRU = append(s.memoLRU[:index], s.memoLRU[index+1:]...)
+			break
+		}
+	}
+	s.memoLRU = append(s.memoLRU, id)
+	for len(s.memoLRU) > 2 {
+		oldest := s.memoLRU[0]
+		s.memoLRU = s.memoLRU[1:]
+		delete(s.memo, oldest)
+	}
+	s.mu.Unlock()
+	return scan, path, nil
+}
+
+func cloneSessionEvents(events []Event) []Event {
+	result := make([]Event, len(events))
+	for index, event := range events {
+		result[index] = cloneSessionEvent(event)
+	}
+	return result
+}
+
+func cloneJSONLSessionScan(scan jsonlSessionScan) jsonlSessionScan {
+	scan.events = cloneSessionEvents(scan.events)
+	scan.raw = append([]byte(nil), scan.raw...)
+	return scan
+}
+
+type JSONLSessionHandle struct {
+	store               *JSONLSessionStore
+	id                  string
+	header              SessionHeader
+	inheritedEventCount SessionLogOffset
+	access              SessionAccess
+
+	mu             sync.Mutex
+	closed         bool
+	materialized   bool
+	path           string
+	events         []Event
+	cursor         int
+	hasTornTail    bool
+	tornTruncateTo int
+	observedLength int
+}
+
+func (h *JSONLSessionHandle) ID() string { return h.id }
+
+func (h *JSONLSessionHandle) Header() SessionHeader { return h.header }
+
+func (h *JSONLSessionHandle) InheritedEventCount() SessionLogOffset { return h.inheritedEventCount }
+
+func (h *JSONLSessionHandle) Access() SessionAccess { return h.access }
+
+func (h *JSONLSessionHandle) Read(ctx context.Context, bounds ...SessionLogOffset) ([]Event, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.assertOpen("read"); err != nil {
+		return nil, err
+	}
+	if len(bounds) > 2 {
+		return nil, errors.New("session handle Read accepts at most offset and length")
+	}
+	offset := SessionLogOffset(0)
+	length := SessionLogOffset(maxJSONSafeInteger)
+	if len(bounds) > 0 {
+		offset = bounds[0]
+	}
+	if len(bounds) > 1 {
+		length = bounds[1]
+	}
+	if offset < 0 || length < 0 {
+		return nil, errors.New("session handle read offset and length must be non-negative")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var events []Event
+	if h.access == SessionAccessWrite {
+		events = cloneSessionEvents(h.events)
+	} else {
+		scan, path, err := h.store.readStoredLog(ctx, h.id)
+		if err != nil {
+			h.store.mu.Lock()
+			_, pending := h.store.pending[h.id]
+			h.store.mu.Unlock()
+			if pending {
+				events = []Event{}
+			} else {
+				return nil, err
+			}
+		} else {
+			h.path = path
+			h.materialized = true
+			events = scan.events
+		}
+	}
+	if len(events) < h.observedLength {
+		return nil, fmt.Errorf("session %q: stored log shrank below a previously observed prefix (%d < %d)", h.id, len(events), h.observedLength)
+	}
+	h.observedLength = len(events)
+	if int(offset) >= len(events) || length == 0 {
+		return []Event{}, nil
+	}
+	end := int(offset + length)
+	if end < int(offset) || end > len(events) {
+		end = len(events)
+	}
+	return cloneSessionEvents(events[int(offset):end]), nil
+}
+
+func (h *JSONLSessionHandle) Append(ctx context.Context, events []Event) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.assertOpen("append"); err != nil {
+		return err
+	}
+	if h.access != SessionAccessWrite {
+		return &SessionReadOnlyError{SessionID: h.id, Operation: "append"}
+	}
+	batch, err := materializeSessionEventBatch(events, h.cursor)
+	if err != nil {
+		return err
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	unlock, err := h.store.begin(ctx, h.id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if h.hasTornTail {
+		if err := truncateJSONLTail(h.path, int64(h.tornTruncateTo)); err != nil {
+			return err
+		}
+		h.hasTornTail = false
+	}
+	h.store.invalidateMemo(h.id)
+	if h.materialized {
+		if h.path == "" {
+			_, path, found, err := h.store.findArtifact(ctx, h.id)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return fmt.Errorf("live session %q disappeared from persistence", h.id)
+			}
+			h.path = path
+		}
+		if err := appendJSONLLines(h.path, batch); err != nil {
+			return err
+		}
+	} else {
+		path := h.store.pathFor(h.header)
+		if err := h.store.materialize(path, h.header, h.inheritedEventCount, batch); err != nil {
+			_ = os.Remove(path)
+			return err
+		}
+		h.path = path
+		h.materialized = true
+		h.store.mu.Lock()
+		h.store.paths[h.id] = path
+		delete(h.store.pending, h.id)
+		h.store.mu.Unlock()
+	}
+	h.events = append(h.events, cloneSessionEvents(batch)...)
+	h.cursor += len(batch)
+	h.observedLength = h.cursor
+	return nil
+}
+
+func (h *JSONLSessionHandle) Flush(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.assertOpen("flush"); err != nil {
+		return err
+	}
+	if h.access != SessionAccessWrite {
+		return &SessionReadOnlyError{SessionID: h.id, Operation: "flush"}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if h.materialized {
+		return nil
+	}
+	unlock, err := h.store.begin(ctx, h.id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	path := h.store.pathFor(h.header)
+	h.store.invalidateMemo(h.id)
+	if err := h.store.materialize(path, h.header, h.inheritedEventCount, nil); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	h.path = path
+	h.materialized = true
+	h.store.mu.Lock()
+	h.store.paths[h.id] = path
+	delete(h.store.pending, h.id)
+	h.store.mu.Unlock()
+	return nil
+}
+
+func (h *JSONLSessionHandle) Close() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil
+	}
+	h.closed = true
+	materialized := h.materialized
+	h.mu.Unlock()
+	h.store.releaseHandle(h, materialized)
+	return nil
+}
+
+func (h *JSONLSessionHandle) assertOpen(operation string) error {
+	if h.closed {
+		return &SessionHandleClosedError{SessionID: h.id, Operation: operation}
+	}
+	return nil
+}
+
+func materializeSessionEventBatch(events []Event, expected int) ([]Event, error) {
+	if len(events) == 0 {
+		return []Event{}, nil
+	}
+	batch := make([]Event, len(events))
+	for index, event := range events {
+		if int(event.Seq) != expected+index {
+			return nil, fmt.Errorf("session append expected seq %d, got %d", expected+index, event.Seq)
+		}
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("session event %q is not losslessly JSON-serializable: %w", event.Type, err)
+		}
+		var detached Event
+		if err := json.Unmarshal(encoded, &detached); err != nil {
+			return nil, fmt.Errorf("session event %q is not losslessly JSON-serializable: %w", event.Type, err)
+		}
+		if detached.Type == "" || detached.Seq < 0 || detached.Time < -maxJSONSafeInteger || detached.Time > maxJSONSafeInteger {
+			return nil, fmt.Errorf("invalid session event %q", event.Type)
+		}
+		batch[index] = detached
+	}
+	return batch, nil
+}
+
+func truncateJSONLTail(path string, size int64) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func inspectStoredSession(ctx context.Context, store SessionStore, id string, balanceInterrupted bool) (SessionInspection, error) {
+	handle, err := store.Open(ctx, id, SessionAccessRead)
+	if err != nil {
+		return SessionInspection{}, err
+	}
+	events, readErr := handle.Read(ctx)
+	closeErr := handle.Close()
+	if readErr != nil || closeErr != nil {
+		return SessionInspection{}, errors.Join(readErr, closeErr)
+	}
+	if balanceInterrupted {
+		events = append(events, interruptedSessionClosers(events)...)
+	}
+	return SessionInspection{
+		Meta: handle.Header(), InheritedEventCount: handle.InheritedEventCount(), Events: events,
+	}, nil
+}
+
+func openStoredSessionForWrite(ctx context.Context, store SessionStore, id string) (SessionHandle, SessionInspection, error) {
+	handle, err := store.Open(ctx, id, SessionAccessWrite)
+	if err != nil {
+		return nil, SessionInspection{}, err
+	}
+	events, err := handle.Read(ctx)
+	if err != nil {
+		_ = handle.Close()
+		return nil, SessionInspection{}, err
+	}
+	closers := interruptedSessionClosers(events)
+	if len(closers) > 0 {
+		if err := handle.Append(ctx, closers); err != nil {
+			_ = handle.Close()
+			return nil, SessionInspection{}, err
+		}
+		events = append(events, closers...)
+	}
+	return handle, SessionInspection{
+		Meta: handle.Header(), InheritedEventCount: handle.InheritedEventCount(), Events: events,
+	}, nil
+}
+
+func (e *Engine) flushSessionPersistence(ctx context.Context, id string) error {
+	session, err := e.getSession(id)
+	if err != nil {
+		return err
+	}
+	session.mu.Lock()
+	handle := session.store
+	session.mu.Unlock()
+	if handle == nil {
+		return fmt.Errorf("session %q has no active persistence handle", id)
+	}
+	return handle.Flush(ctx)
 }
 
 type jsonlArtifact struct {

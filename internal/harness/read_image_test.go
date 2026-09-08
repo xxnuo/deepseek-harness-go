@@ -101,33 +101,52 @@ func TestReadImagePersistsAttachmentAndHydratesToolHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := executeRegisteredTool(t, e, "read_image", id, map[string]any{"file_path": "fixture.PNG"})
-	value, ok := result.Value.(ImageReadValue)
-	if !ok {
-		t.Fatalf("read_image value = %#v", result.Value)
-	}
-	if value.Path != path || value.Image.MediaType != "image/png" || value.Image.Name != "fixture.PNG" {
-		t.Fatalf("read_image value = %#v", value)
-	}
-	if len(result.Content) != 2 || result.Content[0].Type != "text" || result.Content[1].Type != "image" || result.Content[1].Attachment == nil {
-		t.Fatalf("read_image content = %#v", result.Content)
-	}
-	if !strings.Contains(result.Content[0].Text, "<type>image</type>") {
-		t.Fatalf("read_image envelope = %q", result.Content[0].Text)
-	}
-	stored, err := e.readImage(value.Image)
-	if err != nil || !bytes.Equal(stored, data) {
-		t.Fatalf("stored attachment err=%v equal=%v", err, bytes.Equal(stored, data))
-	}
-
 	s, err := e.getSession(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.appendEvent(s, "tool/result", map[string]any{
-		"turn": 1, "step": 1, "message": toolResultMessage("image-call", result.Content, false),
-	}); err != nil {
+	arguments, err := json.Marshal(map[string]any{"file_path": "fixture.PNG"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := e.executeToolCalls(t.Context(), s, 1, 1, []ToolCall{{
+		ID: "image-call", Name: "read_image", Arguments: arguments,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	var resultContent []ContentBlock
+	var meta map[string]any
+	for _, event := range s.Events {
+		if event.Type != "tool/result" {
+			continue
+		}
+		value, _ := event.Data.(map[string]any)
+		message := nestedMessage(value)
+		blocks := contentBlocks(message["content"])
+		if len(blocks) != 1 || blocks[0].ToolCallID != "image-call" {
+			continue
+		}
+		resultContent = blocks[0].Content
+		meta, _ = value["meta"].(map[string]any)
+	}
+	s.mu.Unlock()
+	if !reflect.DeepEqual(meta, map[string]any{"path": path}) {
+		t.Fatalf("read_image presentation metadata = %#v", meta)
+	}
+	if len(resultContent) != 2 || resultContent[0].Type != "text" || resultContent[1].Type != "image" || resultContent[1].Attachment == nil {
+		t.Fatalf("read_image content = %#v", resultContent)
+	}
+	if !strings.Contains(resultContent[0].Text, "<type>image</type>") {
+		t.Fatalf("read_image envelope = %q", resultContent[0].Text)
+	}
+	image := *resultContent[1].Attachment
+	if image.MediaType != "image/png" || image.Name != "fixture.PNG" {
+		t.Fatalf("read_image attachment = %#v", image)
+	}
+	stored, err := e.readImage(image)
+	if err != nil || !bytes.Equal(stored, data) {
+		t.Fatalf("stored attachment err=%v equal=%v", err, bytes.Equal(stored, data))
 	}
 	messages := e.durableMessages(s, 1)
 	if len(messages) != 1 || messages[0].Role != "tool" || len(messages[0].Images) != 1 {

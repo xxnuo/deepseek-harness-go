@@ -175,6 +175,8 @@ func validateDynamicSessionEvent(typ string, seq int, surface any, sources []int
 type dynamicCordisPreparedSession struct {
 	session            *Session
 	restored           bool
+	handle             SessionHandle
+	storedEventCount   int
 	reservationRelease func()
 	entered            bool
 	announced          bool
@@ -192,6 +194,10 @@ func (e *Engine) discardDynamicCordisPreparedSession(run *dynamicCordisRun, id s
 		release := prepared.reservationRelease
 		prepared.reservationRelease = nil
 		release()
+	}
+	if prepared.handle != nil {
+		_ = prepared.handle.Close()
+		prepared.handle = nil
 	}
 	delete(run.preparedSessions, id)
 }
@@ -377,14 +383,12 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 	session := prepared.session
 	session.mu.Lock()
 	header := session.Header
-	inheritedEventCount := session.InheritedEventCount
-	events := append([]Event(nil), session.Events...)
-	firstLiveSeq := session.firstLiveSeq
 	priorStore := session.store
 	priorAttached := session.attached
 	priorAttachmentGeneration := session.attachmentGeneration
 	priorModelSelectionSnapshot := session.subagentModelSelectionSnapshot
 	priorModelSelectionSampled := session.subagentModelSelectionSampled
+	priorEventCount := len(session.Events)
 	session.mu.Unlock()
 	e.mu.RLock()
 	if existing := e.sessions[header.ID]; existing != nil && existing != session {
@@ -398,31 +402,26 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 	}
 	store := e.sessionStore
 	e.mu.RUnlock()
-	if store != nil {
+	handle := prepared.handle
+	storedEventCount := prepared.storedEventCount
+	if store != nil && handle == nil {
 		if prepared.restored {
-			if len(events) > firstLiveSeq {
-				if err := store.Append(context.Background(), header.ID, events[firstLiveSeq:]); err != nil {
-					return err
-				}
-			}
-		} else {
-			if err := store.Create(context.Background(), header, inheritedEventCount); err != nil {
+			var inspection SessionInspection
+			var err error
+			handle, inspection, err = openStoredSessionForWrite(context.Background(), store, header.ID)
+			if err != nil {
 				return err
 			}
-			if len(events) > 0 {
-				if err := store.Append(context.Background(), header.ID, events); err != nil {
-					rollbackSessionStoreCreate(store, header.ID)
-					return err
-				}
+			storedEventCount = len(inspection.Events)
+		} else {
+			var err error
+			handle, err = store.Create(context.Background(), header, session.InheritedEventCount)
+			if err != nil {
+				return err
 			}
 		}
 	}
-	session.mu.Lock()
-	session.store = store
-	attachSessionLocked(session)
-	session.mu.Unlock()
 	e.mu.Lock()
-	e.sessions[header.ID] = session
 	var modelSelectionEvent Event
 	modelSelectionRecorded := false
 	if !prepared.restored && e.hasSubagentModelSelectionToolLocked() {
@@ -432,25 +431,55 @@ func (e *Engine) dynamicCordisEnterPrepared(run *dynamicCordisRun, prepared *dyn
 		modelSelectionEvent, modelSelectionRecorded, recordErr = e.recordSubagentModelSelectionPolicyLocked(session)
 		session.mu.Unlock()
 		if recordErr != nil {
-			delete(e.sessions, header.ID)
-			// Enter has not completed: restore the prepared session to the exact
-			// pre-enter state so callers may discard or retry it without leaving a
-			// detached registry entry or a stale store/snapshot handle behind.
 			session.mu.Lock()
 			session.store = priorStore
 			session.attached = priorAttached
 			session.attachmentGeneration = priorAttachmentGeneration
 			session.subagentModelSelectionSnapshot = priorModelSelectionSnapshot
 			session.subagentModelSelectionSampled = priorModelSelectionSampled
+			session.Events = session.Events[:priorEventCount]
 			session.mu.Unlock()
 			prepared.entered = false
 			e.mu.Unlock()
-			if !prepared.restored {
-				rollbackSessionStoreCreate(store, header.ID)
+			if handle != nil {
+				_ = handle.Close()
 			}
 			return recordErr
 		}
 	}
+	session.mu.Lock()
+	events := cloneSessionEvents(session.Events)
+	if storedEventCount < 0 || storedEventCount > len(events) {
+		session.mu.Unlock()
+		e.mu.Unlock()
+		if handle != nil {
+			_ = handle.Close()
+		}
+		return fmt.Errorf("session %q stored event count %d exceeds log length %d", header.ID, storedEventCount, len(events))
+	}
+	if handle != nil && storedEventCount < len(events) {
+		if err := handle.Append(context.Background(), events[storedEventCount:]); err != nil {
+			session.store = priorStore
+			session.attached = priorAttached
+			session.attachmentGeneration = priorAttachmentGeneration
+			session.subagentModelSelectionSnapshot = priorModelSelectionSnapshot
+			session.subagentModelSelectionSampled = priorModelSelectionSampled
+			session.Events = session.Events[:priorEventCount]
+			session.mu.Unlock()
+			e.mu.Unlock()
+			_ = handle.Close()
+			return err
+		}
+		storedEventCount = len(events)
+	}
+	session.store = handle
+	session.storedEventCount = storedEventCount
+	session.published = true
+	attachSessionLocked(session)
+	session.mu.Unlock()
+	prepared.handle = nil
+	prepared.storedEventCount = storedEventCount
+	e.sessions[header.ID] = session
 	e.mu.Unlock()
 	if modelSelectionRecorded {
 		e.publishEvent(header.ID, modelSelectionEvent)
@@ -472,6 +501,8 @@ func (e *Engine) dynamicCordisDetachPrepared(run *dynamicCordisRun, prepared *dy
 		session.mu.Lock()
 		id := session.Header.ID
 		detachSessionLocked(session)
+		handle := session.store
+		session.store = nil
 		activity := session.activity
 		cancel := session.Cancel
 		session.Cancel = nil
@@ -481,6 +512,9 @@ func (e *Engine) dynamicCordisDetachPrepared(run *dynamicCordisRun, prepared *dy
 			activity.cancel(&agentCancelError{cause: AgentCancelCause{Kind: "disposed"}})
 		} else if cancel != nil {
 			cancel()
+		}
+		if handle != nil {
+			_ = handle.Close()
 		}
 		e.releaseFileReferenceSearch(id)
 		_ = e.jobs.disposeOwner(id, "owner disposed")

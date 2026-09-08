@@ -181,7 +181,7 @@ func (e *Engine) findPreset(id string) (presetRecord, bool) {
 			return row, true
 		}
 	}
-	// dsh-v0.1.2-alpha.4 retains the shipped Code Mode preset as `ptc`.
+	// dsh-v0.1.2-alpha.5 retains the shipped Code Mode preset as `ptc`.
 	// Keep the old id as a read/runtime alias for persisted Go sessions and
 	// callers, while the discovered roster exposes only the canonical id.
 	if id == "code" {
@@ -810,7 +810,9 @@ func (e *Engine) createSubagent(ctx context.Context, parentID, id, preset string
 		return "", err
 	}
 	e.mu.Unlock()
+	if err := e.publishDeferredSession(s); err != nil {
+		return "", err
+	}
 	committed = true
-	e.publishDeferredSession(s)
 	return child, nil
 }

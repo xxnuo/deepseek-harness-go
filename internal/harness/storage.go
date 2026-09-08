@@ -49,11 +49,20 @@ var storageUnitNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 func ValidStorageUnitName(name string) bool { return storageUnitNameRE.MatchString(name) }
 
 type KVUnitDescriptor struct {
-	Name      string
-	Version   int
-	Tables    []string
-	HasGlobal bool
+	Name               string
+	Version            int
+	Tables             []string
+	HasGlobal          bool
+	Layout             KVLayout
+	CompatibleVersions []int
 }
+
+type KVLayout string
+
+const (
+	KVLayoutSingle    KVLayout = "single"
+	KVLayoutPerRecord KVLayout = "per-record"
+)
 
 type KVSnapshot struct {
 	Tables map[string]map[string]any
@@ -66,6 +75,10 @@ type KVUnit interface {
 	DeleteRecord(context.Context, string, string) error
 	SetGlobal(context.Context, any) error
 	Close() error
+}
+
+type KVRecordBackupper interface {
+	BackupRecord(context.Context, string, string) (string, error)
 }
 
 type KVFacet interface {

@@ -40,7 +40,7 @@ func TestShellEnvironmentRegistryValidationCollectionAndDisposal(t *testing.T) {
 		t.Fatalf("collected values = %#v", values)
 	}
 	rows := registry.list()
-	if len(rows) != 2 || rows[0].Key != "DSH_SESSION_JSONL" || rows[1].Key != "DSH_TEST_SESSION" {
+	if len(rows) != 1 || rows[0].Key != "DSH_TEST_SESSION" {
 		t.Fatalf("registry list = %#v", rows)
 	}
 	dispose()

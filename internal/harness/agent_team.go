@@ -25,13 +25,11 @@ const (
 	defaultTeamDisposalTimeout = 5 * time.Second
 	minimumTeamWait            = 10 * time.Second
 	maximumTeamWait            = time.Hour
-	teamEventVersion           = 1
+	teamEventVersion           = 2
 	teamLeadName               = "lead"
 	teamMemberProvisioning     = "provisioning"
 	teamMemberActive           = "active"
 	teamMemberFailed           = "failed"
-	teamMessageQuiet           = "quiet"
-	teamMessageWakeup          = "wakeup"
 	teamTaskPending            = "pending"
 	teamTaskInProgress         = "in_progress"
 	teamTaskCompleted          = "completed"
@@ -173,7 +171,6 @@ type TeamMessageSnapshot struct {
 	SenderID   string         `json:"senderId"`
 	SenderName string         `json:"senderName"`
 	TargetID   string         `json:"targetId"`
-	Delivery   string         `json:"delivery"`
 	Content    []ContentBlock `json:"content"`
 }
 
@@ -190,9 +187,8 @@ type SpawnTeammateResult struct {
 }
 
 type SendTeamMessageRequest struct {
-	Target   string
-	Content  []ContentBlock
-	Delivery string
+	Target  string
+	Content []ContentBlock
 }
 
 type SendTeamMessageResult struct {
@@ -540,7 +536,7 @@ func validateCurrentTeamPayload(eventType string, value any) error {
 		if err != nil {
 			return err
 		}
-		message, messageErr := teamJSONExactObject(object["message"], []string{"id", "senderId", "senderName", "targetId", "delivery", "content"}, nil)
+		message, messageErr := teamJSONExactObject(object["message"], []string{"id", "senderId", "senderName", "targetId", "content"}, nil)
 		if messageErr != nil {
 			return messageErr
 		}
@@ -551,10 +547,6 @@ func validateCurrentTeamPayload(eventType string, value any) error {
 		}
 		if _, err = teamJSONString(message["senderName"], false); err != nil {
 			return err
-		}
-		delivery, deliveryErr := teamJSONString(message["delivery"], false)
-		if deliveryErr != nil || delivery != teamMessageQuiet && delivery != teamMessageWakeup {
-			return errors.New("invalid message delivery")
 		}
 		content, arrayErr := teamJSONArray(message["content"])
 		if arrayErr != nil {
@@ -716,8 +708,7 @@ func foldTeam(rootID string, events []Event) (*teamFoldState, error) {
 				continue
 			}
 			message := cloneTeamMessage(value.Message)
-			if message.ID == "" || message.SenderID == "" || message.SenderName == "" || message.TargetID == "" ||
-				(message.Delivery != teamMessageQuiet && message.Delivery != teamMessageWakeup) {
+			if message.ID == "" || message.SenderID == "" || message.SenderName == "" || message.TargetID == "" {
 				return nil, errors.New("persisted Agent Teams team/message/queued payload is invalid")
 			}
 			if _, exists := state.messages[message.ID]; exists {
@@ -1085,11 +1076,7 @@ func (t *TeamService) append(root *Session, typ string, data any) error {
 	root.mu.Lock()
 	rootID := root.Header.ID
 	root.mu.Unlock()
-	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
-	if !ok {
-		return teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
-	}
-	if err := flusher.Flush(context.Background(), rootID); err != nil {
+	if err := t.engine.flushSessionPersistence(context.Background(), rootID); err != nil {
 		return err
 	}
 	t.notify(rootID)
@@ -1271,12 +1258,7 @@ func (t *TeamService) SpawnTeammate(ctx context.Context, callerID string, reques
 	fork := request.Context == "fork"
 	_, _, createErr := t.engine.startContinuableModelSubagentWithID(operationCtx, callerID, childID, description, request.Prompt, fork, config)
 	if createErr == nil {
-		flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
-		if !ok {
-			createErr = teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
-		} else {
-			createErr = flusher.Flush(operationCtx, childID)
-		}
+		createErr = t.engine.flushSessionPersistence(operationCtx, childID)
 	}
 	if operationErr := t.creationContextError(operationCtx); operationErr != nil {
 		createErr = operationErr
@@ -1350,11 +1332,7 @@ func teamMessageSource(rootID string, message TeamMessageSnapshot) map[string]an
 }
 
 func (t *TeamService) acknowledgeRecordedMessage(root *Session, target *Session, messageID, targetID string) error {
-	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
-	if !ok {
-		return teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
-	}
-	if err := flusher.Flush(context.Background(), targetID); err != nil {
+	if err := t.engine.flushSessionPersistence(context.Background(), targetID); err != nil {
 		return err
 	}
 	if !sessionHasTeamMessage(target, messageID) {
@@ -1462,17 +1440,13 @@ func (t *TeamService) attachForWakeup(ctx context.Context, target *Session) erro
 	return err
 }
 
-func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message TeamMessageSnapshot, forceWake bool) (bool, error) {
+func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message TeamMessageSnapshot) (bool, error) {
 	target, err := t.engine.getSession(message.TargetID)
 	if err != nil {
 		return false, nil
 	}
 	if sessionHasTeamMessage(target, message.ID) {
-		flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
-		if !ok {
-			return false, teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
-		}
-		if err := flusher.Flush(ctx, message.TargetID); err != nil {
+		if err := t.engine.flushSessionPersistence(ctx, message.TargetID); err != nil {
 			return false, err
 		}
 		return sessionHasTeamMessage(target, message.ID), nil
@@ -1483,36 +1457,15 @@ func (t *TeamService) dispatchLocked(ctx context.Context, root *Session, message
 	root.mu.Lock()
 	rootID := root.Header.ID
 	root.mu.Unlock()
-	delivery := message.Delivery
-	if forceWake {
-		delivery = teamMessageWakeup
-	}
 	if message.TargetID == rootID {
-		targetName := "next-step"
-		wakeup := false
-		if delivery == teamMessageWakeup {
-			targetName, wakeup = "next-turn", true
-		}
-		_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), targetName, wakeup)
-	} else if delivery == teamMessageQuiet {
-		target.mu.Lock()
-		attached := target.attached
-		target.mu.Unlock()
-		if !attached {
-			return false, nil
-		}
-		_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), "next-step", false)
+		_, err = t.engine.enqueueTeamPrompt(target, teamMessageContent(message), teamMessageSource(rootID, message), "next-step", true)
 	} else {
-		_, err = t.engine.promptContinuableModelSubagent(ctx, rootID, message.TargetID, teamMessageContent(message), teamMessageSource(rootID, message))
+		_, err = t.engine.deliverContinuableModelSubagent(ctx, rootID, message.TargetID, teamMessageContent(message), teamMessageSource(rootID, message), "next-step")
 	}
 	if err != nil {
 		return false, err
 	}
-	flusher, ok := t.engine.sessionStore.(SessionPersistenceFlusher)
-	if !ok {
-		return false, teamError("TEAM_PERSISTENCE_UNAVAILABLE", "Agent Teams requires durable session flush support")
-	}
-	if err := flusher.Flush(ctx, message.TargetID); err != nil {
+	if err := t.engine.flushSessionPersistence(ctx, message.TargetID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1562,7 +1515,6 @@ func (t *TeamService) dispatchPendingMessage(
 	root *Session,
 	targetID string,
 	throughID string,
-	forceWake bool,
 ) teamDispatchOutcome {
 	runtime.op.Lock()
 	state, err := t.state(root)
@@ -1571,11 +1523,8 @@ func (t *TeamService) dispatchPendingMessage(
 		return teamDispatchOutcome{err: err}
 	}
 	batch := []TeamMessageSnapshot{}
-	if message, ok := state.messages[throughID]; ok && !state.delivered[throughID] {
-		batch = []TeamMessageSnapshot{message}
-		if forceWake {
-			batch = teamPendingTargetBatch(state, targetID, throughID)
-		}
+	if _, ok := state.messages[throughID]; ok && !state.delivered[throughID] {
+		batch = teamPendingTargetBatch(state, targetID, throughID)
 	}
 	runtime.op.Unlock()
 
@@ -1596,7 +1545,7 @@ func (t *TeamService) dispatchPendingMessage(
 		}
 		runtime.op.Unlock()
 
-		candidateAccepted, dispatchErr := t.dispatchLocked(ctx, root, candidate, forceWake)
+		candidateAccepted, dispatchErr := t.dispatchLocked(ctx, root, candidate)
 		if dispatchErr != nil || !candidateAccepted {
 			return teamDispatchOutcome{accepted: accepted, err: dispatchErr}
 		}
@@ -1626,9 +1575,6 @@ func (t *TeamService) SendMessage(ctx context.Context, callerID string, request 
 	}
 	if err := ctx.Err(); err != nil {
 		return SendTeamMessageResult{}, err
-	}
-	if request.Delivery != teamMessageQuiet && request.Delivery != teamMessageWakeup {
-		return SendTeamMessageResult{}, teamError("TEAM_INVALID_ARGUMENT", "delivery must be quiet or wakeup")
 	}
 	operationCtx, dispatch, err := t.beginDispatch(ctx)
 	if err != nil {
@@ -1671,7 +1617,7 @@ func (t *TeamService) SendMessage(ctx context.Context, callerID string, request 
 		}
 		message = TeamMessageSnapshot{
 			ID: newID("team-message"), SenderID: callerID, SenderName: membership.name,
-			TargetID: targetID, Delivery: request.Delivery, Content: cloneContentBlocks(request.Content),
+			TargetID: targetID, Content: cloneContentBlocks(request.Content),
 		}
 		encoded, encodeErr := stringifyJavaScriptJSON(teamMessageContent(message))
 		if encodeErr != nil {
@@ -1685,9 +1631,8 @@ func (t *TeamService) SendMessage(ctx context.Context, callerID string, request 
 		}); err != nil {
 			return err
 		}
-		forceWake := message.Delivery == teamMessageWakeup
 		dispatchResult = t.serializeTargetDispatch(targetID, func() teamDispatchOutcome {
-			return t.dispatchPendingMessage(ctx, runtime, membership.root, targetID, message.ID, forceWake)
+			return t.dispatchPendingMessage(ctx, runtime, membership.root, targetID, message.ID)
 		})
 		return nil
 	}()
@@ -2224,7 +2169,7 @@ func (t *TeamService) recoverRoot(ctx context.Context, root *Session) {
 		terminal := member
 		terminal.Phase = teamMemberFailed
 		terminal.Error = "provisioning did not leave a resumable child Session"
-		inspection, inspectErr := t.engine.sessionStore.Inspect(ctx, member.ID)
+		inspection, inspectErr := inspectStoredSession(ctx, t.engine.sessionStore, member.ID, true)
 		if inspectErr != nil {
 			terminal.Error = "child Session recovery failed: " + inspectErr.Error()
 		} else {
@@ -2247,16 +2192,12 @@ func (t *TeamService) recoverRoot(ctx context.Context, root *Session) {
 			continue
 		}
 		message := state.messages[id]
-		batch := []TeamMessageSnapshot{message}
-		forceWake := message.Delivery == teamMessageWakeup
-		if forceWake {
-			batch = teamPendingTargetBatch(state, message.TargetID, message.ID)
-		}
+		batch := teamPendingTargetBatch(state, message.TargetID, message.ID)
 		for _, candidate := range batch {
 			if state.delivered[candidate.ID] {
 				continue
 			}
-			accepted, dispatchErr := t.dispatchLocked(ctx, root, candidate, forceWake)
+			accepted, dispatchErr := t.dispatchLocked(ctx, root, candidate)
 			if dispatchErr != nil || !accepted {
 				break
 			}

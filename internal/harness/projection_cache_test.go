@@ -3,7 +3,10 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -53,7 +56,7 @@ func waitProjectionCacheSeq(t *testing.T, engine *Engine, id string, want int) {
 		engine.projectionCache.medium.mu.RLock()
 		record, ok := engine.projectionCache.medium.records[id]
 		engine.projectionCache.medium.mu.RUnlock()
-		if ok && record.Seq == want {
+		if ok && projectionCheckpointCut(record.Rows) == want {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -107,14 +110,15 @@ func TestSessionProjectionCacheMandatoryWritesColdReadAndStaleWriteBack(t *testi
 		t.Fatal(err)
 	}
 	closeSession, _ := engine.getSession(closeOnly)
+	waitProjectionCacheSeq(t, engine, closeOnly, -1)
 	if _, err := engine.appendEvent(closeSession, "user/message", map[string]any{
 		"id": "close-prompt", "role": "user", "content": []ContentBlock{{Type: "text", Text: "close"}},
 		"source": map[string]any{"kind": "user"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := engine.projectionCache.medium.snapshot(closeSession.Header, 0, true, engine.sessionProjections.Signature()); ok {
-		t.Fatal("non-mandatory event was written before the configured threshold")
+	if snapshot, ok := engine.projectionCache.medium.snapshot(engine.sessionProjections, closeSession.Header, closeSession.InheritedEventCount); !ok || snapshot.AsOfSeq != -1 {
+		t.Fatalf("non-mandatory event advanced the creation checkpoint: %#v, ok=%t", snapshot, ok)
 	}
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
@@ -141,7 +145,7 @@ func TestSessionProjectionCacheMandatoryWritesColdReadAndStaleWriteBack(t *testi
 	closeLastSeq := len(closeCold.Events) - 1
 	closeHeader := closeCold.Header
 	closeCold.mu.Unlock()
-	if _, ok := reopened.projectionCache.medium.snapshot(closeHeader, closeLastSeq, true, reopened.sessionProjections.Signature()); !ok {
+	if snapshot, ok := reopened.projectionCache.medium.snapshot(reopened.sessionProjections, closeHeader, closeCold.InheritedEventCount); !ok || snapshot.AsOfSeq != closeLastSeq {
 		t.Fatal("engine close did not write the mandatory projection checkpoint")
 	}
 	rows := reopened.ListSessions()
@@ -216,8 +220,7 @@ return {
     })
   },
 }`)
-	composition := engine.sessionProjections.Signature()
-	if !strings.Contains(composition, "dynamic/close-count") {
+	if composition := engine.sessionProjections.Signature(); !strings.Contains(composition, "dynamic/close-count") {
 		t.Fatalf("dynamic projection missing from composition %q", composition)
 	}
 	session, err := engine.getSession(id)
@@ -270,17 +273,177 @@ return {
 	if !ok {
 		t.Fatal("final projection cache record is missing")
 	}
-	if record.Seq != lastSeq {
-		t.Fatalf("final projection cache seq = %d, want %d", record.Seq, lastSeq)
+	row, ok := record.Rows["dynamic/close-count"]
+	if !ok {
+		t.Fatal("final dynamic projection cache row is missing")
 	}
-	if record.Composition != composition {
-		t.Fatalf("final projection cache composition = %q, want %q", record.Composition, composition)
+	if row.Seq != lastSeq {
+		t.Fatalf("final projection cache seq = %d, want %d", row.Seq, lastSeq)
 	}
 	want := map[string]any{"count": float64(1)}
-	if got := record.Values["dynamic/close-count"]; !reflect.DeepEqual(got, want) {
+	if got := row.Value; !reflect.DeepEqual(got, want) {
 		t.Fatalf("final dynamic projection = %#v, want %#v", got, want)
 	}
 	if after := engine.sessionProjections.Signature(); strings.Contains(after, "dynamic/close-count") {
 		t.Fatalf("dynamic projection survived run disposal: %q", after)
 	}
+}
+
+func TestSessionProjectionCacheRecoversCompatibleVersionsAndBacksUpInvalidRecords(t *testing.T) {
+	titleDefinition := ProjectionDefinition{
+		Key: "title", StateVersion: 1,
+		Init: func() any { return "" },
+		Apply: func(state any, event Event) ProjectionResult {
+			if event.Type == "test/title" {
+				return ProjectionResult{State: event.Data.(string), Changed: true}
+			}
+			return ProjectionResult{State: state}
+		},
+		View: func(state any) any { return state },
+	}
+	oldRecord := func(title string) map[string]any {
+		return map[string]any{
+			"identity": map[string]any{"createdAt": 1},
+			"rows":     map[string]any{"title": map[string]any{"ver": 1, "seq": 4, "val": title}},
+		}
+	}
+	writeJSON := func(t *testing.T, path string, value any) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, fixture := range []struct {
+		name    string
+		version int
+		legacy  bool
+	}{
+		{name: "v3", version: 3, legacy: true},
+		{name: "v4", version: 4},
+		{name: "v5", version: 5},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "fixture-session"
+			if fixture.legacy {
+				writeJSON(t, filepath.Join(root, "session_projcache.json"), map[string]any{
+					"unit":   map[string]any{"name": "session_projcache", "version": fixture.version},
+					"global": nil,
+					"tables": map[string]any{"sessions": map[string]any{id: oldRecord(fixture.name)}},
+				})
+			} else {
+				writeJSON(t, filepath.Join(root, "session_projcache", "sessions", id+".json"), map[string]any{
+					"version": fixture.version, "record": oldRecord(fixture.name),
+				})
+			}
+			registry := NewSessionProjectionRegistry()
+			if _, err := registry.Register(titleDefinition); err != nil {
+				t.Fatal(err)
+			}
+			cache, err := newSessionProjectionCache(root, SessionProjectionCacheConfig{WriteEveryEvents: 100, WriteInterval: time.Hour}, registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cache.close(nil) })
+			header := SessionHeader{ID: id, CreatedAt: 1}
+			snapshot, ok := cache.cachedSnapshot(header, 0, "title")
+			if !ok || snapshot.Values["title"] != fixture.name {
+				t.Fatalf("compatible snapshot = %#v, ok=%t", snapshot, ok)
+			}
+			session := &Session{Header: SessionHeader{ID: id, CreatedAt: 2}}
+			event := Event{Type: "test/title", Seq: 0, Time: 1, Data: "current"}
+			session.Events = append(session.Events, event)
+			if _, err := registry.Drive(session, event); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.writeSession(t.Context(), session); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(root, "session_projcache", "sessions", id+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var current struct {
+				Version int `json:"version"`
+				Record  struct {
+					Identity projectionCacheIdentity `json:"identity"`
+					Rows     ProjectionCheckpoint    `json:"rows"`
+				} `json:"record"`
+			}
+			if err := json.Unmarshal(data, &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.Version != sessionProjectionCacheVersion || current.Record.Identity.IsSeeded == nil || *current.Record.Identity.IsSeeded || current.Record.Rows["title"].Value != "current" {
+				t.Fatalf("rewritten document = %#v", current)
+			}
+		})
+	}
+
+	t.Run("lineageless-seeded", func(t *testing.T) {
+		root := t.TempDir()
+		id := "lineageless"
+		writeJSON(t, filepath.Join(root, "session_projcache", "sessions", id+".json"), map[string]any{
+			"version": 5, "record": oldRecord("old"),
+		})
+		registry := NewSessionProjectionRegistry()
+		if _, err := registry.Register(titleDefinition); err != nil {
+			t.Fatal(err)
+		}
+		cache, err := newSessionProjectionCache(root, SessionProjectionCacheConfig{WriteEveryEvents: 100, WriteInterval: time.Hour}, registry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cache.close(nil)
+		if _, ok := cache.cachedSnapshot(SessionHeader{ID: id, CreatedAt: 1, IsSeeded: true}, 2, "title"); ok {
+			t.Fatal("lineage-less record was accepted for a seeded session")
+		}
+	})
+
+	t.Run("invalid-record", func(t *testing.T) {
+		root := t.TempDir()
+		sessionsDir := filepath.Join(root, "session_projcache", "sessions")
+		writeJSON(t, filepath.Join(sessionsDir, "broken.json"), map[string]any{
+			"version": sessionProjectionCacheVersion,
+			"record":  map[string]any{"identity": map[string]any{"createdAt": "bad"}, "rows": "bad"},
+		})
+		writeJSON(t, filepath.Join(sessionsDir, "good.json"), map[string]any{
+			"version": 5, "record": oldRecord("survivor"),
+		})
+		registry := NewSessionProjectionRegistry()
+		if _, err := registry.Register(titleDefinition); err != nil {
+			t.Fatal(err)
+		}
+		cache, err := newSessionProjectionCache(root, SessionProjectionCacheConfig{WriteEveryEvents: 100, WriteInterval: time.Hour}, registry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cache.close(nil)
+		if _, err := os.Stat(filepath.Join(sessionsDir, "broken.json")); !os.IsNotExist(err) {
+			t.Fatalf("invalid record was not moved aside: %v", err)
+		}
+		entries, err := os.ReadDir(sessionsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backedUp := false
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "broken.json.bak.") {
+				backedUp = true
+			}
+		}
+		if !backedUp {
+			t.Fatalf("invalid record backup missing: %#v", entries)
+		}
+		if snapshot, ok := cache.cachedSnapshot(SessionHeader{ID: "good", CreatedAt: 1}, 0, "title"); !ok || snapshot.Values["title"] != "survivor" {
+			t.Fatalf("neighbor record did not survive: %#v, ok=%t", snapshot, ok)
+		}
+	})
 }

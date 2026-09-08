@@ -73,11 +73,18 @@ type DomainTableSpec struct {
 	Parse DomainValueParser
 }
 
+type DomainInvalidRecordsPolicy string
+
+const DomainInvalidRecordsBackupAndSkip DomainInvalidRecordsPolicy = "backup-and-skip"
+
 type DomainSpec struct {
-	Name    string
-	Version int
-	Global  *DomainGlobalSpec
-	Tables  map[string]DomainTableSpec
+	Name               string
+	Version            int
+	Layout             KVLayout
+	CompatibleVersions []int
+	InvalidRecords     DomainInvalidRecordsPolicy
+	Global             *DomainGlobalSpec
+	Tables             map[string]DomainTableSpec
 }
 
 func ValidateDomainSpec(spec DomainSpec) error {
@@ -86,6 +93,17 @@ func ValidateDomainSpec(spec DomainSpec) error {
 	}
 	if spec.Version < 0 {
 		return fmt.Errorf("domain %q version must be a non-negative integer, got %d", spec.Name, spec.Version)
+	}
+	for _, version := range spec.CompatibleVersions {
+		if version < 0 || version >= spec.Version {
+			return fmt.Errorf("domain %q compatibleVersions entries must be non-negative integers below version %d, got %d", spec.Name, spec.Version, version)
+		}
+	}
+	if spec.Layout != "" && spec.Layout != KVLayoutSingle && spec.Layout != KVLayoutPerRecord {
+		return fmt.Errorf("domain %q layout must be 'single' or 'per-record', got %q", spec.Name, spec.Layout)
+	}
+	if spec.InvalidRecords != "" && spec.InvalidRecords != DomainInvalidRecordsBackupAndSkip {
+		return fmt.Errorf("domain %q invalidRecords must be 'backup-and-skip' when present, got %q", spec.Name, spec.InvalidRecords)
 	}
 	for name, table := range spec.Tables {
 		if !ValidStorageUnitName(name) {
@@ -115,7 +133,10 @@ func DomainDescriptor(spec DomainSpec) KVUnitDescriptor {
 		tables = append(tables, table)
 	}
 	sort.Strings(tables)
-	return KVUnitDescriptor{Name: spec.Name, Version: spec.Version, Tables: tables, HasGlobal: spec.Global != nil}
+	return KVUnitDescriptor{
+		Name: spec.Name, Version: spec.Version, Tables: tables, HasGlobal: spec.Global != nil,
+		Layout: spec.Layout, CompatibleVersions: append([]int(nil), spec.CompatibleVersions...),
+	}
 }
 
 type DomainChange struct {
@@ -223,7 +244,17 @@ func (f *DomainFacility) Open(ctx context.Context, spec DomainSpec) (*Domain, er
 		for key, raw := range snapshot.Tables[table] {
 			value, err := tableSpec.Parse(raw)
 			if err != nil {
-				return nil, invalidDomainRecord(spec.Name, table, key, err)
+				invalid := invalidDomainRecord(spec.Name, table, key, err)
+				backupper, ok := unit.(KVRecordBackupper)
+				if spec.InvalidRecords != DomainInvalidRecordsBackupAndSkip || !ok {
+					return nil, invalid
+				}
+				moved, backupErr := backupper.BackupRecord(ctx, table, key)
+				if backupErr != nil {
+					return nil, backupErr
+				}
+				log.Printf("domain %q: stored record %q in table %q failed schema validation; moved to %q and treated as absent. Cause: %v", spec.Name, key, table, moved, err)
+				continue
 			}
 			records[key] = value
 		}

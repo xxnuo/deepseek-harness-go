@@ -674,6 +674,8 @@ func detachSDKSessionRecordWithDynamicOrigin(e *Engine, origin *dynamicCordisRun
 	session.pending = nil
 	session.steering = nil
 	detachSessionLocked(session)
+	handle := session.store
+	session.store = nil
 	session.requestHeaderLogged = false
 	activity := session.activity
 	cancel := session.Cancel
@@ -706,12 +708,16 @@ func detachSDKSessionRecordWithDynamicOrigin(e *Engine, origin *dynamicCordisRun
 	jobsErr := e.jobs.disposeOwner(id, "owner disposed")
 	terminalErr := e.terminals.closeOwner(id)
 	e.shells.closeOwner(id)
+	var persistenceErr error
+	if handle != nil {
+		persistenceErr = handle.Close()
+	}
 	if origin != nil {
 		_ = e.dispatchDynamicCordisEvent(origin, id, true, "session/disposed", dynamicSessionView(session))
 	} else {
 		e.emitDynamicCordisScopedContained(id, "session/disposed", dynamicSessionView(session))
 	}
-	return errors.Join(jobsErr, terminalErr)
+	return errors.Join(jobsErr, terminalErr, persistenceErr)
 }
 
 type sdkSessionLineage struct {

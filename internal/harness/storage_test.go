@@ -237,6 +237,152 @@ func TestJSONStorageBackendSpecifics(t *testing.T) {
 	}
 }
 
+func TestJSONStoragePerRecordLayout(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	descriptor := KVUnitDescriptor{
+		Name: "records", Version: 2, Tables: []string{"items"}, HasGlobal: true,
+		Layout: KVLayoutPerRecord, CompatibleVersions: []int{1},
+	}
+	backend, err := NewJSONStorageBackend(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	unit, err := backend.Open(ctx, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, err := unit.LoadAll(ctx); err != nil || len(snapshot.Tables["items"]) != 0 || snapshot.Global != nil {
+		t.Fatalf("empty snapshot=%#v err=%v", snapshot, err)
+	}
+	if err := unit.PutRecord(ctx, "items", "good", map[string]any{"value": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unit.SetGlobal(ctx, "global"); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(root, "records", "items", "good.json")
+	data, err := os.ReadFile(recordPath)
+	if err != nil || !strings.HasSuffix(string(data), "\n") || !strings.Contains(string(data), `"version": 2`) {
+		t.Fatalf("record=%q err=%v", data, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "records", "items", "compatible.json"), []byte(`{"version":1,"record":{"value":"old"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "records", "items", "stale.json"), []byte(`{"version":0,"record":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "records", "items", "broken.json"), []byte(`{oops`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "records", "items", "unsafe%2Fkey.json"), []byte(`{"version":2,"record":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := unit.LoadAll(ctx)
+	if err != nil || len(snapshot.Tables["items"]) != 2 || snapshot.Tables["items"]["stale"] != nil || snapshot.Tables["items"]["broken"] != nil || snapshot.Global != "global" {
+		t.Fatalf("filtered snapshot=%#v err=%v", snapshot, err)
+	}
+	if err := unit.PutRecord(ctx, "items", "a/b", true); err == nil || !strings.Contains(err.Error(), "not path-safe") {
+		t.Fatalf("unsafe key error=%v", err)
+	}
+	backupper, ok := unit.(KVRecordBackupper)
+	if !ok {
+		t.Fatal("per-record unit has no backup capability")
+	}
+	moved, err := backupper.BackupRecord(ctx, "items", "good")
+	if err != nil || !strings.Contains(moved, "good.json.bak.") {
+		t.Fatalf("backup=%q err=%v", moved, err)
+	}
+	if _, err := os.Stat(recordPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("original record after backup: %v", err)
+	}
+	if err := unit.PutRecord(ctx, "items", "good", map[string]any{"value": 2}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJSONStoragePerRecordLegacyBootstrap(t *testing.T) {
+	ctx := context.Background()
+	descriptor := KVUnitDescriptor{
+		Name: "records", Version: 3, Tables: []string{"items"},
+		Layout: KVLayoutPerRecord, CompatibleVersions: []int{2},
+	}
+	t.Run("accepted legacy is copied and preserved", func(t *testing.T) {
+		root := t.TempDir()
+		legacy := []byte(`{"unit":{"name":"records","version":2},"tables":{"items":{"old":{"value":1}},"other":{"x":true}}}`)
+		legacyPath := filepath.Join(root, "records.json")
+		if err := os.WriteFile(legacyPath, legacy, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		backend, _ := NewJSONStorageBackend(root)
+		defer backend.Close()
+		unit, err := backend.Open(ctx, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := unit.LoadAll(ctx)
+		if err != nil || !reflect.DeepEqual(snapshot.Tables["items"]["old"], map[string]any{"value": float64(1)}) {
+			t.Fatalf("bootstrapped snapshot=%#v err=%v", snapshot, err)
+		}
+		migrated, err := os.ReadFile(filepath.Join(root, "records", "items", "old.json"))
+		if err != nil || !strings.Contains(string(migrated), `"version": 3`) {
+			t.Fatalf("migrated=%q err=%v", migrated, err)
+		}
+		kept, err := os.ReadFile(legacyPath)
+		if err != nil || !reflect.DeepEqual(kept, legacy) {
+			t.Fatalf("legacy changed: %q err=%v", kept, err)
+		}
+	})
+	t.Run("new document suppresses legacy", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "records.json"), []byte(`{"unit":{"name":"records","version":3},"tables":{"items":{"old":true}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, "records", "items")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{oops`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		backend, _ := NewJSONStorageBackend(root)
+		defer backend.Close()
+		unit, err := backend.Open(ctx, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := unit.LoadAll(ctx)
+		if err != nil || len(snapshot.Tables["items"]) != 0 {
+			t.Fatalf("suppressed snapshot=%#v err=%v", snapshot, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "old.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy unexpectedly migrated: %v", err)
+		}
+	})
+	t.Run("unreadable global document suppresses legacy", func(t *testing.T) {
+		root := t.TempDir()
+		withGlobal := descriptor
+		withGlobal.HasGlobal = true
+		if err := os.WriteFile(filepath.Join(root, "records.json"), []byte(`{"unit":{"name":"records","version":3},"tables":{"items":{"old":true}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(root, "records", "global.json"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		backend, _ := NewJSONStorageBackend(root)
+		defer backend.Close()
+		unit, err := backend.Open(ctx, withGlobal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := unit.LoadAll(ctx)
+		if err != nil || len(snapshot.Tables["items"]) != 0 {
+			t.Fatalf("global suppression snapshot=%#v err=%v", snapshot, err)
+		}
+	})
+}
+
 func TestSQLiteStorageBackendSpecifics(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "nested", "storage.db")
@@ -577,6 +723,64 @@ func TestDomainFacilityRejectsInvalidStoredRecordAndRoutes(t *testing.T) {
 	nullable.Global.Parse = func(value any) (any, error) { return value, nil }
 	if err := ValidateDomainSpec(nullable); err == nil {
 		t.Fatal("nullable global accepted")
+	}
+}
+
+func TestDomainFacilityBacksUpAndSkipsInvalidPerRecord(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := NewJSONStorageBackend(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := storageDomainSpec()
+	spec.Name = "salvage"
+	spec.Layout = KVLayoutPerRecord
+	spec.InvalidRecords = DomainInvalidRecordsBackupAndSkip
+	unit, err := backend.Open(ctx, DomainDescriptor(spec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unit.PutRecord(ctx, "items", "bad", map[string]any{"count": "NaN"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unit.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hub := NewStorageHub()
+	_, _ = hub.Backend.Register("json", backend)
+	facility, err := NewDomainFacility(hub, "json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer facility.Close()
+	defer backend.Close()
+	domain, err := facility.Open(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, _ := domain.Table("items")
+	if size, err := table.Size(); err != nil || size != 0 {
+		t.Fatalf("salvaged size=%d err=%v", size, err)
+	}
+	backups, err := filepath.Glob(filepath.Join(root, "salvage", "items", "bad.json.bak.*"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("backups=%v err=%v", backups, err)
+	}
+
+	fallback := storageDomainSpec()
+	fallback.Name = "fallback"
+	fallback.InvalidRecords = DomainInvalidRecordsBackupAndSkip
+	unit, err = backend.Open(ctx, DomainDescriptor(fallback))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unit.PutRecord(ctx, "items", "bad", map[string]any{"count": "NaN"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = unit.Close()
+	if _, err := facility.Open(ctx, fallback); !IsDomainError(err, DomainInvalidRecord) {
+		t.Fatalf("single-layout fallback error=%v", err)
 	}
 }
 
