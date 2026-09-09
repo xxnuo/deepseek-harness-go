@@ -347,6 +347,9 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("/api/session.export", e.sessionExportHandler)
 	mux.HandleFunc("/plugins/events", e.servePluginEvents)
 	mux.HandleFunc("/plugins/", e.pluginHandler)
+	mux.HandleFunc("/open-in-app/apps", e.openInAppApps)
+	mux.HandleFunc("/open-in-app/icon/", e.openInAppIcon)
+	mux.HandleFunc("/open-in-app/open", e.openInAppOpen)
 	mux.HandleFunc("/", e.staticHandler)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if e.dynamicWebUpgradeHandler(w, r) || e.dynamicWebNamedHandler(w, r) {

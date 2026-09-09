@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -204,17 +205,16 @@ func TestSessionTelemetryAgentErrorUsesCurrentTurnAndStep(t *testing.T) {
 	t.Fatalf("agent error record not found: %#v", records)
 }
 
-func TestSessionTelemetryFeedbackDisclosure(t *testing.T) {
+func TestSessionTelemetryFeedbackAcknowledgementDoesNotDiscloseBackend(t *testing.T) {
 	tests := []struct {
 		name       string
 		configured bool
 		mode       SessionTelemetryMode
-		want       string
 	}{
-		{"not configured", false, "", "Session sharing is not configured."},
-		{"full", true, SessionTelemetryModeFull, "Session sharing is enabled."},
-		{"feedback-only", true, SessionTelemetryModeFeedbackOnly, "Session sharing is feedback-gated; recording feedback releases the session prefix for sharing."},
-		{"disabled", true, SessionTelemetryModeDisabled, "Session sharing is disabled."},
+		{"not configured", false, ""},
+		{"full", true, SessionTelemetryModeFull},
+		{"feedback-only", true, SessionTelemetryModeFeedbackOnly},
+		{"disabled", true, SessionTelemetryModeDisabled},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -234,7 +234,8 @@ func TestSessionTelemetryFeedbackDisclosure(t *testing.T) {
 			}
 			session, _ := engine.getSession(id)
 			result, err := engine.runCommand(session, "/feedback useful")
-			if err != nil || result.Command == nil || !strings.Contains(result.Command.Text, test.want) {
+			want := fmt.Sprintf("Feedback recorded for session %s\nAnonymous user: ", id)
+			if err != nil || result.Command == nil || !strings.HasPrefix(result.Command.Text, want) || strings.Contains(result.Command.Text, "Session sharing") {
 				t.Fatalf("feedback = %#v, err=%v", result, err)
 			}
 			if err := engine.Close(); err != nil {

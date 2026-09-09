@@ -971,7 +971,7 @@ func TestJSONRPCSDKAdmitsInlineImageBeforeDurablePrompt(t *testing.T) {
 		t.Fatal("inline image bytes were persisted in the session log")
 	}
 	refs := map[string]ImageAttachmentRef{}
-	collectExportImageRefs(encoded, refs)
+	collectExportAttachmentRefs(encoded, refs, map[string]FileAttachmentRef{})
 	if len(refs) != 1 {
 		t.Fatalf("durable image refs = %#v", refs)
 	}

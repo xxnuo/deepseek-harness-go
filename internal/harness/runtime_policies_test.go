@@ -354,12 +354,12 @@ func TestContextOverflowCompactsAndRetriesSameStep(t *testing.T) {
 	if steps != 1 {
 		t.Fatalf("step/start count = %d, want 1", steps)
 	}
-	if len(assistant.SourceEventSeqs) != 1 {
-		t.Fatalf("assistant sources = %#v, want only successful retry chunk", assistant.SourceEventSeqs)
+	if assistant.SourceEventSeqs != nil {
+		t.Fatalf("assistant sources = %#v, want nil", assistant.SourceEventSeqs)
 	}
-	chunk, _ := events[assistant.SourceEventSeqs[0]].Data.(map[string]any)["chunk"].(map[string]any)
-	if chunk["text"] != "done" {
-		t.Fatalf("assistant source chunk = %#v", chunk)
+	assistantData, _ := assistant.Data.(map[string]any)
+	if !streamContainsText(assistantData["stream"], "done") {
+		t.Fatalf("assistant embedded stream = %#v", assistantData["stream"])
 	}
 }
 

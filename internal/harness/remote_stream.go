@@ -290,6 +290,8 @@ func (e *Engine) runRemoteStream(
 		rpcErr = e.streamSessionControl(ctx, payload, send)
 	case "workspace/follow":
 		rpcErr = e.streamWorkspaceFollow(ctx, payload, send)
+	case "workspaceFiles/changes":
+		rpcErr = e.streamWorkspaceFiles(ctx, payload, send)
 	default:
 		rpcErr = rpcError("invocation-unavailable", "no active stream Remote method exports this endpoint", map[string]any{"endpoint": endpoint})
 	}
@@ -603,12 +605,13 @@ func (e *Engine) settleRemoteEventResult(
 }
 
 type remoteSessionAddress struct {
-	kind     string
-	session  string
-	parent   string
-	child    string
-	mode     string
-	maxItems int
+	kind            string
+	session         string
+	parent          string
+	child           string
+	mode            string
+	maxItems        int
+	assistantStream bool
 }
 
 func decodeRemoteSessionFollow(payload json.RawMessage) (remoteSessionAddress, *RPCError) {
@@ -616,7 +619,7 @@ func decodeRemoteSessionFollow(payload json.RawMessage) (remoteSessionAddress, *
 	if rpcErr != nil {
 		return remoteSessionAddress{}, rpcErr
 	}
-	request, err := remoteObject(args["request"], []string{"address", "maxMessages"}, []string{"address"})
+	request, err := remoteObject(args["request"], []string{"address", "maxMessages", "assistantStream"}, []string{"address"})
 	if err != nil {
 		return remoteSessionAddress{}, remoteInputError("session/follow", "request", err)
 	}
@@ -659,6 +662,11 @@ func decodeRemoteSessionFollow(payload json.RawMessage) (remoteSessionAddress, *
 			return remoteSessionAddress{}, remoteInputError("session/follow", "request.maxMessages", errors.New("must be a positive safe integer"))
 		}
 		result.maxItems = int(value)
+	}
+	if raw, exists := request["assistantStream"]; exists {
+		if json.Unmarshal(raw, &result.assistantStream) != nil || !result.assistantStream {
+			return remoteSessionAddress{}, remoteInputError("session/follow", "request.assistantStream", errors.New("must be true when present"))
+		}
 	}
 	return result, nil
 }
@@ -716,6 +724,10 @@ func (e *Engine) streamSessionFollow(ctx context.Context, payload json.RawMessag
 		id = address.child
 	}
 	events := e.Subscribe(ctx, id)
+	var assistantFrames <-chan map[string]any
+	if address.assistantStream {
+		assistantFrames = e.subscribeAssistantStream(ctx, id)
+	}
 	projection, err := e.sessionProjections.Snapshot(session)
 	if err != nil {
 		return rpcError("internal", err.Error(), nil)
@@ -729,11 +741,18 @@ func (e *Engine) streamSessionFollow(ctx context.Context, payload json.RawMessag
 	}
 	session.mu.Unlock()
 	records, hasMore := remoteHistoryRecords(log, address.maxItems)
-	if err := send(map[string]any{
+	snapshot := map[string]any{
 		"type": "snapshot", "header": header, "cursor": cursor,
 		"records": records, "hasMore": hasMore,
 		"projections": map[string]any{"asOfSeq": projection.AsOfSeq, "values": projection.Values},
-	}); err != nil {
+	}
+	assistantRevision := 0
+	if address.assistantStream {
+		baseline := e.assistantStreamSnapshot(session)
+		snapshot["assistantStream"] = baseline
+		assistantRevision = eventInt(baseline["revision"])
+	}
+	if err := send(snapshot); err != nil {
 		return rpcError("internal", err.Error(), nil)
 	}
 	nextSeq := cursor + 1
@@ -753,6 +772,19 @@ func (e *Engine) streamSessionFollow(ctx context.Context, payload json.RawMessag
 			}
 			nextSeq++
 			if err := send(map[string]any{"type": "event", "event": event}); err != nil {
+				return rpcError("internal", err.Error(), nil)
+			}
+		case frame, ok := <-assistantFrames:
+			if !ok {
+				assistantFrames = nil
+				continue
+			}
+			revision := eventInt(frame["revision"])
+			if revision <= assistantRevision {
+				continue
+			}
+			assistantRevision = revision
+			if err := send(map[string]any{"type": "assistant-stream", "frame": frame}); err != nil {
 				return rpcError("internal", err.Error(), nil)
 			}
 		}

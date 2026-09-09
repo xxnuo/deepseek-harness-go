@@ -146,8 +146,8 @@ func TestReadSessionPreservesReplacementSurfaceObject(t *testing.T) {
 }
 
 func TestReadUpstreamPackedSessionLog(t *testing.T) {
-	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/text-turn/session.jsonl")
-	if s.Header.ID != "{{session:1}}" || len(s.Events) != 45 {
+	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/text-turn/session.v2.jsonl")
+	if s.Header.ID != "{{session:1}}" || len(s.Events) != 22 {
 		t.Fatalf("upstream session = id %q, events %d", s.Header.ID, len(s.Events))
 	}
 	for seq, event := range s.Events {
@@ -158,8 +158,7 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 	foundTextDelta := false
 	for _, event := range s.Events {
 		data, _ := event.Data.(map[string]any)
-		chunk, _ := data["chunk"].(map[string]any)
-		if event.Type == "assistant/chunk" && chunk["type"] == "text-delta" && chunk["text"] == "SD" {
+		if event.Type == "assistant/message" && streamContainsText(data["stream"], "SD") {
 			foundTextDelta = true
 			break
 		}
@@ -174,18 +173,20 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 			break
 		}
 	}
-	if len(message.SourceEventSeqs) != 29 || message.SourceEventSeqs[0] != 13 || message.SourceEventSeqs[len(message.SourceEventSeqs)-1] != 41 || !isAppendSurfaceEvent(message) {
+	if message.SourceEventSeqs != nil || !isAppendSurfaceEvent(message) {
 		t.Fatalf("assistant provenance = %#v", message)
 	}
 
-	toolSession := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/bash-tool/session.jsonl")
+	toolSession := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/sdk/bash-tool/session.v2.jsonl")
 	foundToolDelta := false
 	for _, event := range toolSession.Events {
 		data, _ := event.Data.(map[string]any)
-		chunk, _ := data["chunk"].(map[string]any)
-		if event.Type == "assistant/chunk" && chunk["type"] == "tool-call-delta" && chunk["name"] == "bash" {
-			foundToolDelta = true
-			break
+		if event.Type == "assistant/message" {
+			for _, member := range assistantStreamChunks(data["stream"]) {
+				if member.chunk["type"] == "tool-call-delta" && member.chunk["name"] == "bash" {
+					foundToolDelta = true
+				}
+			}
 		}
 	}
 	if !foundToolDelta {
@@ -194,7 +195,7 @@ func TestReadUpstreamPackedSessionLog(t *testing.T) {
 }
 
 func TestReadUpstreamCompactionRebuildsLiveSurface(t *testing.T) {
-	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/session/compaction-recovery/session.jsonl")
+	s := readUpstreamSessionSnapshot(t, "testdata/upstream/snapshots/session/compaction-recovery/session.v2.jsonl")
 	var replacement Event
 	for _, event := range s.Events {
 		if event.Type == "user/message" {

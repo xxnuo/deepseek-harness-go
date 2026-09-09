@@ -27,6 +27,17 @@ func executeFSTool(t *testing.T, e *Engine, name string, arguments any) (ToolRes
 	})
 }
 
+func TestGuardedMutationErrorsUseStablePathAwareRemedies(t *testing.T) {
+	target := fsTarget{displayPath: "/workspace/demo.txt", targetKey: "/workspace/demo.txt"}
+	state := newFSObservationState()
+	if _, err := state.editIntent("session", target); err == nil || err.Error() != `FS_NOT_OBSERVED: cannot modify "/workspace/demo.txt": file has not been read — read the file, then retry` {
+		t.Fatalf("not-observed error = %v", err)
+	}
+	if got := fsStaleVersionError("write", target.displayPath).Error(); got != `FS_STALE_VERSION: cannot write "/workspace/demo.txt": file changed since it was read — re-read the file, then retry` {
+		t.Fatalf("stale error = %q", got)
+	}
+}
+
 func TestReadToolUpstreamWindowCaps(t *testing.T) {
 	e := newIntegrationEngine(t)
 	workspace := e.Config().Workspace

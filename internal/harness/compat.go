@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -715,7 +714,7 @@ func (e *Engine) deepSeekFileStoreFor(cfg Config) *DeepSeekFileStore {
 	defer e.mu.Unlock()
 	if e.deepSeekFileStore == nil {
 		indexPath := filepath.Join(cfg.DataDir, "llm-deepseek", "files-v3.json")
-		e.deepSeekFileStore = NewDeepSeekFileStore(NewDeepSeekUploadIndex(indexPath), &http.Client{})
+		e.deepSeekFileStore = NewDeepSeekFileStore(NewDeepSeekUploadIndex(indexPath), newHTTPClient())
 	}
 	return e.deepSeekFileStore
 }

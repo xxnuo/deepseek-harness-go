@@ -96,7 +96,7 @@ return {
 		section, _ := raw.(map[string]any)
 		names = append(names, section["name"].(string))
 	}
-	if strings.Join(names[:4], ",") != "harness:identity,dynamic:identity,dynamic:variable,deployment:persona" {
+	if strings.Join(names[:4], ",") != "harness:identity,dynamic:identity,dynamic:variable,deployment:persona-prefix" {
 		t.Fatalf("section order = %#v", names)
 	}
 	if sections[1].(map[string]any)["text"] != "Dynamic {{model}} in {{cwd}} for hidden." {
@@ -515,7 +515,7 @@ func TestDynamicCordisSectionShadowsCompletePresetPersona(t *testing.T) {
 return {
   inject: ['systemPrompt'],
   apply(ctx) {
-    ctx.systemPrompt.section({ name: 'deployment:persona', order: 0, text: 'Scoped persona.' })
+    ctx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: 'Scoped persona.' })
   }
 }`)
 	e.dynamicCordis.RLock()
@@ -526,7 +526,7 @@ return {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sections) < 2 || sections[0].Name != "harness:identity" || sections[1].Name != "deployment:persona" || sections[1].Text != "Scoped persona." || sections[1].Complete {
+	if len(sections) < 2 || sections[0].Name != "harness:identity" || sections[1].Name != "deployment:persona-prefix" || sections[1].Text != "Scoped persona." || sections[1].Complete {
 		t.Fatalf("shadowed complete persona = %#v", sections)
 	}
 }

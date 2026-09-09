@@ -1279,6 +1279,13 @@ func TestAgentTeamMailboxRecoversAcrossJSONL(t *testing.T) {
 		if !sessionHasTeamMessage(mustSession(t, second, child), queued.MessageID) {
 			t.Fatal("recovered message was not durably staged in target Session")
 		}
+		childSession := mustSession(t, second, child)
+		childSession.mu.Lock()
+		recoveredMode := childSession.Header.Mode
+		childSession.mu.Unlock()
+		if recoveredMode != "continuable" {
+			t.Fatalf("recovered child mode = %q", recoveredMode)
+		}
 		if err := second.Close(); err != nil {
 			t.Fatal(err)
 		}

@@ -98,7 +98,7 @@ func newE2BCloudSandbox(ctx context.Context, config E2BConfig) (E2BSandbox, erro
 		apiURL:      apiURL,
 		sandboxURL:  sandboxURL,
 		accessToken: created.EnvdAccessToken,
-		client:      http.DefaultClient,
+		client:      newHTTPClient(),
 	}
 	sandbox.files = &e2bCloudFiles{sandbox: sandbox}
 	sandbox.commands = &e2bCloudCommands{sandbox: sandbox}
@@ -136,7 +136,7 @@ func e2bAPIJSON(ctx context.Context, method, endpoint, apiKey string, input, out
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := newHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}

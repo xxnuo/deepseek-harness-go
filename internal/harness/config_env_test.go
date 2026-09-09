@@ -18,7 +18,7 @@ func TestDefaultConfigUsesSupportedEnvironmentSwitches(t *testing.T) {
 	if cfg.DataDir != home || cfg.AgentsHome != agents || cfg.WebSearchProvider != "exa" || cfg.WebFetchProvider != "custom-fetch" || cfg.ToolPresentation != "both" {
 		t.Fatalf("environment config = %#v", cfg)
 	}
-	if cfg.Version != Version() || cfg.Version != "0.1.2-alpha.5" {
+	if cfg.Version != Version() || cfg.Version != "0.1.3-alpha.2" {
 		t.Fatalf("version = %q", cfg.Version)
 	}
 }

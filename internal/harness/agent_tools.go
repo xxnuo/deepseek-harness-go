@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var errToolCallTimeout = errors.New("tool call timeout")
@@ -30,8 +31,10 @@ func transcriptMessages(events []Event, turn int) []ChatMessage {
 			if messageValue == nil {
 				continue
 			}
-			message := ChatMessage{Role: "assistant"}
-			for _, block := range contentBlocks(messageValue["content"]) {
+			blocks := contentBlocks(messageValue["content"])
+			source, _ := messageValue["source"].(map[string]any)
+			message := ChatMessage{Role: "assistant", Blocks: blocks, Source: cloneStringMap(source)}
+			for _, block := range blocks {
 				switch block.Type {
 				case "text":
 					message.Content += block.Text
@@ -44,6 +47,7 @@ func transcriptMessages(events []Event, turn int) []ChatMessage {
 					message.ToolCalls = append(message.ToolCalls, ToolCall{ID: block.ID, Name: block.Name, Arguments: json.RawMessage(block.Arguments)})
 				}
 			}
+			applyPiAIReplayState(&message, blocks)
 			if message.Content != "" || message.Reasoning != "" || len(message.ToolCalls) > 0 {
 				messages = append(messages, message)
 			}
@@ -96,9 +100,17 @@ func contentBlocks(value any) []ContentBlock {
 			}
 			block := ContentBlock{Type: typeName, Text: stringValue(data["text"]), Signature: stringValue(data["signature"]), ID: stringValue(data["id"]), Name: stringValue(data["name"]), Arguments: stringValue(data["arguments"]), ToolCallID: stringValue(data["toolCallId"])}
 			if raw, ok := data["attachment"].(map[string]any); ok {
-				var attachment ImageAttachmentRef
-				if encoded, err := json.Marshal(raw); err == nil && json.Unmarshal(encoded, &attachment) == nil {
-					block.Attachment = &attachment
+				encoded, err := json.Marshal(raw)
+				if typeName == "file" {
+					var attachment FileAttachmentRef
+					if err == nil && json.Unmarshal(encoded, &attachment) == nil {
+						block.FileAttachment = &attachment
+					}
+				} else {
+					var attachment ImageAttachmentRef
+					if err == nil && json.Unmarshal(encoded, &attachment) == nil {
+						block.Attachment = &attachment
+					}
 				}
 			}
 			block.IsError, _ = data["isError"].(bool)
@@ -205,12 +217,28 @@ func (e *Engine) hydrateChatMessagesWithLimit(messages []ChatMessage, maxBytes i
 					encoded := base64.StdEncoding.EncodeToString(data)
 					out[i].Images = append(out[i].Images, ChatImage{MediaType: block.Attachment.MediaType, Data: encoded, AttachmentID: block.Attachment.AttachmentID})
 					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "image", MediaType: block.Attachment.MediaType, Data: encoded, AttachmentID: block.Attachment.AttachmentID})
+				case block.Type == "file" && block.FileAttachment != nil:
+					path, err := e.fileAttachmentPath(*block.FileAttachment)
+					if err != nil {
+						path = ""
+					}
+					text := fileRequestText(*block.FileAttachment, path)
+					out[i].Parts = append(out[i].Parts, ChatContentPart{Type: "text", Text: text})
 				default:
 					hydrate(block.Content)
 				}
 			}
 		}
 		hydrate(out[i].Blocks)
+		if len(out[i].Parts) > 0 {
+			var text strings.Builder
+			for _, part := range out[i].Parts {
+				if part.Type == "text" {
+					text.WriteString(part.Text)
+				}
+			}
+			out[i].Content = text.String()
+		}
 	}
 	return out
 }

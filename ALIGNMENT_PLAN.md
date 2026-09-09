@@ -1,8 +1,61 @@
 # DeepSeek Harness Go 语义对齐记录
 
-当前基线：上游 `deepseek-harness` commit `dd6322d604e00eec1ba5e0c8541159906a21094a`（`dsh-v0.1.2-alpha.3`）。此前 rc.2 与 alpha.1 的完成记录保留为迁移历史；本轮继续按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
+当前基线：上游 `deepseek-harness` commit `c389f96bf3a9b6807cb71ed6bdad5849be0df6d8`，最近标签 `dsh-v0.1.3-alpha.2`。此前 rc.2、alpha.1、alpha.3、alpha.4 与 alpha.5 的完成记录保留为迁移历史；后续复核继续按源码执行路径、状态机、取消、持久化、事件和结果语义核对，不按文件数量或同名文件判断。
 
 ## 对齐顺序
+
+## c389f96bf3 跟进（2026-09-08，已完成）
+
+验收目标为 `c389f96bf3a9b6807cb71ed6bdad5849be0df6d8`，最近标签 `dsh-v0.1.3-alpha.2`，不是旧 alpha.5。起始 Go HEAD 与上游工作树以现场 git 为准；原有 `ALIGNMENT_PLAN.md` 和 `internal/harness/upstream_inventory_test.go` 未提交修改完整保留。不得以更新版本号、清单或测试通过代替语义移植，不提前修改已验证基线声明。
+
+1. [已完成] 恢复历史要求：保留官方前端、可复用 Go API、逐生产调用链核对、真实功能验证；原版 npm/Cordis、SDK client 和外部 provider 历史边界重新审计而非默认为完成。
+2. [已完成] 审计 alpha.5 到目标的 70 个合入审计项，并复核既往 deferred/missing 分类；覆盖删除/撤销项，未复活已撤销的 message-edit。
+3. [已完成] 分组补齐持久化格式 v2/迁移/写租约、assistant stream、durable inbox/subagent controls、workspace-files/open-in-app、通用附件、proxy/进程收容、prompt/SDK、模型发现和 Typert Remote 行为，逐项添加回归。
+4. [已完成] 更新目标 pin、官方 assets、catalog、inventory 和 facade；新增 root 均有源码、调用链和行为证据，最终无 missing/pending。
+5. [已完成] 完整运行 `make verify-upstream test vet race smoke-standalone smoke-clean-archive`，并完成官方前端页面、CLI/RPC、图标及重启持久化验证；失败、修复和退出结果见步骤记录。
+6. [已完成] 最终只读复核目标提交、审计表、生成物、测试日志、进程残留和工作树；保持用户原有 dirty 文件及上游子仓库不变。
+
+现场发现：上游 HEAD 精确等于目标且干净；当前 Go `upstream.lock` 仍固定 alpha.5。仅 core/api/tool/host/subagent/session/CLI 范围已有 497 个变更文件；此数量仅用于审计范围，不作为完成性指标。Go 仍持久化 `assistant/chunk`，上游已转为 v2 的嵌入 stream 与 `assistant/attempt`，必须连同历史格式迁移一起处理。
+
+步骤记录 01：模型发现生产入口 `domains.go → OpenAIProvider.discoverModels` 已补 Anthropic 原生路径、认证和单页限制，以及 enriched models map 的 alias、容量字段优先级、坏行跳过、array 优先和重复记录保留。新增 parser/HTTP/cancel/4MiB 回归。首次直接 `go test` 的集成项因未嵌入 runtime assets 失败，不能作为行为失败或通过证据；后续必须改用 wrapper。为生成目标资产，`upstream.lock` 切到目标构建 pin，此操作不表示对齐验收完成，当前已验证基线仍为 alpha.5。
+
+### 原有对齐顺序
+
+步骤记录 02：`make prepare-runtime-assets` 已成功构建目标官方 UI；wrapper 首次报上游 `snapshots/sdk/text-turn/session.jsonl` 不存在，确认目标将这三组回归源迁到 `session.v2.jsonl` 后修正同步脚本路径。没有修改上游源文件，也没有把旧快照冒充新快照。快照读取/迁移语义尚待 v2 工作项验证。
+
+步骤记录 03：persona 改为 `deployment:persona-prefix`/`deployment:persona-suffix`，环境后缀位于 10200，preset 的 prefix/suffix 和 complete 行为进入真实 prompt assembly；旧 preset `text` 暂保留兼容输入。durable inbox 恢复补齐 next-turn/next-step 跨队列重复 message id 拒绝，替换/先移除再转队列合法。`with_runtime_assets ... test -race -count=1 -run '^(TestDiscoverModels|TestDiscoveredModels|TestOpenAIProviderModelDiscovery|TestPersonaSuffix|TestInboxRecovery|TestCompletePresetPersona|TestDynamic.*Prompt)' ./internal/harness` 退出 0，2.476s。发现旧 model-listing 测试要求去重，与目标 `readListing` 保留重复记录不同，已改为同时断言重复行与后续 metadata，未删除回归。
+
+步骤记录 04：目标资产下首次全仓普通测试退出 1（harness 48.633s），日志 `/home/xxnuo/.cache/dsh-go-c389-tmp/full-baseline.log`。失败包括未移植 open-in-app 导致 web profile 启动失败、版本/56 项 boot graph 基线变化、Remote 新接口、default profile contract 和 18 个新增 workspace roots。不是完整通过，尚未执行最终 vet/race/standalone/archive 门禁。
+
+步骤记录 05：新增 workspaceFiles read/readBytes/stat/list/changes 的 Remote 生产入口；本地读取拒绝叶子 symlink、非普通文件、workspace 越界，使用 `os.OpenRoot` 阻止检查后路径逃逸；文本分页只积累当前窗口并按 UTF-8 字节限额，二进制窗口 base64。changes 接入现有 Agent FS observation、ready 先行、有序排队、context/Engine 关闭释放，不冒充 OS watcher。定向真实 write-tool→stream、分页和路径隔离 race 测试退出 0（1.437s），日志 `/home/xxnuo/.cache/dsh-go-c389-tmp/workspace-files.log`。可配置 caps、非本地 FS provider 和最终 profile 接线尚未验收，因此本组仍为进行中。
+
+历版保留范围复核清单：完整 npm/Cordis runtime 与对象 intercept、公开 SDK client、平台 ripgrep 随包交付、低频插件 profile 映射、webhook ingress/rule、connection recovery/reload 故障注入、真实外部 provider 凭证与平台实机验收。不能把这些历史 deferred 标签自动转为 completed；原记录的后续项目若后文已有实现，需按当前代码/测试消歧，不能重复实现或仅据旧文字判断。
+
+### 历史工作顺序（保留）
+
+步骤记录 06：workspaceFiles caps 已接入公开 Go Config、CLI composition 和 request 执行路径；补 Engine.Close 终止观察流。新增 profile 回归首次错误要求通用配置解码器拒绝未知属性；检查现有 `decodeProfileEntryConfig` 的容忍行为后改为断言忽略，负数/零/小数仍拒绝，未改公共解码器的全项目语义。最终本组重新运行结果待补。
+
+步骤记录 07：写租约采用上游 `session-persistence-jsonl/src/lease.ts` 的同一 POSIX `session.lock` flock 和 Windows named semaphore 命名；write-open 在扫描前取锁，lazy Create 在第一笔 materialization 前取锁，Close 释放，read-open 不争写锁。修复原有 materialize 失败无条件删除目标文件的问题，EEXIST 绝不能删除其他创建者的数据。`go test -race -count=1 -run '^(TestJSONL|TestSessionWriteLease|TestSessionMaterializationFailure|TestSessionLease)' ./internal/harness` 退出 0（1.254s），包含独立 store 争用、读取不受阻、重复 create 原文件逐字节不变、独立测试子进程持锁/kill 后接管。此纯持久化测试不需要 runtime assets；Windows 当前仅计划交叉编译，不冒充实机通过。日志 `/home/xxnuo/.cache/dsh-go-c389-tmp/lease-race.log`。
+
+步骤记录 08：完成 v1→v2 session snapshot、嵌入 assistant stream/attempt、历史 snapshot 迁移和 durable inbox 恢复；补齐 persona prefix/suffix、模型切换提示、Team queue control、workspace-files 与通用文件附件、message feedback/telemetry、HTTP proxy、文件系统诊断及 Windows 子进程收容。对应生产入口、冷恢复、失败路径和 race 回归均已落到 Go 实现，审计表逐项关联源码与测试。
+
+步骤记录 09：`upstream.lock`、官方 runtime assets、pi-ai catalog、dynamic inspect catalog、284-root inventory 和 public facade 已同步到目标。最终分类为 `frontend=47`、`hybrid=10`、`ported=184`、`replaced=28`、`support=15`，总数 284，无 missing；`UPSTREAM_AUDIT_c389f96bf3.tsv` 共 70 个审计项，无 pending。上游子仓库始终保持目标 HEAD 且干净。
+
+步骤记录 10：首次完整门禁尝试因系统不存在 `/usr/bin/time` 而未启动测试，改用 shell `time -p`。随后门禁在 64.90s 退出 2，暴露冷 Team mode 与旧 snapshot 引用；修正后相关测试连续运行 20 次通过。第一次六段完整门禁退出 0（435.78s）；再次严格复核后的门禁退出 0（432.45s），日志 `/home/xxnuo/.cache/dsh-go-c389-tmp/full-gate-final-after-gaps.log`。
+
+步骤记录 11：严格重审额外发现两项真实遗漏并完成修复。其一是 `#3409` 的完整 open-in-app：按目标顺序支持 macOS/Windows/Linux 应用定位、图标提取缓存、detached launch、shell fallback 和 stale ENOENT 单项刷新；Windows、Darwin 交叉编译与 focused race 均通过。其二是 `#3613` 的 pi-ai 0.85.1 replay：持久化校验后的 v2 replay envelope、resolved response model/id、provider thinking level、Anthropic mid-conversation effort 与 signed reasoning 同模型约束；生产路径和 malformed replay 回归均通过。
+
+步骤记录 12：第一次真实 standalone 验收使用 `DSH_HOME=/home/xxnuo/.cache/dsh-go-c389-tmp/live-home.WosuqY` 与 workspace `/home/xxnuo/.cache/dsh-go-c389-tmp/live-workspace.07TKpk`。官方中文页面截图 `/home/xxnuo/.cache/dsh-go-c389-tmp/live-ui.png` 已人工复核；workspace/session 创建、重命名、workspaceFiles list/read、file upload 均通过，重启后恢复同一 workspace、标题、history 和内容寻址文件，断言 `RESTART_PERSISTENCE_ASSERTIONS=passed`。最初 Remote 请求遗漏 `payload.args` 包装而被协议正确拒绝，修正请求形状后通过。
+
+步骤记录 13：最终在线复核发现已声明的 Session、Settings、LLM、Credentials、Skills 和 Agent Teams 一元 Typert Remote 未桥接，斜杠式 `session/create` 返回 `gateway/invocation-unavailable`；这不是测试噪声，已补齐到现有 Go controller/持久化生产调用链，并补精确输出投影、Team task business result 和模型 reasoning catalog。HTTP 回归与 focused race 退出 0。一次 `dsh web --help` 误触发正常 profile 启动并因外部 profile 插件缺失退出，仅记为 CLI 参数试探失败，未作为服务故障。
+
+步骤记录 14：Remote 修复后的最终六段门禁 `make verify-upstream test vet race smoke-standalone smoke-clean-archive` 退出 0，总耗时 `real 422.55`、`user 508.25`、`sys 40.19`，日志 `/home/xxnuo/.cache/dsh-go-c389-tmp/full-gate-final-remote-bridge.log`。普通测试：root 2.263s、cmd/dsh 12.666s、internal/harness 48.397s；race：root 42.644s、cmd/dsh 16.776s、internal/harness 268.851s；standalone 3.720s；clean archive：root 2.335s、cmd/dsh 14.148s、internal/harness 48.617s。
+
+步骤记录 15：新 standalone 二进制使用同一 DSH_HOME 两次重启完成最终真实验收：`/healthz` 返回版本 `0.1.3-alpha.2`；官方首页 27228 bytes；应用目录返回 filemanager/cursor/vscode/zed/androidstudio/pycharm，`/open-in-app/icon/vscode` 返回 1024×1024 PNG。斜杠式 `workspace/create`、`session/list/create/rename/page`、`session/modelCatalog`、`llm/listProviders`、`settings/describe`、`credentials/describe` 全部成功；Remote 创建的 `final-remote-bridge-session` 在再次重启后保留标题、history 和 workspace 关联，断言 `LIVE_REMOTE_ASSERTIONS=passed`、`RESTART_REMOTE_PERSISTENCE_ASSERTIONS=passed`。证据目录 `/home/xxnuo/.cache/dsh-go-c389-tmp/final-live-evidence-after-bridge`。
+
+70 个合入审计项逐条跟踪于 `UPSTREAM_AUDIT_c389f96bf3.tsv`，最终均以源码、Go 调用链和验证闭合后分类。目标提交自身 `#3713` 仅改 workspace-management E2E 等待种子 Session 所属 projection 的条件，审计仍覆盖其前面的全部合入内容。
+
+### 既往对齐顺序明细（保留）
 
 1. 普通 Agent tool scheduler：`parallel`/`exclusive`、有界并发、exclusive barrier、模型顺序提交、abort drain、未派发调用的 synthetic result。
 2. 通用 ToolRuntime：`additionalContexts`、`concludesTurn`、`finalizeContent`、`presentationMeta`、输出 materialization、标准 abort 结果。

@@ -15,7 +15,7 @@ func TestSessionTelemetryProfileMapsExporterAndProcessor(t *testing.T) {
 - id: telemetry
   name: '@deepseek-ai/dsh-session-telemetry-otel'
   config:
-    mode: FULL
+    mode: FEEDBACK_ONLY
     shutdownTimeoutMillis: 3210
     exporter:
       url: http://127.0.0.1:4318/v1/logs
@@ -36,7 +36,7 @@ func TestSessionTelemetryProfileMapsExporterAndProcessor(t *testing.T) {
 	}
 	cfg := engineConfig(&profileLoader{home: t.TempDir()}, composed)
 	telemetry := cfg.SessionTelemetry
-	if telemetry == nil || telemetry.Mode != harness.SessionTelemetryModeFull || telemetry.ShutdownTimeout != 3210*time.Millisecond {
+	if telemetry == nil || telemetry.Mode != harness.SessionTelemetryModeFeedbackOnly || telemetry.ShutdownTimeout != 3210*time.Millisecond {
 		t.Fatalf("telemetry = %#v", telemetry)
 	}
 	if telemetry.Exporter.URL != "http://127.0.0.1:4318/v1/logs" || telemetry.Exporter.Headers["authorization"] != "Bearer-test" || telemetry.Exporter.Compression != "gzip" || telemetry.Exporter.Timeout != 1200*time.Millisecond {
@@ -55,7 +55,7 @@ func TestSessionTelemetryProfileDisabledEnvironmentUnmountsService(t *testing.T)
 	composed := mcpTestComposition(t, `
 - id: telemetry
   name: '@deepseek-ai/dsh-session-telemetry-otel'
-  config: {mode: FULL}
+  config: {mode: FEEDBACK_ONLY}
 `)
 	if err := composed.validate(); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestSessionTelemetryCLIReportsDisabledFeedback(t *testing.T) {
 	if err != nil || result.Command == nil || result.Command.Kind != "success" {
 		t.Fatalf("feedback result = %#v, err = %v", result, err)
 	}
-	if !strings.Contains(stderr.String(), "session telemetry is DISABLED; nothing will be shared and this feedback remains local") {
+	if !strings.Contains(stderr.String(), "OpenTelemetry session upload is DISABLED; this feedback is not uploaded through OpenTelemetry") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
@@ -106,7 +106,12 @@ func TestSessionTelemetryProfileRejectsInvalidConfig(t *testing.T) {
 		"batch size": `
 - id: telemetry
   name: '@deepseek-ai/dsh-session-telemetry-otel'
-  config: {mode: FULL, exporter: {url: http://collector/v1/logs}, processor: {maxExportBatchSize: 0}}
+  config: {mode: FEEDBACK_ONLY, exporter: {url: http://collector/v1/logs}, processor: {maxExportBatchSize: 0}}
+`,
+		"removed full mode": `
+- id: telemetry
+  name: '@deepseek-ai/dsh-session-telemetry-otel'
+  config: {mode: FULL, exporter: {url: http://collector/v1/logs}}
 `,
 		"duplicate": `
 - id: telemetry-one
@@ -127,7 +132,7 @@ func TestSessionTelemetryProfileRejectsInvalidConfig(t *testing.T) {
 	composed := mcpTestComposition(t, `
 - id: telemetry
   name: '@deepseek-ai/dsh-session-telemetry-otel'
-  config: {mode: FULL}
+  config: {}
 `)
 	if err := composed.validate(); err != nil {
 		t.Fatal(err)

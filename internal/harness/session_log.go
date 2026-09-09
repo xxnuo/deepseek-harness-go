@@ -15,6 +15,7 @@ var knownSessionEventTypes = map[string]struct{}{
 	"approval/asked":                         {},
 	"approval/decided":                       {},
 	"approval/policy":                        {},
+	"assistant/attempt":                      {},
 	"assistant/chunk":                        {},
 	"assistant/message":                      {},
 	"command/done":                           {},
@@ -24,6 +25,8 @@ var knownSessionEventTypes = map[string]struct{}{
 	"compaction/start":                       {},
 	"compaction/summary":                     {},
 	"feedback/record":                        {},
+	"feedback/message-put":                   {},
+	"feedback/message-delete":                {},
 	"goal/change":                            {},
 	"hook/invoked":                           {},
 	"hook/result":                            {},
@@ -67,6 +70,10 @@ func isSurfaceEligibleType(typ string) bool {
 }
 
 func decodeSessionStorageRecord(line []byte) ([]Event, error) {
+	return decodeSessionStorageRecordVersion(line, 1)
+}
+
+func decodeSessionStorageRecordVersion(line []byte, version int) ([]Event, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return nil, err
@@ -79,7 +86,13 @@ func decodeSessionStorageRecord(line []byte) ([]Event, error) {
 		return nil, fmt.Errorf("record type is missing or invalid")
 	}
 	if typ == "text-chunks" || typ == "reasoning-chunks" || typ == "tool-call-chunks" {
+		if version >= 2 {
+			return nil, fmt.Errorf("format v2 cannot contain packed top-level assistant chunks")
+		}
 		return decodePackedChunks(typ, raw)
+	}
+	if version >= 2 && typ == "assistant/chunk" {
+		return nil, fmt.Errorf("format v2 cannot contain top-level assistant/chunk")
 	}
 	for key := range raw {
 		switch key {
@@ -97,7 +110,8 @@ func decodeSessionStorageRecord(line []byte) ([]Event, error) {
 		return nil, fmt.Errorf("event %q has invalid ignorable marker", typ)
 	}
 	var event Event
-	if err := json.Unmarshal(line, &event); err != nil {
+	event.Type = typ
+	if err := json.Unmarshal(raw["data"], &event.Data); err != nil {
 		return nil, err
 	}
 	if err := unmarshalRequired(raw["seq"], &event.Seq); err != nil {
@@ -108,6 +122,9 @@ func decodeSessionStorageRecord(line []byte) ([]Event, error) {
 	}
 	if event.Seq < 0 || int64(event.Seq) > maxJSONSafeInteger || event.Time < -maxJSONSafeInteger || event.Time > maxJSONSafeInteger {
 		return nil, fmt.Errorf("event %q has invalid seq or time", typ)
+	}
+	if _, ok := raw["ignorable"]; ok {
+		event.Ignorable = true
 	}
 	if _, ok := knownSessionEventTypes[typ]; !ok && !event.Ignorable {
 		return nil, fmt.Errorf("session event type %q (seq %d) is unknown and not marked ignorable", typ, event.Seq)
@@ -125,9 +142,21 @@ func decodeSessionStorageRecord(line []byte) ([]Event, error) {
 		if err := validateSurfaceOp(op); err != nil {
 			return nil, fmt.Errorf("event %q: %w", typ, err)
 		}
+		if err := json.Unmarshal(op, &event.SurfaceOp); err != nil {
+			return nil, fmt.Errorf("event %q has invalid surfaceOp", typ)
+		}
 	}
 	if sources, ok := raw["sourceEventSeqs"]; ok {
 		if len(bytes.TrimSpace(sources)) == 0 || bytes.TrimSpace(sources)[0] != '[' {
+			return nil, fmt.Errorf("event %q has invalid sourceEventSeqs", typ)
+		}
+		var err error
+		if version >= 2 {
+			event.SourceEventSeqs, err = decodeSessionSeqRanges(sources, int(event.Seq))
+		} else {
+			err = json.Unmarshal(sources, &event.SourceEventSeqs)
+		}
+		if err != nil || event.SourceEventSeqs == nil {
 			return nil, fmt.Errorf("event %q has invalid sourceEventSeqs", typ)
 		}
 		if err := validateSourceEventSeqs(event); err != nil {
@@ -135,6 +164,78 @@ func decodeSessionStorageRecord(line []byte) ([]Event, error) {
 		}
 	}
 	return []Event{event}, nil
+}
+
+func decodeSessionSeqRanges(raw json.RawMessage, max int) ([]int, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil || entries == nil {
+		return nil, fmt.Errorf("sourceEventSeqs must be an array")
+	}
+	result := make([]int, 0, len(entries))
+	hasRange := false
+	for _, entry := range entries {
+		var scalar int
+		if json.Unmarshal(entry, &scalar) == nil {
+			result = append(result, scalar)
+			continue
+		}
+		var pair []int
+		if json.Unmarshal(entry, &pair) != nil || len(pair) != 2 || pair[0] < 0 || pair[0] > pair[1] || pair[1] >= max || pair[1]-pair[0]+1 > max-len(result) {
+			return nil, fmt.Errorf("invalid sourceEventSeqs range")
+		}
+		for value := pair[0]; value <= pair[1]; value++ {
+			result = append(result, value)
+		}
+		hasRange = true
+	}
+	seen := make(map[int]struct{}, len(result))
+	for index, value := range result {
+		if value < 0 || value >= max {
+			return nil, fmt.Errorf("sourceEventSeqs must reference earlier events")
+		}
+		if _, exists := seen[value]; exists {
+			return nil, fmt.Errorf("sourceEventSeqs contains duplicates")
+		}
+		seen[value] = struct{}{}
+		if hasRange && index > 0 && value <= result[index-1] {
+			return nil, fmt.Errorf("sourceEventSeqs ranges must be strictly increasing")
+		}
+	}
+	return result, nil
+}
+
+func encodeSessionSeqRanges(values []int) []any {
+	if len(values) == 0 {
+		return []any{}
+	}
+	for index := 1; index < len(values); index++ {
+		if values[index] <= values[index-1] {
+			result := make([]any, len(values))
+			for item, value := range values {
+				result[item] = value
+			}
+			return result
+		}
+	}
+	result := make([]any, 0, len(values))
+	for index := 0; index < len(values); {
+		start := values[index]
+		end := start
+		for index+1 < len(values) && values[index+1] == end+1 {
+			index++
+			end++
+		}
+		if end-start >= 2 {
+			result = append(result, []int{start, end})
+		} else {
+			result = append(result, start)
+			if end-start == 1 {
+				result = append(result, end)
+			}
+		}
+		index++
+	}
+	return result
 }
 
 func decodeSessionSeedEvent(value any, index int) (Event, error) {

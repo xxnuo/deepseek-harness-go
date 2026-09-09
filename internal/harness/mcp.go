@@ -289,7 +289,7 @@ func (c *MCPConnection) transport() (mcp.Transport, error) {
 		cmd.Stderr = os.Stderr
 		return &mcp.CommandTransport{Command: cmd}, nil
 	}
-	client := &http.Client{Transport: &mcpHeaderTransport{base: http.DefaultTransport, headers: c.config.Headers}}
+	client := &http.Client{Transport: &mcpHeaderTransport{base: proxyHTTPTransport(), headers: c.config.Headers}}
 	return &mcp.StreamableClientTransport{Endpoint: c.config.URL, HTTPClient: client}, nil
 }
 

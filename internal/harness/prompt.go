@@ -21,7 +21,7 @@ import (
 const (
 	harnessIdentity             = "You are an AI agent powered by DeepSeek Harness."
 	deliverableFilePrompt       = "When you successfully create or modify files, mention the primary outputs in your final response. To make those and any other changed-file references clickable in Web, format them as Markdown inline code using the exact file-tool path, or a basename when unique among the files changed in that turn."
-	defaultCodingPersona        = "You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}."
+	defaultCodingPersona        = "You are a coding agent powered by the {{model}} model."
 	defaultInstructionMaxBytes  = 65536
 	defaultInstructionSourceCap = 1 << 20
 	subagentDelegationContext   = "You are a delegated subagent: your permission scope was fixed when you were started and cannot be widened from inside this session - operations that require approval are rejected automatically. When the task needs access beyond that scope, do not retry the denied operation; state the limitation in your reply so the delegating agent can handle it."
@@ -29,6 +29,7 @@ const (
 
 type agentRuntime struct {
 	persona                          string
+	personaSuffix                    string
 	completePersona                  bool
 	includeInstructions              bool
 	instructionMaxBytes              int
@@ -103,7 +104,7 @@ type presetRuntimeGeneration struct {
 
 func defaultAgentRuntime(config Config) agentRuntime {
 	return agentRuntime{
-		persona: config.Persona, includeInstructions: true,
+		persona: config.Persona, personaSuffix: config.PersonaSuffix, includeInstructions: true,
 		instructionMaxBytes: config.InstructionMaxBytes, includeRuntimeContext: true,
 		toolPresentation: config.ToolPresentation, webTools: cloneWebToolConfig(config.WebTools), planSection: defaultPlanModeSection,
 		goalDefaultMaxRounds: defaultMaxGoalRounds, goalBlockThreshold: defaultGoalBlockThreshold,
@@ -391,7 +392,7 @@ func (e *Engine) compilePresetRuntime(row presetRecord) (agentRuntime, error) {
 		return agentRuntime{}, errors.New("agent-preset-invalid: composition must be a YAML array")
 	}
 	runtimeConfig := agentRuntime{
-		persona: e.cfg.Persona, includeRuntimeContext: true,
+		persona: e.cfg.Persona, personaSuffix: e.cfg.PersonaSuffix, includeRuntimeContext: true,
 		instructionMaxBytes: e.cfg.InstructionMaxBytes,
 		toolNames:           map[string]bool{}, toolPresentation: e.cfg.ToolPresentation,
 		goalDefaultMaxRounds: defaultMaxGoalRounds, goalBlockThreshold: defaultGoalBlockThreshold,
@@ -548,13 +549,18 @@ func (e *Engine) compilePresetRuntime(row presetRecord) (agentRuntime, error) {
 			}
 			runtimeConfig.customSkillDirs = append(runtimeConfig.customSkillDirs, dirs...)
 		case "@deepseek-ai/dsh-persona":
-			if err := rejectUnknownPresetConfig(config, "persona", "text", "complete", "includeRuntimeContext"); err != nil {
+			if err := rejectUnknownPresetConfig(config, "persona", "prefix", "suffix", "text", "complete", "includeRuntimeContext"); err != nil {
 				return err
 			}
-			if yamlMapValue(config, "text") == nil {
-				return errors.New("agent-preset-invalid: persona text is required")
+			prefix := yamlMapValue(config, "prefix")
+			if prefix == nil {
+				prefix = yamlMapValue(config, "text")
 			}
-			runtimeConfig.persona = yamlScalar(yamlMapValue(config, "text"))
+			if prefix == nil {
+				return errors.New("agent-preset-invalid: persona prefix is required")
+			}
+			runtimeConfig.persona = yamlScalar(prefix)
+			runtimeConfig.personaSuffix = yamlScalar(yamlMapValue(config, "suffix"))
 			runtimeConfig.completePersona = yamlNodeBool(yamlMapValue(config, "complete"), false)
 			runtimeConfig.includeRuntimeContext = yamlNodeBool(yamlMapValue(config, "includeRuntimeContext"), true)
 		case "@deepseek-ai/dsh-agent-instructions":
@@ -1342,7 +1348,8 @@ func (e *Engine) resolvedSystemPromptAssembly(s *Session, selection ModelSelecti
 	}
 	sections := []resolvedPromptSection{
 		{Name: "harness:identity", Order: -100, Text: harnessIdentity},
-		{Name: "deployment:persona", Order: 0, Text: agent.persona, Complete: agent.completePersona},
+		{Name: "deployment:persona-prefix", Order: 0, Text: agent.persona, Complete: agent.completePersona},
+		{Name: "deployment:persona-suffix", Order: 10200, Text: agent.personaSuffix},
 	}
 	add := func(name string, order float64, text string) {
 		sections = append(sections, resolvedPromptSection{Name: name, Order: order, Text: text})

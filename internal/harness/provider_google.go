@@ -36,7 +36,7 @@ type googleProvider struct {
 func newGoogleProvider(id, baseURL, apiKey, model string, vertex bool) *googleProvider {
 	return &googleProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{}, vertex: vertex,
+		client: newHTTPClient(), vertex: vertex,
 	}
 }
 

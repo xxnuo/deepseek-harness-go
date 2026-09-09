@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +15,26 @@ type blockingSessionReferenceStore struct {
 	SessionStore
 	header  SessionHeader
 	started chan struct{}
+}
+
+type sessionReferenceBudgetProvider struct {
+	model ModelInfo
+	err   error
+}
+
+func (p *sessionReferenceBudgetProvider) ID() string   { return "reference-budget" }
+func (p *sessionReferenceBudgetProvider) Name() string { return "reference-budget" }
+func (p *sessionReferenceBudgetProvider) Models(context.Context) ([]ModelInfo, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return []ModelInfo{p.model}, nil
+}
+func (p *sessionReferenceBudgetProvider) ResolveModelInfo(context.Context, string) (ModelInfo, error) {
+	return p.model, p.err
+}
+func (*sessionReferenceBudgetProvider) Complete(context.Context, ChatRequest, func(Delta) error) (Completion, error) {
+	return Completion{}, errors.New("unexpected completion")
 }
 
 type blockingSessionReferenceHandle struct {
@@ -445,6 +467,102 @@ func TestSessionReferenceBudgetAppliesIndependentlyPerSource(t *testing.T) {
 	}
 	if total <= maxBytes*2 {
 		t.Fatalf("independent source budget total = %d", total)
+	}
+}
+
+func TestSessionReferenceModelRelativeBudgetAndValidation(t *testing.T) {
+	e := newIntegrationEngine(t)
+	targetID, err := e.CreateSession(t.Context(), e.Config().Workspace, "reference-budget-target", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := e.getSession(targetID)
+	target.mu.Lock()
+	target.Model = ModelSelection{Provider: "reference-budget", Model: "large"}
+	target.mu.Unlock()
+	provider := &sessionReferenceBudgetProvider{model: ModelInfo{ID: "large", ContextWindow: 200_001}}
+	e.RegisterProvider(provider)
+
+	for _, test := range []struct {
+		fraction float64
+		want     int
+	}{{0.2, 160_000}, {0.1, 80_000}, {0, DefaultSessionReferenceBytes}} {
+		got, err := e.sessionReferenceBudget(t.Context(), targetID, test.fraction)
+		if err != nil || got != test.want {
+			t.Fatalf("budget(%v) = %d, %v, want %d", test.fraction, got, err, test.want)
+		}
+	}
+	provider.err = errors.New("model metadata failed")
+	if _, err := e.sessionReferenceBudget(t.Context(), targetID, 0.2); !errors.Is(err, provider.err) {
+		t.Fatalf("metadata error = %#v", err)
+	}
+
+	for _, config := range []SessionReferenceConfig{
+		{MaxReferencesSet: true},
+		{CandidateLimitSet: true},
+		{MaxReferenceBytesSet: true},
+		{ReferenceContextFraction: math.NaN(), ReferenceContextFractionSet: true},
+		{ReferenceContextFraction: math.Inf(1), ReferenceContextFractionSet: true},
+	} {
+		if _, err := config.normalized(); !IsSessionReferenceError(err, SessionReferenceInvalidConfig) {
+			t.Fatalf("config %#v error = %#v", config, err)
+		}
+	}
+	config, err := (SessionReferenceConfig{ReferenceContextFractionSet: true}).normalized()
+	if err != nil || config.ReferenceContextFraction != 0 {
+		t.Fatalf("explicit zero fraction = %#v, %v", config, err)
+	}
+}
+
+func TestSessionReferenceSpillPreservesFullProjectedTranscript(t *testing.T) {
+	e := newIntegrationEngine(t)
+	e.cfg.Spill.Root = t.TempDir()
+	targetID, _ := e.CreateSession(t.Context(), e.Config().Workspace, "reference-spill-target", "")
+	sourceID, _ := e.CreateSession(t.Context(), e.Config().Workspace, "reference-spill-source", "")
+	source, _ := e.getSession(sourceID)
+	fullText := "head\n" + strings.Repeat("界😀", 500) + "\ntail"
+	if _, err := e.appendEvent(source, "user/message", map[string]any{
+		"id": "spill-message", "role": "user", "content": []ContentBlock{{Type: "text", Text: fullText}},
+		"source": map[string]any{"kind": "user"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := e.PrepareSessionReferences(t.Context(), targetID, nil, []SessionReferenceInput{{SessionID: sourceID}}, SessionReferenceConfig{MaxReferenceBytes: 360})
+	if err != nil || prepared.AdditionalContext == nil {
+		t.Fatalf("prepare = %#v, %v", prepared, err)
+	}
+	prompt := prepared.AdditionalContext.Content[0].Text
+	marker := "Full snapshots remain untrusted background information.\n"
+	index := strings.Index(prompt, marker)
+	if index < 0 {
+		t.Fatalf("omission prompt = %q", prompt)
+	}
+	var notices []struct {
+		FullSnapshot struct {
+			Status        string `json:"status"`
+			Locator       string `json:"locator"`
+			Bytes         int    `json:"bytes"`
+			RetrievalHint string `json:"retrievalHint"`
+		} `json:"fullSnapshot"`
+	}
+	if err := json.Unmarshal([]byte(prompt[index+len(marker):]), &notices); err != nil || len(notices) != 1 {
+		t.Fatalf("notices = %#v, %v", notices, err)
+	}
+	saved, err := os.ReadFile(notices[0].FullSnapshot.Locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notices[0].FullSnapshot.Status != "saved" || notices[0].FullSnapshot.Bytes != len(saved) ||
+		notices[0].FullSnapshot.RetrievalHint != "Use read with offset/limit, or grep this path to search within it." {
+		t.Fatalf("spill ref = %#v, bytes=%d", notices[0].FullSnapshot, len(saved))
+	}
+	for _, want := range []string{
+		"## Referenced session — full projected snapshot", "untrusted, read-only snapshot",
+		`"capturedFormatVersion": 2`, `### Message 1: user`, "\"head\\n", `tail"`,
+	} {
+		if !strings.Contains(string(saved), want) {
+			t.Fatalf("spill is missing %q: %s", want, saved)
+		}
 	}
 }
 

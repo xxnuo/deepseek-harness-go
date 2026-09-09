@@ -574,6 +574,8 @@ type ExaSearchProviderOptions = core.ExaSearchProviderOptions
 
 type ExactModelInfoResolver = core.ExactModelInfoResolver
 
+type FileAttachmentRef = core.FileAttachmentRef
+
 type FileReferenceCandidate = core.FileReferenceCandidate
 
 type FileReferenceConfig = core.FileReferenceConfig
@@ -1061,6 +1063,8 @@ type WebToolConfig = core.WebToolConfig
 type Workspace = core.Workspace
 
 type WorkspaceFileSearch = core.WorkspaceFileSearch
+
+type WorkspaceFilesConfig = core.WorkspaceFilesConfig
 
 func ACPSubagentStopReason(reason string) SubagentStopReason {
 	return core.ACPSubagentStopReason(reason)

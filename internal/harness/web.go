@@ -810,13 +810,12 @@ func (p *deepSeekWebSearchProvider) Search(ctx context.Context, req WebSearchReq
 	request.Header.Set("Authorization", "Bearer "+options.apiKey)
 	request.Header.Set("anthropic-version", options.apiVersion)
 	request.Header.Set("User-Agent", "deepseek-harness/0.0.1")
-	client := &http.Client{
-		Timeout: 60 * time.Second,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			// Search requests carry credentials and must never be forwarded to a
-			// different origin (or even silently follow a same-origin redirect).
-			return http.ErrUseLastResponse
-		},
+	client := newHTTPClient()
+	client.Timeout = 60 * time.Second
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		// Search requests carry credentials and must never be forwarded to a
+		// different origin (or even silently follow a same-origin redirect).
+		return http.ErrUseLastResponse
 	}
 	resp, err := client.Do(request)
 	if err != nil {
@@ -1078,12 +1077,14 @@ func NewHTTPWebFetchProvider(configs ...HTTPWebFetchConfig) *HTTPWebFetchProvide
 	if len(configs) > 0 {
 		config = normalizeHTTPWebFetchConfig(configs[0])
 	}
+	client := newHTTPClient()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		// Redirects are resolved by Fetch so origin and hop policies are
+		// applied before another request is made.
+		return http.ErrUseLastResponse
+	}
 	return &HTTPWebFetchProvider{
-		client: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			// Redirects are resolved by Fetch so origin and hop policies are
-			// applied before another request is made.
-			return http.ErrUseLastResponse
-		}},
+		client:       client,
 		MaxURLLength: config.MaxURLLength,
 		MaxBodyBytes: config.MaxResponseBytes,
 		MaxBodyChars: config.MaxBodyChars,
@@ -1123,7 +1124,7 @@ func (p *HTTPWebFetchProvider) Fetch(ctx context.Context, req WebFetchRequest) (
 func (p *HTTPWebFetchProvider) fetchURL(ctx context.Context, current *url.URL) (WebFetchResult, error) {
 	client := p.client
 	if client == nil {
-		client = &http.Client{}
+		client = newHTTPClient()
 	}
 	// Clone the client so a caller-provided transport is retained while the
 	// provider's manual redirect policy cannot be overridden accidentally.

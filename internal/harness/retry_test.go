@@ -153,7 +153,7 @@ func TestRetryRecoversWithinOneStepAndLinksOnlySuccessfulChunks(t *testing.T) {
 	s.mu.Lock()
 	events := append([]Event(nil), s.Events...)
 	s.mu.Unlock()
-	var starts, retries, retryStarted, messages []Event
+	var starts, retries, retryStarted, attempts, messages []Event
 	for _, event := range events {
 		switch event.Type {
 		case "step/start":
@@ -164,29 +164,33 @@ func TestRetryRecoversWithinOneStepAndLinksOnlySuccessfulChunks(t *testing.T) {
 			retryStarted = append(retryStarted, event)
 		case "assistant/message":
 			messages = append(messages, event)
+		case "assistant/attempt":
+			attempts = append(attempts, event)
 		}
 	}
-	if len(starts) != 1 || len(retries) != 1 || len(retryStarted) != 1 || len(messages) != 1 {
-		t.Fatalf("event counts: step=%d retry=%d started=%d message=%d", len(starts), len(retries), len(retryStarted), len(messages))
+	if len(starts) != 1 || len(retries) != 1 || len(retryStarted) != 1 || len(attempts) != 1 || len(messages) != 1 {
+		t.Fatalf("event counts: step=%d retry=%d started=%d attempt=%d message=%d", len(starts), len(retries), len(retryStarted), len(attempts), len(messages))
 	}
 	if retries[0].Seq >= retryStarted[0].Seq {
 		t.Fatalf("retry events out of order: %#v %#v", retries[0], retryStarted[0])
 	}
-	if len(messages[0].SourceEventSeqs) != 1 {
+	if messages[0].SourceEventSeqs != nil {
 		t.Fatalf("message source refs = %#v", messages[0].SourceEventSeqs)
 	}
-	refs := messages[0].SourceEventSeqs
-	for _, event := range events {
-		if event.Type != "assistant/chunk" {
-			continue
-		}
-		data, _ := event.Data.(map[string]any)
-		chunk, _ := data["chunk"].(map[string]any)
-		text, _ := chunk["text"].(string)
-		if text == "discarded" && containsInt(refs, int(event.Seq)) {
-			t.Fatalf("failed chunk linked to assistant message: %#v", event)
+	attemptData, _ := attempts[0].Data.(map[string]any)
+	messageData, _ := messages[0].Data.(map[string]any)
+	if !streamContainsText(attemptData["stream"], "discarded") || !streamContainsText(messageData["stream"], "recovered") {
+		t.Fatalf("attempt/message streams = %#v / %#v", attemptData["stream"], messageData["stream"])
+	}
+}
+
+func streamContainsText(value any, target string) bool {
+	for _, timed := range assistantStreamChunks(value) {
+		if timed.chunk["text"] == target {
+			return true
 		}
 	}
+	return false
 }
 
 func containsInt(values []int, target int) bool {

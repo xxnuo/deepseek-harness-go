@@ -44,7 +44,7 @@ func TestSessionHeaderSeparatesSeedPresenceFromInheritedCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(wire), `"seedLength":0`) || strings.Contains(string(wire), "isSeeded") {
+	if !strings.Contains(string(wire), `"isSeeded":true`) || strings.Contains(string(wire), "seedLength") {
 		t.Fatalf("seeded wire header = %s", wire)
 	}
 	parsed, ok, err := parseSessionHeader(wire)
@@ -55,7 +55,7 @@ func TestSessionHeaderSeparatesSeedPresenceFromInheritedCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(unseededWire), "seedLength") {
+	if !strings.Contains(string(unseededWire), `"isSeeded":false`) || strings.Contains(string(unseededWire), "seedLength") {
 		t.Fatalf("unseeded wire header = %s", unseededWire)
 	}
 	logical, err := json.Marshal(seeded)

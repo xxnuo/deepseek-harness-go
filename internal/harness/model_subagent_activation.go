@@ -557,6 +557,7 @@ func (e *Engine) restoreContinuableSubagentComposition(child *Session, descripto
 		persona = *descriptor.Persona
 	}
 	child.mu.Lock()
+	child.Header.Mode = descriptor.Mode
 	child.Model = selection
 	child.personaOverride = persona
 	child.toolRestriction = restriction

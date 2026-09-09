@@ -41,7 +41,7 @@ func TestForkSessionUsesTurnBoundaryAndCarriesTailMetadata(t *testing.T) {
 	seedLength, title, parentID := child.Header.SeedLength, child.Title, child.Header.ParentSession
 	events := append([]Event(nil), child.Events...)
 	child.mu.Unlock()
-	if seedLength != 7 || len(events) != 7 || title != "Seed title" || parentID != parent {
+	if seedLength != 7 || len(events) != 8 || events[7].Type != "session/end-seed" || title != "Seed title" || parentID != parent {
 		t.Fatalf("fork metadata = seed=%d events=%d title=%q parent=%q", seedLength, len(events), title, parentID)
 	}
 

@@ -121,7 +121,7 @@ type DeepSeekFilesClient struct {
 
 func NewDeepSeekFilesClient(baseURL, apiKey string, client *http.Client) *DeepSeekFilesClient {
 	if client == nil {
-		client = &http.Client{}
+		client = newHTTPClient()
 	}
 	return &DeepSeekFilesClient{BaseURL: strings.TrimRight(baseURL, "/"), APIKey: apiKey, HTTPClient: client}
 }
@@ -513,7 +513,7 @@ func NewDeepSeekFileStore(index *DeepSeekUploadIndex, client *http.Client) *Deep
 		index = NewDeepSeekUploadIndex(filepath.Join(".", "llm-deepseek", "files-v3.json"))
 	}
 	if client == nil {
-		client = &http.Client{}
+		client = newHTTPClient()
 	}
 	return &DeepSeekFileStore{Index: index, HTTPClient: client, now: time.Now, inflight: map[string]*deepSeekUploadCall{}}
 }

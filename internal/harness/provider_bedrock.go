@@ -38,7 +38,7 @@ type bedrockProvider struct {
 func newBedrockProvider(id, baseURL, apiKey, model string) *bedrockProvider {
 	return &bedrockProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{},
+		client: newHTTPClient(),
 	}
 }
 
@@ -106,7 +106,7 @@ func (p *bedrockProvider) Complete(ctx context.Context, req ChatRequest, onDelta
 
 func (p *bedrockProvider) requestBody(req ChatRequest) map[string]any {
 	retention := resolvedPiAICacheRetention(p.cacheRetention)
-	body := map[string]any{"messages": bedrockMessages(req.Messages, p.modelSpec, retention)}
+	body := map[string]any{"messages": bedrockMessages(req.Messages, p.modelSpec, p.id, retention)}
 	if req.System != "" {
 		system := []any{map[string]any{"text": req.System}}
 		if retention != "none" && bedrockSupportsPromptCache(p.modelSpec) {
@@ -181,7 +181,7 @@ func (p *bedrockProvider) reasoningFields(effort string) map[string]any {
 	}
 }
 
-func bedrockMessages(messages []ChatMessage, model piAIModel, retention string) []any {
+func bedrockMessages(messages []ChatMessage, model piAIModel, provider, retention string) []any {
 	out := make([]any, 0, len(messages))
 	for index := 0; index < len(messages); index++ {
 		message := messages[index]
@@ -196,7 +196,8 @@ func bedrockMessages(messages []ChatMessage, model piAIModel, retention string) 
 			}
 			if reasoning := strings.TrimSpace(message.Reasoning); reasoning != "" {
 				if bedrockClaude(model) {
-					if strings.TrimSpace(message.ReasoningSignature) == "" {
+					sameModel := !message.ReplayStatePresent || message.ReplayValid && message.NativeAPI == "bedrock-converse-stream" && message.NativeProvider == provider && message.NativeModel == model.ID
+					if strings.TrimSpace(message.ReasoningSignature) == "" || !sameModel {
 						content = append(content, map[string]any{"text": message.Reasoning})
 					} else {
 						content = append(content, map[string]any{"reasoningContent": map[string]any{"reasoningText": map[string]any{"text": message.Reasoning, "signature": message.ReasoningSignature}}})

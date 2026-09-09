@@ -269,11 +269,13 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	if input.Meta != nil {
 		meta = *input.Meta
 	}
+	sourceVersion := SessionFormatVersion
 	if input.SeedSource == "persistence" {
 		if meta.ID != id {
 			return nil, fmt.Errorf("restored session header id %q does not match session id %q", meta.ID, id)
 		}
-		if meta.Version != SessionFormatVersion {
+		sourceVersion = meta.Version
+		if sourceVersion < 0 || sourceVersion > SessionFormatVersion {
 			return nil, fmt.Errorf("unsupported session format version %d", meta.Version)
 		}
 	}
@@ -323,19 +325,51 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	}
 	session.mu.Lock()
 	for index, raw := range input.Seed {
-		seed, err := decodeSessionSeedEvent(raw, index)
+		if input.SeedSource == "persistence" && sourceVersion < SessionFormatVersion {
+			encoded, err := json.Marshal(raw)
+			if err != nil {
+				session.mu.Unlock()
+				return nil, fmt.Errorf("seed event at index %d is not JSON-serializable", index)
+			}
+			decoded, err := decodeSessionStorageRecordVersion(encoded, sourceVersion)
+			if err != nil {
+				session.mu.Unlock()
+				return nil, fmt.Errorf("seed event at index %d: %w", index, err)
+			}
+			for _, seed := range decoded {
+				if int(seed.Seq) != len(session.Events) {
+					session.mu.Unlock()
+					return nil, fmt.Errorf("seed event at index %d is not contiguous", index)
+				}
+				session.Events = append(session.Events, seed)
+			}
+		} else {
+			seed, err := decodeSessionSeedEvent(raw, index)
+			if err != nil {
+				session.mu.Unlock()
+				return nil, err
+			}
+			if err := validateDynamicSessionEvent(seed.Type, len(session.Events), seed.SurfaceOp, seed.SourceEventSeqs); err != nil {
+				session.mu.Unlock()
+				return nil, fmt.Errorf("invalid seed event at index %d: %w", index, err)
+			}
+			if _, err := appendSeedEventLocked(session, seed); err != nil {
+				session.mu.Unlock()
+				return nil, err
+			}
+		}
+	}
+	if input.SeedSource == "persistence" && sourceVersion < SessionFormatVersion {
+		migrated, migratedCut, err := migrateLegacySessionEvents(meta, inheritedEventCount, sourceVersion, session.Events)
 		if err != nil {
 			session.mu.Unlock()
 			return nil, err
 		}
-		if err := validateDynamicSessionEvent(seed.Type, len(session.Events), seed.SurfaceOp, seed.SourceEventSeqs); err != nil {
-			session.mu.Unlock()
-			return nil, fmt.Errorf("invalid seed event at index %d: %w", index, err)
-		}
-		if _, err := appendSeedEventLocked(session, seed); err != nil {
-			session.mu.Unlock()
-			return nil, err
-		}
+		session.Events = migrated
+		inheritedEventCount = migratedCut
+		session.InheritedEventCount = migratedCut
+		meta.SeedLength = int(migratedCut)
+		session.Header = meta
 	}
 	if int(inheritedEventCount) > len(session.Events) {
 		session.mu.Unlock()
@@ -343,10 +377,17 @@ func (e *Engine) dynamicCordisPrepareSession(run *dynamicCordisRun, id string, o
 	}
 	session.firstLiveSeq = len(session.Events)
 	if seedProvided && (len(session.Events) == 0 || session.Events[len(session.Events)-1].Type != "session/end-seed") {
-		if _, err := appendEventLocked(session, "session/end-seed", map[string]any{}, nil, nil, false); err != nil {
+		data := map[string]any{}
+		if meta.IsSeeded {
+			data["inherited"] = true
+		}
+		if _, err := appendEventLocked(session, "session/end-seed", data, nil, nil, false); err != nil {
 			session.mu.Unlock()
 			return nil, err
 		}
+	} else if seedProvided && meta.IsSeeded {
+		marker, _ := session.Events[len(session.Events)-1].Data.(map[string]any)
+		marker["inherited"] = true
 	}
 	if _, err := foldSurfaceEvents(session.Events, true); err != nil {
 		session.mu.Unlock()

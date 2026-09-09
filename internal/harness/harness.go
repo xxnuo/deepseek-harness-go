@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-const SessionFormatVersion = 0
+const SessionFormatVersion = 2
 
 // LaunchEnvironmentSnapshot preserves the source of launch-time values even
 // when a CLI temporarily materializes dotenv entries in os.Environ.
@@ -76,6 +76,7 @@ type Config struct {
 	// Nil keeps the historical permissive behavior for library callers.
 	TodoAllowParallelInProgress *bool
 	Persona                     string
+	PersonaSuffix               string
 	InstructionMaxBytes         int
 	DeepSeekWebSearch           DeepSeekWebSearchConfig
 	ExaSearch                   ExaSearchProviderOptions
@@ -89,6 +90,7 @@ type Config struct {
 	RepeatToolReminder          RepeatToolReminderConfig
 	Jobs                        JobsConfig
 	FileReference               FileReferenceConfig
+	WorkspaceFiles              WorkspaceFilesConfig
 	SessionReference            SessionReferenceConfig
 	SessionProjectionCache      *SessionProjectionCacheConfig
 	Storage                     *StorageRuntimeConfig
@@ -281,7 +283,7 @@ func DefaultConfig() Config {
 		BaseURL: baseURL, APIKey: os.Getenv("DEEPSEEK_API_KEY"), Persist: true,
 		WebSearchProvider: webSearchProvider, WebFetchProvider: webFetchProvider,
 		WebTools: webTools, HTTPWebFetch: defaultHTTPWebFetchConfig(),
-		ToolPresentation: toolPresentation, Persona: defaultCodingPersona,
+		ToolPresentation: toolPresentation, Persona: defaultCodingPersona, PersonaSuffix: "Your working directory is {{cwd}}.",
 		ToolTimeoutPolicyEnabled:       &timeoutPolicyEnabled,
 		TodoAllowParallelInProgress:    &todoAllowParallel,
 		DeepSeekSessionLogEnabled:      &deepSeekSessionLogEnabled,
@@ -531,17 +533,18 @@ func WithTerminalTool(v TerminalToolConfig) Option {
 func WithE2B(v E2BConfig) Option { return func(c *Config) { c.E2B = &v } }
 
 type ContentBlock struct {
-	Type       string              `json:"type"`
-	Text       string              `json:"text,omitempty"`
-	Signature  string              `json:"signature,omitempty"`
-	Attachment *ImageAttachmentRef `json:"attachment,omitempty"`
-	ID         string              `json:"id,omitempty"`
-	Name       string              `json:"name,omitempty"`
-	Arguments  string              `json:"arguments,omitempty"`
-	ToolCallID string              `json:"toolCallId,omitempty"`
-	Content    []ContentBlock      `json:"content,omitempty"`
-	IsError    bool                `json:"isError,omitempty"`
-	Extra      map[string]any      `json:"-"`
+	Type           string              `json:"type"`
+	Text           string              `json:"text,omitempty"`
+	Signature      string              `json:"signature,omitempty"`
+	Attachment     *ImageAttachmentRef `json:"attachment,omitempty"`
+	FileAttachment *FileAttachmentRef  `json:"-"`
+	ID             string              `json:"id,omitempty"`
+	Name           string              `json:"name,omitempty"`
+	Arguments      string              `json:"arguments,omitempty"`
+	ToolCallID     string              `json:"toolCallId,omitempty"`
+	Content        []ContentBlock      `json:"content,omitempty"`
+	IsError        bool                `json:"isError,omitempty"`
+	Extra          map[string]any      `json:"-"`
 }
 
 type PromptContentPart struct {
@@ -550,6 +553,7 @@ type PromptContentPart struct {
 	MediaType string `json:"mediaType,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Name      string `json:"name,omitempty"`
+	ReceiptID string `json:"receiptId,omitempty"`
 	decoded   []byte
 }
 
@@ -601,17 +605,23 @@ type ReasoningEffortInfo struct {
 }
 
 type ChatMessage struct {
-	Role               string            `json:"role"`
-	Content            string            `json:"content"`
-	Parts              []ChatContentPart `json:"parts,omitempty"`
-	Blocks             []ContentBlock    `json:"blocks,omitempty"`
-	Images             []ChatImage       `json:"images,omitempty"`
-	HadImages          bool              `json:"-"`
-	Reasoning          string            `json:"reasoning_content,omitempty"`
-	ReasoningSignature string            `json:"reasoning_signature,omitempty"`
-	ToolCalls          []ToolCall        `json:"tool_calls,omitempty"`
-	ToolCallID         string            `json:"tool_call_id,omitempty"`
-	Source             map[string]any    `json:"-"`
+	Role                  string            `json:"role"`
+	Content               string            `json:"content"`
+	Parts                 []ChatContentPart `json:"parts,omitempty"`
+	Blocks                []ContentBlock    `json:"blocks,omitempty"`
+	Images                []ChatImage       `json:"images,omitempty"`
+	HadImages             bool              `json:"-"`
+	Reasoning             string            `json:"reasoning_content,omitempty"`
+	ReasoningSignature    string            `json:"reasoning_signature,omitempty"`
+	ToolCalls             []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID            string            `json:"tool_call_id,omitempty"`
+	Source                map[string]any    `json:"-"`
+	ReplayStatePresent    bool              `json:"-"`
+	ReplayValid           bool              `json:"-"`
+	NativeAPI             string            `json:"-"`
+	NativeProvider        string            `json:"-"`
+	NativeModel           string            `json:"-"`
+	ProviderThinkingLevel *string           `json:"-"`
 }
 
 type ChatImage struct {
@@ -657,12 +667,16 @@ type Delta struct {
 }
 
 type Completion struct {
-	Text               string
-	Reasoning          string
-	ReasoningSignature string
-	ToolCalls          []ToolCall
-	Usage              map[string]any
-	Finish             string
+	Text                  string
+	Reasoning             string
+	ReasoningSignature    string
+	ToolCalls             []ToolCall
+	Usage                 map[string]any
+	Finish                string
+	ReplayAPI             string
+	ResponseModel         string
+	ResponseID            string
+	ProviderThinkingLevel *string
 }
 
 type ToolConstrainedSampling struct {
@@ -785,7 +799,7 @@ type SessionHeader struct {
 	Origin          string `json:"origin,omitempty"`
 	DelegationDepth int    `json:"delegationDepth,omitempty"`
 	AgentPreset     string `json:"agentPreset,omitempty"`
-	Mode            string `json:"mode,omitempty"`
+	Mode            string `json:"-"`
 }
 
 // SessionSeq identifies an existing event. SessionLogOffset identifies a gap
@@ -904,6 +918,9 @@ type Session struct {
 	mu                             sync.Mutex
 	store                          SessionHandle
 	storedEventCount               int
+	assistantStreamRevision        int
+	assistantAttemptCounter        int
+	assistantStreamActive          *assistantStreamActive
 	invariants                     *InvariantRegistry
 }
 
@@ -1067,6 +1084,8 @@ type Engine struct {
 	deepSeekPackageIdentityCache map[string]deepSeekPackageIdentityCacheResult
 	bootMu                       sync.Mutex
 	bootSnapshot                 *bootSnapshot
+	openInAppMu                  sync.Mutex
+	openInApp                    *openInAppRuntime
 	bootInitialRevisionNonce     string
 	bootNextInitialRevision      uint64
 	presetRuntimeMu              sync.Mutex
@@ -1105,6 +1124,7 @@ type Engine struct {
 	credentialService            *CredentialService
 	authorizationService         *AuthorizationService
 	subs                         map[string]map[chan Event]struct{}
+	assistantStreamSubs          map[string]map[chan map[string]any]struct{}
 	hostSubs                     map[chan map[string]any]struct{}
 	muxSubs                      map[chan map[string]any]struct{}
 	pendingMu                    sync.Mutex
@@ -1118,6 +1138,8 @@ type Engine struct {
 	fileReferenceSearches        map[string]*WorkspaceFileSearch
 	attachmentRequestMu          sync.Mutex
 	attachmentRequestInflight    map[string]*sharedRequestImage
+	fileUploadMu                 sync.Mutex
+	fileUploads                  map[string]map[string]stagedFileUpload
 	imageCompression             chan struct{}
 	jobs                         *jobRegistry
 	shellEnv                     *shellEnvironmentRegistry
@@ -1275,7 +1297,7 @@ func New(opts ...Option) (*Engine, error) {
 		}
 	}
 	titleCtx, titleCancel := context.WithCancel(context.Background())
-	e := &Engine{cfg: cfg, deepSeekExtensions: newDeepSeekLlmAPIExtensionRegistry(), pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, remoteEventClients: map[string]map[string]struct{}{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, scheduleProjectionDispose: scheduleProjectionDispose, modelSubagentActivations: map[string]*modelSubagentActivation{}, storage: NewStorageHub(), jobWakes: map[string]int{}}
+	e := &Engine{cfg: cfg, deepSeekExtensions: newDeepSeekLlmAPIExtensionRegistry(), pluginInventory: clonePluginInventory(cfg.PluginInventory), presetRuntimes: map[string]*presetRuntimeGeneration{}, sessions: map[string]*Session{}, providers: map[string]Provider{}, subagentProviders: map[string]SubagentProvider{}, subagentProviderTokens: map[string]uint64{}, piAIProviders: map[string]*managedPiAIProvider{}, retryPolicies: map[string]RetryPolicy{}, webSearchProviders: map[string]WebSearchProvider{}, webSearchProviderTokens: map[string]*byte{}, webFetchProviders: map[string]WebFetchProvider{}, webFetchProviderTokens: map[string]*byte{}, hostWebSearchDisposers: map[string]func(){}, hostWebFetchDisposers: map[string]func(){}, tools: map[string]Tool{}, toolOwners: map[string]string{}, hostToolModules: map[string]string{}, scopedTools: map[string]map[string]Tool{}, structuredOutputs: map[string]*structuredOutputRuntime{}, workspaces: map[string]*Workspace{}, workspaceOrder: []string{}, archived: map[string]bool{}, goals: map[string]goalState{}, settings: map[string]map[string]any{}, settingsRev: map[string]int{}, credentials: map[string]string{}, credentialRecords: map[CredentialKey]CredentialRecord{}, credentialRecordOrder: []CredentialKey{}, subs: map[string]map[chan Event]struct{}{}, assistantStreamSubs: map[string]map[chan map[string]any]struct{}{}, hostSubs: map[chan map[string]any]struct{}{}, muxSubs: map[chan map[string]any]struct{}{}, pending: map[string]*pendingInteraction{}, remoteEventClients: map[string]map[string]struct{}{}, dynamicCordis: newDynamicCordisState(), fsState: newFSObservationState(), fileReferenceSearches: map[string]*WorkspaceFileSearch{}, attachmentRequestInflight: map[string]*sharedRequestImage{}, imageCompression: make(chan struct{}, cfg.ImageCompressionConcurrency), jobs: newJobRegistry(), shellEnv: newShellEnvironmentRegistry(), shells: newPersistentShellRegistry(), terminals: newTerminalRegistry(), lsp: newLSPRegistry(), titleWork: map[string]*sessionTitleWorkState{}, titleCtx: titleCtx, titleCancel: titleCancel, invariants: invariants, sessionProjections: sessionProjections, scheduleProjectionDispose: scheduleProjectionDispose, modelSubagentActivations: map[string]*modelSubagentActivation{}, storage: NewStorageHub(), jobWakes: map[string]int{}}
 	sessionProjections.setRuntimeExecutor(func(job func()) error {
 		if !e.dynamicCordis.loop.call(job) {
 			return errors.New("dynamic Cordis runtime is closed")
@@ -2689,29 +2711,17 @@ func readSession(r io.Reader) (*Session, error) {
 	if !scanner.Scan() {
 		return nil, errors.New("empty session log")
 	}
-	var wireHeader sessionHeaderLine
-	if err := json.Unmarshal(scanner.Bytes(), &wireHeader); err != nil {
+	header, inheritedEventCount, sourceVersion, ok, err := parseSessionArtifactHeader(scanner.Bytes())
+	if err != nil {
 		return nil, err
 	}
-	if wireHeader.Type != "session" || wireHeader.ID == "" {
+	if !ok {
 		return nil, errors.New("invalid session header")
-	}
-	if wireHeader.Version != SessionFormatVersion {
-		return nil, fmt.Errorf("unsupported session format version %d", wireHeader.Version)
-	}
-	header := SessionHeader{
-		Version: wireHeader.Version, ID: wireHeader.ID, CreatedAt: wireHeader.CreatedAt,
-		CWD: wireHeader.CWD, ParentSession: wireHeader.ParentSession,
-		IsSeeded: wireHeader.SeedLength != nil, Origin: wireHeader.Origin,
-		DelegationDepth: wireHeader.DelegationDepth, AgentPreset: wireHeader.AgentPreset, Mode: wireHeader.Mode,
-	}
-	if wireHeader.SeedLength != nil {
-		header.SeedLength = *wireHeader.SeedLength
 	}
 	line := 1
 	for scanner.Scan() {
 		line++
-		record, err := decodeSessionStorageRecord(scanner.Bytes())
+		record, err := decodeSessionStorageRecordVersion(scanner.Bytes(), sourceVersion)
 		if err != nil {
 			return nil, fmt.Errorf("session log line %d: %w", line, err)
 		}
@@ -2725,6 +2735,22 @@ func readSession(r io.Reader) (*Session, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+	if sourceVersion < SessionFormatVersion {
+		events, inheritedEventCount, err = migrateLegacySessionEvents(header, inheritedEventCount, sourceVersion, events)
+		if err != nil {
+			return nil, err
+		}
+		header.SeedLength = int(inheritedEventCount)
+	} else if header.IsSeeded {
+		marker, found := inheritedSeedMarker(events)
+		if !found {
+			return nil, errors.New("format v2 seeded Session lacks an inherited end-seed marker")
+		}
+		inheritedEventCount = SessionLogOffset(marker)
+		header.SeedLength = marker
+	} else if _, found := inheritedSeedMarker(events); found {
+		return nil, errors.New("format v2 unseeded Session contains an inherited end-seed marker")
+	}
 	if _, err := foldSurfaceEvents(events, true); err != nil {
 		return nil, err
 	}
@@ -2732,7 +2758,7 @@ func readSession(r io.Reader) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, InheritedEventCount: SessionLogOffset(header.SeedLength), firstLiveSeq: len(events), pending: pending, steering: steering, published: true}, nil
+	return &Session{Header: header, Title: sessionTitleFromEvents(events), Events: events, InheritedEventCount: inheritedEventCount, firstLiveSeq: len(events), pending: pending, steering: steering, published: true}, nil
 }
 
 func (e *Engine) CreateSession(ctx context.Context, cwd, id, preset string) (string, error) {
@@ -3123,6 +3149,15 @@ func (e *Engine) publishEvent(id string, event Event) {
 }
 
 func (e *Engine) publishEventFrom(origin *dynamicCordisRun, id string, event Event) {
+	if event.Type == "user/message" && eventSourceKind(event.Data) == "user" {
+		if data, ok := event.Data.(map[string]any); ok {
+			if source, ok := data["source"].(map[string]any); ok {
+				if requestID, ok := source["rpcId"].(string); ok {
+					e.retireFileReceipts(id, requestID)
+				}
+			}
+		}
+	}
 	if event.Type == "tool/result" {
 		e.invalidateFileReferenceSearch(id)
 	}
@@ -3647,6 +3682,9 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	e.closed = true
+	if e.fsState != nil {
+		e.fsState.closeFollowers()
+	}
 	sessions := make([]*Session, 0, len(e.sessions))
 	for _, s := range e.sessions {
 		sessions = append(sessions, s)
@@ -3668,6 +3706,13 @@ func (e *Engine) Close() error {
 		}
 	}
 	e.subs = map[string]map[chan Event]struct{}{}
+	assistantStreamSubs := make([]chan map[string]any, 0)
+	for _, subs := range e.assistantStreamSubs {
+		for ch := range subs {
+			assistantStreamSubs = append(assistantStreamSubs, ch)
+		}
+	}
+	e.assistantStreamSubs = map[string]map[chan map[string]any]struct{}{}
 	websocketPools := make([]*openAIResponsesWebSocketPool, 0, len(e.piAIProviders))
 	for _, provider := range e.piAIProviders {
 		websocketPools = append(websocketPools, provider.websockets)
@@ -3756,6 +3801,9 @@ func (e *Engine) Close() error {
 		close(ch)
 	}
 	for _, ch := range eventSubs {
+		close(ch)
+	}
+	for _, ch := range assistantStreamSubs {
 		close(ch)
 	}
 	return errors.Join(deepSeekExtensionsErr, teamErr, activationErr, terminalErr, lspErr, projectionCacheErr, sessionStoreErr, e2bErr, invariantErr, storageErr)

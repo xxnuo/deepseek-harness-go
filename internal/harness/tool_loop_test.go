@@ -477,8 +477,12 @@ func TestToolLoopExecutesAndReplaysToolResult(t *testing.T) {
 	for _, event := range session.Events {
 		switch event.Type {
 		case "assistant/message":
-			if len(event.SourceEventSeqs) != 1 {
+			if event.SourceEventSeqs != nil {
 				t.Fatalf("assistant provenance = %#v", event.SourceEventSeqs)
+			}
+			data, _ := event.Data.(map[string]any)
+			if stream, _ := data["stream"].([]any); len(stream) == 0 {
+				t.Fatalf("assistant stream = %#v", data["stream"])
 			}
 		case "tool/call":
 			toolCallSeq = int(event.Seq)

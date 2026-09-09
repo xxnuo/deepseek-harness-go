@@ -502,7 +502,7 @@ func NewOpenAIProvider(id, baseURL, apiKey, model string) *OpenAIProvider {
 	if model == "" {
 		model = "deepseek-chat"
 	}
-	return &OpenAIProvider{id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model, client: &http.Client{}}
+	return &OpenAIProvider{id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model, client: newHTTPClient()}
 }
 
 type openAICompletionsCompat struct {
@@ -519,6 +519,8 @@ type openAICompletionsCompat struct {
 	supportsUsageInStreaming         bool
 	supportsFinishReason             bool
 	supportsThinkingTokenBudget      bool
+	thinkingTokenBudgetField         string
+	vllmPriority                     *int
 	supportsStrictMode               bool
 	requiresToolResultName           bool
 	requiresAssistantAfterToolResult bool
@@ -624,6 +626,8 @@ func resolveOpenAICompletionsCompat(provider, baseURL string, model piAIModel) o
 	if value := model.Compat.SupportsThinkingTokenBudget; value != nil {
 		compat.supportsThinkingTokenBudget = *value
 	}
+	compat.thinkingTokenBudgetField = model.Compat.ThinkingTokenBudgetField
+	compat.vllmPriority = model.Compat.VLLMPriority
 	if value := model.Compat.SupportsDeveloperRole; value != nil {
 		compat.supportsDeveloperRole = *value
 	}
@@ -690,7 +694,7 @@ func piAIReasoningWire(model piAIModel, level string) (string, bool) {
 	return level, level != "off"
 }
 
-func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compat openAICompletionsCompat, req ChatRequest) {
+func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compat openAICompletionsCompat, req ChatRequest, configuredBudgets map[string]int) {
 	if model.ID == "" {
 		if req.Thinking != "" {
 			body["thinking"] = &openAIWireThinking{Type: req.Thinking}
@@ -705,6 +709,11 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 	}
 	enabled := req.ReasoningEffort != "" && req.ReasoningEffort != "off"
 	wire, hasWire := piAIReasoningWire(model, req.ReasoningEffort)
+	ceiling := model.MaxTokens
+	if req.MaxTokens > 0 {
+		ceiling = req.MaxTokens
+	}
+	budget, hasBudget := openAIThinkingTokenBudget(req.ReasoningEffort, configuredBudgets, ceiling)
 	switch compat.thinkingFormat {
 	case "zai":
 		body["thinking"] = map[string]any{"type": map[bool]string{true: "enabled", false: "disabled"}[enabled]}
@@ -716,11 +725,11 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 	case "qwen-chat-template":
 		body["chat_template_kwargs"] = map[string]any{"enable_thinking": enabled, "preserve_thinking": true}
 	case "chat-template":
-		if kwargs := openAIChatTemplateKwargs(model, req.ReasoningEffort, compat.chatTemplateKwargs); len(kwargs) > 0 {
+		if kwargs := openAIChatTemplateKwargs(model, req.ReasoningEffort, budget, hasBudget, compat.chatTemplateKwargs); len(kwargs) > 0 {
 			body["chat_template_kwargs"] = kwargs
 		}
 	case "baseten":
-		if args := openAIChatTemplateKwargs(model, req.ReasoningEffort, compat.chatTemplateArgs); len(args) > 0 {
+		if args := openAIChatTemplateKwargs(model, req.ReasoningEffort, budget, hasBudget, compat.chatTemplateArgs); len(args) > 0 {
 			body["chat_template_args"] = args
 		}
 		if enabled && compat.supportsReasoningEffort && hasWire {
@@ -779,7 +788,7 @@ func applyOpenAICompletionsReasoning(body map[string]any, model piAIModel, compa
 	}
 }
 
-func openAIChatTemplateKwargs(model piAIModel, effort string, configured map[string]any) map[string]any {
+func openAIChatTemplateKwargs(model piAIModel, effort string, budget int, hasBudget bool, configured map[string]any) map[string]any {
 	enabled := effort != "" && effort != "off"
 	result := map[string]any{}
 	for name, raw := range configured {
@@ -807,6 +816,12 @@ func openAIChatTemplateKwargs(model piAIModel, effort string, configured map[str
 				case enabled:
 					value = effort
 				default:
+					include = false
+				}
+			case "thinking.budget":
+				if hasBudget {
+					value = budget
+				} else {
 					include = false
 				}
 			}
@@ -972,12 +987,27 @@ func (p *OpenAIProvider) ResolveModelInfo(ctx context.Context, model string) (Mo
 	return info, nil
 }
 func (p *OpenAIProvider) Models(ctx context.Context) ([]ModelInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
+	return p.discoverModels(ctx, "openai-completions")
+}
+
+func (p *OpenAIProvider) discoverModels(ctx context.Context, api string) ([]ModelInfo, error) {
+	base := strings.TrimRight(p.baseURL, "/")
+	url := base + "/models"
+	if api == "anthropic-messages" {
+		url = strings.TrimSuffix(base, "/v1") + "/v1/models?limit=1000"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	p.applyHeaders(req)
-	if p.apiKey != "" {
+	req.Header.Set("Accept", "application/json")
+	if api == "anthropic-messages" {
+		req.Header.Set("anthropic-version", "2023-06-01")
+		if p.apiKey != "" {
+			req.Header.Set("x-api-key", p.apiKey)
+		}
+	} else if p.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 	resp, err := p.client.Do(req)
@@ -997,48 +1027,7 @@ func (p *OpenAIProvider) Models(ctx context.Context) ([]ModelInfo, error) {
 	if len(bodyBytes) > maxDiscoveryBytes {
 		return nil, fmt.Errorf("model discovery: response exceeds %d bytes", maxDiscoveryBytes)
 	}
-	var body struct {
-		Data []struct {
-			ID              string `json:"id"`
-			Name            string `json:"name"`
-			DisplayName     string `json:"display_name"`
-			ContextWindow   int    `json:"context_window"`
-			ContextLength   int    `json:"context_length"`
-			MaxTokens       int    `json:"max_tokens"`
-			MaxOutputTokens int    `json:"max_output_tokens"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		return nil, err
-	}
-	out := make([]ModelInfo, 0, len(body.Data))
-	seen := make(map[string]struct{}, len(body.Data))
-	for _, m := range body.Data {
-		if strings.TrimSpace(m.ID) == "" {
-			continue
-		}
-		if _, exists := seen[m.ID]; exists {
-			continue
-		}
-		seen[m.ID] = struct{}{}
-		name := m.Name
-		if name == "" {
-			name = m.DisplayName
-		}
-		if name == "" {
-			name = m.ID
-		}
-		contextWindow := m.ContextWindow
-		if contextWindow <= 0 {
-			contextWindow = m.ContextLength
-		}
-		maxTokens := m.MaxTokens
-		if maxTokens <= 0 {
-			maxTokens = m.MaxOutputTokens
-		}
-		out = append(out, ModelInfo{ID: m.ID, Name: name, ContextWindow: contextWindow, MaxTokens: maxTokens})
-	}
-	return out, nil
+	return parseDiscoveredModels(bodyBytes)
 }
 
 func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta func(Delta) error) (Completion, error) {
@@ -1101,15 +1090,22 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	if cacheRetention == "long" && compat.supportsLongCacheRetention {
 		body["prompt_cache_retention"] = "24h"
 	}
-	applyOpenAICompletionsReasoning(body, p.modelSpec, compat, req)
-	if compat.supportsThinkingTokenBudget && p.modelSpec.Reasoning {
+	applyOpenAICompletionsReasoning(body, p.modelSpec, compat, req, p.thinkingBudgets)
+	budgetField := compat.thinkingTokenBudgetField
+	if budgetField == "" && compat.supportsThinkingTokenBudget {
+		budgetField = "thinking_token_budget"
+	}
+	if budgetField != "" && p.modelSpec.Reasoning {
 		ceiling := p.modelSpec.MaxTokens
 		if req.MaxTokens > 0 {
 			ceiling = req.MaxTokens
 		}
 		if budget, ok := openAIThinkingTokenBudget(req.ReasoningEffort, p.thinkingBudgets, ceiling); ok {
-			body["thinking_token_budget"] = budget
+			body[budgetField] = budget
 		}
+	}
+	if compat.vllmPriority != nil {
+		body["priority"] = *compat.vllmPriority
 	}
 	var preparedExtensions *PreparedDeepSeekLlmAPIExtensions
 	if p.deepSeekExtensions != nil {
@@ -1162,7 +1158,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 			return Completion{}, &ProviderError{Code: "REQUEST_EXTENSION", Message: "DeepSeek request extension acceptance failed", Err: acceptErr}
 		}
 	}
-	var text, reasoning, finish string
+	var text, reasoning, finish, responseModel, responseID string
 	callParts := map[int]*ToolCall{}
 	callOrder := []int{}
 	usage := map[string]any{}
@@ -1177,6 +1173,8 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 			return nil
 		}
 		var chunk struct {
+			ID      string `json:"id"`
+			Model   string `json:"model"`
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
@@ -1196,6 +1194,12 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			return fmt.Errorf("malformed SSE payload: %w", err)
+		}
+		if chunk.ID != "" {
+			responseID = chunk.ID
+		}
+		if chunk.Model != "" {
+			responseModel = chunk.Model
 		}
 		if len(chunk.Choices) > 0 {
 			d := chunk.Choices[0].Delta
@@ -1269,5 +1273,5 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req ChatRequest, onDelta 
 	if text == "" && reasoning == "" && len(calls) == 0 {
 		return Completion{}, &ProviderError{Code: "EMPTY_RESPONSE", Message: "model returned a completed response with no content"}
 	}
-	return Completion{Text: text, Reasoning: reasoning, ToolCalls: calls, Usage: usage, Finish: finish}, nil
+	return Completion{Text: text, Reasoning: reasoning, ToolCalls: calls, Usage: usage, Finish: finish, ResponseModel: responseModel, ResponseID: responseID}, nil
 }

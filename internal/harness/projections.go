@@ -93,7 +93,15 @@ func eventUsageSample(event Event) (usageSample, bool) {
 			return usageSample{}, false
 		}
 		value = chunk["usage"]
-	} else if event.Type != "assistant/message" {
+	} else if event.Type == "assistant/message" || event.Type == "assistant/attempt" {
+		if _, ok := usageBuckets(value); !ok {
+			for _, timed := range assistantStreamChunks(data["stream"]) {
+				if timed.chunk["type"] == "usage" {
+					value = timed.chunk["usage"]
+				}
+			}
+		}
+	} else {
 		return usageSample{}, false
 	}
 	buckets, ok := usageBuckets(value)
@@ -460,6 +468,25 @@ func projectionChunkHasToken(event Event) bool {
 	}
 }
 
+func assistantStreamFirstTokenTime(value any) (int64, bool) {
+	for _, timed := range assistantStreamChunks(value) {
+		chunk := timed.chunk
+		switch chunk["type"] {
+		case "text-delta", "reasoning-delta":
+			if text, _ := chunk["text"].(string); text != "" {
+				return timed.time, true
+			}
+		case "tool-call-delta":
+			arguments, _ := chunk["argumentsDelta"].(string)
+			_, hasName := chunk["name"]
+			if arguments != "" || hasName {
+				return timed.time, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func projectionCallID(event Event) string {
 	data, _ := event.Data.(map[string]any)
 	if event.Type == "tool/call" {
@@ -502,6 +529,15 @@ func currentSessionStats(events []Event) map[string]any {
 				time := event.Time
 				open.firstToken = &time
 			}
+		case "assistant/attempt":
+			if open == nil || open.firstToken != nil {
+				continue
+			}
+			turn, turnOK := eventSeqNumber(data["turn"])
+			step, stepOK := eventSeqNumber(data["step"])
+			if first, ok := assistantStreamFirstTokenTime(data["stream"]); ok && turnOK && stepOK && turn == open.turn && step == open.step {
+				open.firstToken = &first
+			}
 		case "assistant/message":
 			if open == nil {
 				continue
@@ -510,6 +546,11 @@ func currentSessionStats(events []Event) map[string]any {
 			step, stepOK := eventSeqNumber(data["step"])
 			if !turnOK || !stepOK || turn != open.turn || step != open.step {
 				continue
+			}
+			if open.firstToken == nil {
+				if first, ok := assistantStreamFirstTokenTime(data["stream"]); ok {
+					open.firstToken = &first
+				}
 			}
 			if elapsed := event.Time - open.start; elapsed > 0 {
 				llmMS += elapsed

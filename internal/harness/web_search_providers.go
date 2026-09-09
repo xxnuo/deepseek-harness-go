@@ -244,7 +244,9 @@ func (p *PerplexitySearchProvider) Search(ctx context.Context, request WebSearch
 }
 
 func webSearchProviderHTTPClient() *http.Client {
-	return &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	client := newHTTPClient()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	return client
 }
 
 func validAbsoluteURL(value string) bool {

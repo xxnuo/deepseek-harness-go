@@ -96,7 +96,7 @@ func shellEnvironment() map[string]string {
 }
 
 func configureChildProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW}
 	if cmd.Cancel != nil {
 		cmd.Cancel = func() error { return killChildProcess(cmd) }
 	}
@@ -126,7 +126,7 @@ func prepareShellChild(cmd *exec.Cmd, mode, workspace string) (shellChildState, 
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Token = syscall.Token(sandbox.token)
-	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW
 	cmd.Env = sandbox.environment(cmd.Env)
 	return &windowsShellChildState{sandbox: sandbox, job: job}, nil
 }
@@ -167,6 +167,7 @@ func killChildProcessPID(pid int) error {
 	}
 	command := exec.Command(taskkill, "/PID", strconv.Itoa(pid), "/T", "/F")
 	command.Stdout, command.Stderr = nil, nil
+	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	if err := command.Run(); err == nil {
 		return nil
 	}

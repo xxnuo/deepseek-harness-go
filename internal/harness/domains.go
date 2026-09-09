@@ -74,7 +74,14 @@ func (e *Engine) Models(ctx context.Context) ([]map[string]any, []map[string]any
 		}
 		rows := []map[string]any{}
 		for _, m := range models {
-			rows = append(rows, map[string]any{"id": m.ID, "name": m.Name, "description": m.Description, "inputModalities": m.InputModalities})
+			row := map[string]any{"id": m.ID, "name": m.Name, "inputModalities": m.InputModalities}
+			if m.Description != "" {
+				row["description"] = m.Description
+			}
+			if m.Reasoning != nil {
+				row["reasoning"] = m.Reasoning
+			}
+			rows = append(rows, row)
 		}
 		groups = append(groups, map[string]any{"id": p.ID(), "name": p.Name(), "models": rows})
 	}
@@ -104,7 +111,7 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 		if catalog, ok := piAICatalog[providerID]; ok && len(catalog.Models) > 0 {
 			return discoveredModelsValue(piAIModelInfos(catalog.Models)), nil
 		}
-		if api != "" && api != "openai-completions" && api != "openai-responses" {
+		if api != "" && api != "openai-completions" && api != "openai-responses" && api != "anthropic-messages" {
 			return nil, rpcError("model-discovery-failed", fmt.Sprintf("pi-ai protocol %q has no model listing this Go build can read; enter this provider's models by hand", api), map[string]any{"settingsNs": ns, "baseURL": baseURL})
 		}
 	}
@@ -126,7 +133,7 @@ func (e *Engine) discoverModels(ctx context.Context, p map[string]any) (any, *RP
 		if configured != nil {
 			probe.headers = clonePIAIHeaders(configured.profile.headers)
 		}
-		models, err := probe.Models(ctx)
+		models, err := probe.discoverModels(ctx, api)
 		if err != nil {
 			return nil, rpcError("model-discovery-failed", err.Error(), map[string]any{"settingsNs": ns, "baseURL": baseURL})
 		}
@@ -203,11 +210,10 @@ func (e *Engine) ListWorkspaces() ([]Workspace, []string) {
 }
 
 func (e *Engine) CreateWorkspace(path string) (Workspace, bool, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return Workspace{}, false, err
+	if !filepath.IsAbs(path) {
+		return Workspace{}, false, fmt.Errorf("workspace-invalid-path: %s", path)
 	}
-	canonical, err := filepath.EvalSymlinks(abs)
+	canonical, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return Workspace{}, false, fmt.Errorf("workspace-invalid-path: %s", path)
 	}

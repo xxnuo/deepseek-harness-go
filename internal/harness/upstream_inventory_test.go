@@ -106,8 +106,18 @@ func TestUpstreamInventoryDoesNotOverclaimSDKClient(t *testing.T) {
 	if !reflect.DeepEqual(client.goFiles, []string{"internal/harness/sdk.go"}) {
 		t.Fatalf("packages/sdk/client Go surface = %#v, want SDK server surface", client.goFiles)
 	}
-	if counts["frontend"] != 42 || counts["hybrid"] != 9 || counts["ported"] != 176 || counts["replaced"] != 26 || counts["support"] != 13 {
-		t.Fatalf("alpha.4 inventory counts = %#v, want frontend=42 hybrid=9 ported=176 replaced=26 support=13", counts)
+	if counts["frontend"] != 47 || counts["hybrid"] != 10 || counts["ported"] != 184 || counts["replaced"] != 28 || counts["support"] != 15 {
+		t.Fatalf("c389f96bf3 target inventory counts = %#v, want frontend=47 hybrid=10 ported=184 replaced=28 support=15", counts)
+	}
+}
+
+func TestUpstreamInventoryNewRootsRequireReview(t *testing.T) {
+	rows := reconcileUpstreamInventoryRows(
+		[]upstreamInventoryRow{{status: "ported", root: "packages/example/existing"}},
+		[]string{"packages/example/existing", "packages/example/new"},
+	)
+	if len(rows) != 2 || rows[0].status != "ported" || rows[1].status != "missing" {
+		t.Fatalf("reconciled rows = %#v, want existing classification plus a failing missing marker", rows)
 	}
 }
 
@@ -124,6 +134,71 @@ func reconcileUpstreamInventoryRows(rows []upstreamInventoryRow, roots []string)
 		known[row.root] = row
 	}
 	defaults := map[string]upstreamInventoryRow{
+		"apps/desktop": {
+			status: "support", root: "apps/desktop",
+		},
+		"apps/desktop-host": {
+			status: "replaced", root: "apps/desktop-host",
+			goFiles: []string{"cmd/dsh/main.go", "internal/harness/server.go"},
+		},
+		"benchmarks": {
+			status: "support", root: "benchmarks",
+		},
+		"packages/api/workspace-files": {
+			status: "ported", root: "packages/api/workspace-files",
+			goFiles: []string{"internal/harness/workspace_files.go", "internal/harness/workspace_file_stream.go"},
+		},
+		"packages/client/file-upload": {
+			status: "ported", root: "packages/client/file-upload",
+			goFiles: []string{"internal/harness/file_attachments.go", "internal/harness/server.go"},
+		},
+		"packages/client/resources": {
+			status: "hybrid", root: "packages/client/resources",
+			goFiles: []string{"internal/harness/server.go", "internal/harness/frontend.go"},
+		},
+		"packages/client/ui-dockkit": {
+			status: "frontend", root: "packages/client/ui-dockkit",
+		},
+		"packages/client/ui-open-in-app": {
+			status: "frontend", root: "packages/client/ui-open-in-app",
+		},
+		"packages/client/ui-sidebar-files": {
+			status: "frontend", root: "packages/client/ui-sidebar-files",
+		},
+		"packages/client/ui-sidebar-right": {
+			status: "frontend", root: "packages/client/ui-sidebar-right",
+		},
+		"packages/client/ui-sidebar-textpreview": {
+			status: "frontend", root: "packages/client/ui-sidebar-textpreview",
+		},
+		"packages/host/open-in-app": {
+			status: "ported", root: "packages/host/open-in-app",
+			goFiles: []string{"internal/harness/open_in_app.go", "internal/harness/server.go"},
+		},
+		"packages/session/session-format": {
+			status: "ported", root: "packages/session/session-format",
+			goFiles: []string{"internal/harness/session_persistence.go", "internal/harness/session_log.go"},
+		},
+		"packages/session/session-format-catalog": {
+			status: "ported", root: "packages/session/session-format-catalog",
+			goFiles: []string{"internal/harness/session_persistence.go", "internal/harness/session_migration.go"},
+		},
+		"packages/session/session-format-v0-to-v1": {
+			status: "ported", root: "packages/session/session-format-v0-to-v1",
+			goFiles: []string{"internal/harness/session_migration.go"},
+		},
+		"packages/session/session-format-v1-to-v2": {
+			status: "ported", root: "packages/session/session-format-v1-to-v2",
+			goFiles: []string{"internal/harness/session_migration.go"},
+		},
+		"packages/util/http-proxy": {
+			status: "ported", root: "packages/util/http-proxy",
+			goFiles: []string{"internal/harness/http_proxy.go"},
+		},
+		"packages/util/package-manifest": {
+			status: "replaced", root: "packages/util/package-manifest",
+			goFiles: []string{"internal/harness/runtime_policies.go", "cmd/dsh/profile.go"},
+		},
 		"packages/client/ui-schedule": {
 			status: "frontend", root: "packages/client/ui-schedule",
 		},
@@ -154,9 +229,9 @@ func reconcileUpstreamInventoryRows(rows []upstreamInventoryRow, roots []string)
 			result = append(result, row)
 			continue
 		}
-		// A newly introduced root must be reviewed and classified before it can
-		// enter the verified baseline.
-		result = append(result, upstreamInventoryRow{status: "support", root: root})
+		// A newly introduced root must remain a failing marker until a reviewer
+		// assigns its real classification and, where applicable, Go surface.
+		result = append(result, upstreamInventoryRow{status: "missing", root: root})
 	}
 	return result
 }

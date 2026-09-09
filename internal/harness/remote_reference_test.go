@@ -65,21 +65,22 @@ func TestCommandsRemoteAdmitsImagesForGoalAndPlan(t *testing.T) {
 	server := httptest.NewServer(e.Handler())
 	t.Cleanup(server.Close)
 	image := map[string]any{
+		"type":      "image",
 		"mediaType": "image/png",
 		"data":      b64(attachmentFixtureBytes(t)["image/png"]),
 		"name":      "diagram.png",
 	}
 
 	_, envelope := postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/clear", "images": []any{image}},
+		"args": map[string]any{"agentId": id, "line": "/clear", "submittedAttachments": []any{image}},
 	})
 	refused := remoteValue(t, envelope).(map[string]any)["result"].(map[string]any)
-	if refused["kind"] != "error" || refused["text"] != "/clear does not accept image attachments" {
+	if refused["kind"] != "error" || refused["text"] != "/clear does not accept attachments" {
 		t.Fatalf("non-image command result = %#v", refused)
 	}
 
 	_, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/goal", "images": []any{image}},
+		"args": map[string]any{"agentId": id, "line": "/goal", "submittedAttachments": []any{image}},
 	})
 	bareGoal := remoteValue(t, envelope).(map[string]any)["result"].(map[string]any)
 	if bareGoal["kind"] != "error" || !strings.Contains(bareGoal["text"].(string), "only accompany a goal objective") {
@@ -87,7 +88,7 @@ func TestCommandsRemoteAdmitsImagesForGoalAndPlan(t *testing.T) {
 	}
 
 	_, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/plan", "images": []any{image}},
+		"args": map[string]any{"agentId": id, "line": "/plan", "submittedAttachments": []any{image}},
 	})
 	plan := remoteValue(t, envelope).(map[string]any)["result"].(map[string]any)
 	if plan["kind"] != "success" {
@@ -103,10 +104,10 @@ func TestCommandsRemoteAdmitsImagesForGoalAndPlan(t *testing.T) {
 	}
 
 	_, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/plan off", "images": []any{image}},
+		"args": map[string]any{"agentId": id, "line": "/plan off", "submittedAttachments": []any{image}},
 	})
 	planOff := remoteValue(t, envelope).(map[string]any)["result"].(map[string]any)
-	if planOff["kind"] != "error" || planOff["text"] != "Image attachments cannot accompany /plan off." {
+	if planOff["kind"] != "error" || planOff["text"] != "Attachments cannot accompany /plan off." {
 		t.Fatalf("image plan off result = %#v", planOff)
 	}
 }

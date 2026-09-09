@@ -124,6 +124,7 @@ type composition struct {
 	perplexitySearch      *harness.PerplexitySearchProviderOptions
 	storage               *harness.StorageRuntimeConfig
 	fileReference         *harness.FileReferenceConfig
+	workspaceFiles        *harness.WorkspaceFilesConfig
 	agentTeams            *harness.AgentTeamConfig
 	runtimeInvariants     *harness.RuntimeInvariantConfig
 	jobs                  harness.JobsConfig
@@ -146,6 +147,7 @@ type pluginEntry struct {
 }
 
 var supportedPluginNames = map[string]bool{
+	"@deepseek-ai/dsh-api-workspace-files":                    true,
 	"@deepseek-ai/cordis-plugin-hmr":                          true,
 	"@deepseek-ai/cordis-plugin-timer":                        true,
 	"@deepseek-ai/dsh-agent":                                  true,
@@ -166,13 +168,16 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-api-workspace-controller":               true,
 	"@deepseek-ai/dsh-bash-sandbox":                           true,
 	"@deepseek-ai/dsh-client-connection":                      true,
+	"@deepseek-ai/dsh-client-file-upload":                     true,
 	"@deepseek-ai/dsh-client-hmr":                             true,
 	"@deepseek-ai/dsh-client-locale":                          true,
 	"@deepseek-ai/dsh-client-modules":                         true,
+	"@deepseek-ai/dsh-client-resources":                       true,
 	"@deepseek-ai/dsh-client-runtime":                         true,
 	"@deepseek-ai/dsh-client-ui-conversation":                 true,
 	"@deepseek-ai/dsh-client-ui-deliverables":                 true,
 	"@deepseek-ai/dsh-client-ui-directory-picker-native":      true,
+	"@deepseek-ai/dsh-client-ui-dockkit":                      true,
 	"@deepseek-ai/dsh-client-ui-agent-preset":                 true,
 	"@deepseek-ai/dsh-client-ui-approval":                     true,
 	"@deepseek-ai/dsh-client-ui-attachment":                   true,
@@ -186,6 +191,7 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-client-ui-layout":                       true,
 	"@deepseek-ai/dsh-client-ui-message-feedback":             true,
 	"@deepseek-ai/dsh-client-ui-model-selection":              true,
+	"@deepseek-ai/dsh-client-ui-open-in-app":                  true,
 	"@deepseek-ai/dsh-client-ui-permission-presets":           true,
 	"@deepseek-ai/dsh-client-ui-plan":                         true,
 	"@deepseek-ai/dsh-client-ui-reference":                    true,
@@ -197,6 +203,9 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-client-ui-settings-plugins":             true,
 	"@deepseek-ai/dsh-client-ui-session":                      true,
 	"@deepseek-ai/dsh-client-ui-sidebar":                      true,
+	"@deepseek-ai/dsh-client-ui-sidebar-files":                true,
+	"@deepseek-ai/dsh-client-ui-sidebar-right":                true,
+	"@deepseek-ai/dsh-client-ui-sidebar-textpreview":          true,
 	"@deepseek-ai/dsh-client-ui-skill":                        true,
 	"@deepseek-ai/dsh-client-ui-subagent":                     true,
 	"@deepseek-ai/dsh-client-ui-theme":                        true,
@@ -234,6 +243,7 @@ var supportedPluginNames = map[string]bool{
 	"@deepseek-ai/dsh-headless/startup":                       true,
 	"@deepseek-ai/dsh-host-apiproxy":                          true,
 	"@deepseek-ai/dsh-host-directory-picker-auto":             true,
+	"@deepseek-ai/dsh-host-open-in-app":                       true,
 	"@deepseek-ai/dsh-host-plugin-inventory":                  true,
 	"@deepseek-ai/dsh-host-webserver":                         true,
 	"@deepseek-ai/dsh-hooks-claude-code":                      true,
@@ -1908,6 +1918,9 @@ func (composition *composition) validate() error {
 		return err
 	}
 	composition.fileReference = fileReference
+	if err := composition.resolveWorkspaceFilesConfig(); err != nil {
+		return err
+	}
 	agentTeams, err := composition.resolveAgentTeamConfig()
 	if err != nil {
 		return err
@@ -2776,12 +2789,12 @@ func (composition *composition) resolveSessionTelemetryConfig() (*harness.Sessio
 			}
 			mode := harness.SessionTelemetryMode(raw.Mode)
 			if mode == "" {
-				mode = harness.SessionTelemetryModeDisabled
+				mode = harness.SessionTelemetryModeFeedbackOnly
 			}
 			switch mode {
-			case harness.SessionTelemetryModeDisabled, harness.SessionTelemetryModeFull, harness.SessionTelemetryModeFeedbackOnly:
+			case harness.SessionTelemetryModeDisabled, harness.SessionTelemetryModeFeedbackOnly:
 			default:
-				return fmt.Errorf("session-telemetry-otel: mode must be DISABLED, FULL, or FEEDBACK_ONLY, got %q", raw.Mode)
+				return fmt.Errorf("session-telemetry-otel: mode must be DISABLED or FEEDBACK_ONLY, got %q", raw.Mode)
 			}
 			config := &harness.SessionTelemetryConfig{Mode: mode}
 			if raw.ShutdownTimeoutMillis != nil {
@@ -3011,6 +3024,38 @@ func (composition *composition) configInt(id, key string) (int, bool) {
 		return 0, false
 	}
 	var result int
+	if err := value.Decode(&result); err != nil {
+		return 0, false
+	}
+	return result, true
+}
+
+func (composition *composition) configFloat(id, key string) (float64, bool) {
+	entry, ok := composition.index[id]
+	if !ok {
+		return 0, false
+	}
+	value := mappingValue(mappingValue(entry.node, "config"), key)
+	if value == nil || value.Kind != yaml.ScalarNode {
+		return 0, false
+	}
+	if isJSExpr(value) {
+		resolved, err := profileConfigValue(value)
+		if err != nil {
+			return 0, false
+		}
+		switch number := resolved.(type) {
+		case int:
+			return float64(number), true
+		case int64:
+			return float64(number), true
+		case float64:
+			return number, true
+		default:
+			return 0, false
+		}
+	}
+	var result float64
 	if err := value.Decode(&result); err != nil {
 		return 0, false
 	}

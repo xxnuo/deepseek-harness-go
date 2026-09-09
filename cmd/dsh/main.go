@@ -541,6 +541,9 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	if composed.fileReference != nil {
 		cfg.FileReference = *composed.fileReference
 	}
+	if composed.workspaceFiles != nil {
+		cfg.WorkspaceFiles = *composed.workspaceFiles
+	}
 	if composed.agentTeams != nil {
 		config := *composed.agentTeams
 		cfg.AgentTeams = &config
@@ -630,12 +633,19 @@ func engineConfig(loader *profileLoader, composed *composition) harness.Config {
 	if composed.enabled("session-reference") {
 		if value, ok := composed.configInt("session-reference", "maxReferences"); ok {
 			cfg.SessionReference.MaxReferences = value
+			cfg.SessionReference.MaxReferencesSet = true
 		}
 		if value, ok := composed.configInt("session-reference", "candidateLimit"); ok {
 			cfg.SessionReference.CandidateLimit = value
+			cfg.SessionReference.CandidateLimitSet = true
 		}
 		if value, ok := composed.configInt("session-reference", "maxReferenceBytes"); ok {
 			cfg.SessionReference.MaxReferenceBytes = value
+			cfg.SessionReference.MaxReferenceBytesSet = true
+		}
+		if value, ok := composed.configFloat("session-reference", "referenceContextFraction"); ok {
+			cfg.SessionReference.ReferenceContextFraction = value
+			cfg.SessionReference.ReferenceContextFractionSet = true
 		}
 	}
 	if composed.enabled("session-projection-cache") {

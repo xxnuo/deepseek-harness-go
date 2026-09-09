@@ -147,10 +147,13 @@ func estimateRequestHeader(header map[string]any) int {
 }
 
 func providerAssistantTokens(events []Event, assistant Event, durableTokens int) (int, error) {
+	data, _ := assistant.Data.(map[string]any)
+	if chunks := assistantStreamChunks(data["stream"]); len(chunks) > 0 {
+		return estimateAssistantStreamTokens(chunks), nil
+	}
 	if assistant.SourceEventSeqs == nil {
 		return durableTokens, nil
 	}
-	data, _ := assistant.Data.(map[string]any)
 	turn, step := eventInt(data["turn"]), eventInt(data["step"])
 	seen := map[int]bool{}
 	text, reasoning := "", ""
@@ -211,4 +214,47 @@ func providerAssistantTokens(events []Event, assistant Event, durableTokens int)
 		return 0, nil
 	}
 	return estimateProjectionContent(blocks) + 4, nil
+}
+
+func estimateAssistantStreamTokens(chunks []timedAssistantChunk) int {
+	text, reasoning := "", ""
+	type toolChunk struct{ name, arguments string }
+	tools := map[int]*toolChunk{}
+	indices := make([]int, 0)
+	for _, timed := range chunks {
+		chunk := timed.chunk
+		switch chunk["type"] {
+		case "text-delta":
+			text += stringValue(chunk["text"])
+		case "reasoning-delta":
+			reasoning += stringValue(chunk["text"])
+		case "tool-call-delta":
+			index := eventInt(chunk["index"])
+			current := tools[index]
+			if current == nil {
+				current = &toolChunk{}
+				tools[index] = current
+				indices = append(indices, index)
+			}
+			if name, ok := chunk["name"].(string); ok && name != "" {
+				current.name = name
+			}
+			current.arguments += stringValue(chunk["argumentsDelta"])
+		}
+	}
+	blocks := make([]ContentBlock, 0, 2+len(tools))
+	if reasoning != "" {
+		blocks = append(blocks, ContentBlock{Type: "reasoning", Text: reasoning})
+	}
+	if text != "" {
+		blocks = append(blocks, ContentBlock{Type: "text", Text: text})
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		blocks = append(blocks, ContentBlock{Type: "tool-call", Name: tools[index].name, Arguments: tools[index].arguments})
+	}
+	if len(blocks) == 0 {
+		return 0
+	}
+	return estimateProjectionContent(blocks) + 4
 }

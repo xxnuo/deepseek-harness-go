@@ -147,7 +147,7 @@ const (
 )
 
 var (
-	errSessionTelemetryDisabledFeedback = errors.New("session telemetry is DISABLED; nothing will be shared and this feedback remains local")
+	errSessionTelemetryDisabledFeedback = errors.New("OpenTelemetry session upload is DISABLED; this feedback is not uploaded through OpenTelemetry")
 )
 
 func normalizeSessionTelemetryConfig(config *SessionTelemetryConfig) *SessionTelemetryConfig {
@@ -156,7 +156,7 @@ func normalizeSessionTelemetryConfig(config *SessionTelemetryConfig) *SessionTel
 	}
 	normalized := *config
 	if normalized.Mode == "" {
-		normalized.Mode = SessionTelemetryModeDisabled
+		normalized.Mode = SessionTelemetryModeFeedbackOnly
 	}
 	if normalized.ShutdownTimeout == 0 {
 		normalized.ShutdownTimeout = defaultSessionTelemetryShutdownTimeout
@@ -272,13 +272,13 @@ func (c *sessionTelemetryCoordinator) captureEvent(session *Session, event Event
 		return
 	}
 	if c.mode == SessionTelemetryModeDisabled {
-		if event.Type == "feedback/record" {
+		if isFeedbackTelemetryEvent(session, event) {
 			c.report(errSessionTelemetryDisabledFeedback)
 		}
 		return
 	}
 	if c.mode == SessionTelemetryModeFeedbackOnly {
-		if event.Type == "feedback/record" {
+		if isFeedbackTelemetryEvent(session, event) {
 			c.captureSession(session, int(event.Seq))
 		}
 		return
@@ -291,11 +291,11 @@ func (c *sessionTelemetryCoordinator) captureEvent(session *Session, event Event
 }
 
 func (c *sessionTelemetryCoordinator) captureSession(session *Session, throughSeq int) {
-	header, firstLiveSeq, events := sessionTelemetrySnapshot(session)
+	header, _, events := sessionTelemetrySnapshot(session)
 	c.mu.Lock()
 	cursor, ok := c.cursor[header.ID]
 	if !ok {
-		cursor = firstLiveSeq - 1
+		cursor = -1
 	}
 	var errs []error
 	for _, event := range events {
@@ -314,6 +314,21 @@ func (c *sessionTelemetryCoordinator) captureSession(session *Session, throughSe
 	for _, err := range errs {
 		c.report(err)
 	}
+}
+
+func isFeedbackTelemetryEvent(session *Session, event Event) bool {
+	if int(event.Seq) < int(session.InheritedEventCount) {
+		return false
+	}
+	if event.Type == "feedback/record" {
+		return true
+	}
+	if event.Type != "feedback/message-put" && event.Type != "feedback/message-delete" {
+		return false
+	}
+	data, _ := event.Data.(map[string]any)
+	sessionID, _ := data["sessionId"].(string)
+	return sessionID == session.Header.ID
 }
 
 func (c *sessionTelemetryCoordinator) trackSession(session *Session) {
@@ -910,13 +925,13 @@ func (t sessionTelemetryUserAgentTransport) RoundTrip(request *http.Request) (*h
 }
 
 func sessionTelemetryHTTPClient(config SessionTelemetryOTLPExporterConfig) *http.Client {
-	client := &http.Client{}
+	client := newHTTPClient()
 	if config.HTTPClient != nil {
 		*client = *config.HTTPClient
 	}
 	transport := client.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = proxyHTTPTransport()
 	}
 	if base, ok := transport.(*http.Transport); ok && (config.KeepAlive != nil || config.ConcurrencyLimit > 0) {
 		cloned := base.Clone()

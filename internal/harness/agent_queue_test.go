@@ -367,7 +367,11 @@ func TestPersistedInboxPromptRunsAfterSessionAttach(t *testing.T) {
 	}
 	log := `{"type":"session","version":0,"id":"durable-queue","createdAt":1,"cwd":` + fmt.Sprintf("%q", workspace) + `}` + "\n" +
 		`{"type":"agent/inbox/spliced","seq":0,"time":1,"data":{"target":"next-turn","start":0,"inserted":[{"id":"msg-durable","role":"user","content":[{"type":"text","text":"restored prompt"}],"source":{"kind":"user"}}]}}` + "\n"
-	if err := os.WriteFile(filepath.Join(sessions, "durable-queue.jsonl"), []byte(log), 0o600); err != nil {
+	sessionDir := filepath.Join(sessions, SessionProjectKey(workspace), EncodeSessionPathSegment("durable-queue"))
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "session.jsonl"), []byte(log), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	e, err := New(WithDataDir(root), WithWorkspace(workspace), WithPersistence(true), WithProvider("echo"), WithModel("echo"))

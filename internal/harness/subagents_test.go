@@ -333,3 +333,32 @@ func TestDrainSubagentChildrenRejectsNewWorkDuringRelease(t *testing.T) {
 		t.Fatalf("subagent creation during drain = %v", err)
 	}
 }
+
+func TestContinuableSubagentOwnQueueRemainsHumanMutable(t *testing.T) {
+	e := newIntegrationEngine(t)
+	for _, test := range []struct {
+		id        string
+		mode      string
+		inherited SessionLogOffset
+		want      bool
+	}{
+		{id: "own-continuable", mode: "continuable", want: true},
+		{id: "one-shot", mode: "one-shot", want: false},
+		{id: "inherited-continuable", mode: "continuable", inherited: 1, want: false},
+	} {
+		session := &Session{
+			Header: SessionHeader{Version: SessionFormatVersion, ID: test.id, Origin: "subagent"},
+			Events: []Event{{Type: "subagent/descriptor", Seq: 0, Data: map[string]any{
+				"version": SubagentDescriptorVersion, "mode": test.mode, "provider": "spawn", "label": "child",
+			}}},
+			InheritedEventCount: test.inherited,
+		}
+		e.mu.Lock()
+		e.sessions[test.id] = session
+		e.mu.Unlock()
+		_, rpcErr := e.requireQueueMutable(test.id)
+		if (rpcErr == nil) != test.want {
+			t.Fatalf("%s mutable=%v error=%#v", test.id, rpcErr == nil, rpcErr)
+		}
+	}
+}

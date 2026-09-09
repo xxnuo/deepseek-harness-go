@@ -30,7 +30,7 @@ type catalogResponsesProvider struct {
 func newCatalogResponsesProvider(id, baseURL, apiKey, model string, codex bool) *catalogResponsesProvider {
 	return &catalogResponsesProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{}, websockets: newOpenAIResponsesWebSocketPool(), codex: codex,
+		client: newHTTPClient(), websockets: newOpenAIResponsesWebSocketPool(), codex: codex,
 	}
 }
 

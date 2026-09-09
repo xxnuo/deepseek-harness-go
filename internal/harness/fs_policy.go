@@ -33,15 +33,18 @@ type fsWriteIntent struct {
 }
 
 type fsObservationState struct {
-	mu       sync.Mutex
-	observed map[string]map[string]fsObservation
-	locks    map[string]*sync.Mutex
+	mu        sync.Mutex
+	observed  map[string]map[string]fsObservation
+	locks     map[string]*sync.Mutex
+	followers map[*workspaceFileFollower]struct{}
+	closed    bool
 }
 
 func newFSObservationState() *fsObservationState {
 	return &fsObservationState{
-		observed: make(map[string]map[string]fsObservation),
-		locks:    make(map[string]*sync.Mutex),
+		observed:  make(map[string]map[string]fsObservation),
+		locks:     make(map[string]*sync.Mutex),
+		followers: make(map[*workspaceFileFollower]struct{}),
 	}
 }
 
@@ -73,11 +76,24 @@ func (s *fsObservationState) lock(targetKey string) *sync.Mutex {
 }
 
 func (s *fsObservationState) observe(sessionID string, target fsTarget, observation fsObservation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for follower := range s.followers {
+		change := map[string]any{"absolutePath": target.targetKey}
+		if observation.present && observation.version.info != nil {
+			change["version"] = workspaceFileVersion(observation.version.info)
+		} else {
+			change["absent"] = true
+		}
+		follower.queue = append(follower.queue, change)
+		select {
+		case follower.wake <- struct{}{}:
+		default:
+		}
+	}
 	if sessionID == "" {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	byTarget := s.observed[sessionID]
 	if byTarget == nil {
 		byTarget = make(map[string]fsObservation)
@@ -88,13 +104,13 @@ func (s *fsObservationState) observe(sessionID string, target fsTarget, observat
 
 func (s *fsObservationState) editIntent(sessionID string, target fsTarget) (fsFileVersion, error) {
 	if sessionID == "" {
-		return fsFileVersion{}, fsPolicyError("FS_NOT_OBSERVED", fmt.Sprintf("edit requires reading %q first", target.displayPath))
+		return fsFileVersion{}, fsNotObservedError(target.displayPath)
 	}
 	s.mu.Lock()
 	observation, ok := s.observed[sessionID][target.targetKey]
 	s.mu.Unlock()
 	if !ok {
-		return fsFileVersion{}, fsPolicyError("FS_NOT_OBSERVED", fmt.Sprintf("edit requires reading %q first", target.displayPath))
+		return fsFileVersion{}, fsNotObservedError(target.displayPath)
 	}
 	if !observation.present {
 		return fsFileVersion{}, fsPolicyError("FS_NOT_FOUND", fmt.Sprintf("cannot edit %q: not found", target.displayPath))
@@ -117,6 +133,14 @@ func (s *fsObservationState) writeIntent(sessionID string, target fsTarget) fsWr
 
 func fsPolicyError(code, message string) error {
 	return fmt.Errorf("%s: %s", code, message)
+}
+
+func fsNotObservedError(displayPath string) error {
+	return fsPolicyError("FS_NOT_OBSERVED", fmt.Sprintf("cannot modify %q: file has not been read — read the file, then retry", displayPath))
+}
+
+func fsStaleVersionError(operation, displayPath string) error {
+	return fsPolicyError("FS_STALE_VERSION", fmt.Sprintf("cannot %s %q: file changed since it was read — re-read the file, then retry", operation, displayPath))
 }
 
 func readVersionedFile(path string) ([]byte, fsFileVersion, fs.FileMode, error) {
@@ -223,12 +247,12 @@ func (e *Engine) guardedFSWrite(target fsTarget, data []byte, intent fsWriteInte
 	}
 	if intent.create {
 		if exists {
-			return fsFileVersion{}, false, "", fsPolicyError("FS_NOT_OBSERVED", fmt.Sprintf("cannot overwrite existing %q without reading it first", target.displayPath))
+			return fsFileVersion{}, false, "", fsNotObservedError(target.displayPath)
 		}
 		mode = 0o644
 	} else {
 		if !exists || !sameFSVersion(current, intent.version) {
-			return fsFileVersion{}, false, "", fsPolicyError("FS_STALE_VERSION", fmt.Sprintf("cannot write %q: file changed since it was read", target.displayPath))
+			return fsFileVersion{}, false, "", fsStaleVersionError("write", target.displayPath)
 		}
 	}
 	if err := writeFileAtomic(target.targetKey, data, mode, intent.create); err != nil {
@@ -245,13 +269,13 @@ func (e *Engine) guardedFSEdit(target fsTarget, expected fsFileVersion, apply fu
 
 	data, current, mode, err := readVersionedFile(target.targetKey)
 	if errors.Is(err, fs.ErrNotExist) {
-		return fsFileVersion{}, fsPolicyError("FS_STALE_VERSION", fmt.Sprintf("cannot edit %q: file changed since it was read", target.displayPath))
+		return fsFileVersion{}, fsStaleVersionError("edit", target.displayPath)
 	}
 	if err != nil {
 		return fsFileVersion{}, err
 	}
 	if !sameFSVersion(current, expected) {
-		return fsFileVersion{}, fsPolicyError("FS_STALE_VERSION", fmt.Sprintf("cannot edit %q: file changed since it was read", target.displayPath))
+		return fsFileVersion{}, fsStaleVersionError("edit", target.displayPath)
 	}
 	updated, err := apply(string(data))
 	if err != nil {

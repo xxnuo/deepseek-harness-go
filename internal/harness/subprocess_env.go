@@ -15,6 +15,13 @@ func scrubbedChildEnv(extra map[string]string) []string {
 		}
 		values[key] = value
 	}
+	for key, value := range proxyEnvironmentForChild() {
+		if value == nil {
+			delete(values, key)
+		} else {
+			values[key] = *value
+		}
+	}
 	for key, value := range extra {
 		values[key] = value
 	}

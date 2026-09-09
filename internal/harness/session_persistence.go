@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf16"
@@ -226,16 +227,54 @@ func (s *JSONLSessionStore) Open(ctx context.Context, id string, access SessionA
 		s.adoptHandle(handle)
 		return handle, nil
 	}
+	var lease io.Closer
+	if access == SessionAccessWrite {
+		_, path, found, err := s.findArtifact(ctx, id)
+		if err != nil || !found {
+			s.releaseWriteClaim(id)
+			if err != nil {
+				return nil, err
+			}
+			return nil, &SessionPersistenceNotFoundError{SessionID: id}
+		}
+		lease, err = acquireSessionWriteLease(filepath.Dir(path), id)
+		if err != nil {
+			s.releaseWriteClaim(id)
+			return nil, err
+		}
+	}
 	scan, path, err := s.readStoredLogLocked(ctx, id)
 	if err != nil {
+		if lease != nil {
+			_ = lease.Close()
+		}
 		if access == SessionAccessWrite {
 			s.releaseWriteClaim(id)
 		}
 		return nil, err
 	}
+	if access == SessionAccessWrite && scan.sourceVersion < SessionFormatVersion {
+		currentPath := sessionGenerationPath(filepath.Dir(path), SessionFormatVersion)
+		if err := s.materialize(currentPath, scan.meta, scan.inheritedEventCount, scan.events); err != nil {
+			_ = lease.Close()
+			s.releaseWriteClaim(id)
+			return nil, err
+		}
+		s.invalidateMemo(id)
+		path = currentPath
+		scan, err = scanJSONLSession(path, id)
+		if err != nil {
+			_ = lease.Close()
+			s.releaseWriteClaim(id)
+			return nil, err
+		}
+		s.mu.Lock()
+		s.paths[id] = path
+		s.mu.Unlock()
+	}
 	handle := &JSONLSessionHandle{
 		store: s, id: id, header: scan.meta, inheritedEventCount: scan.inheritedEventCount,
-		access: access, materialized: true, path: path,
+		access: access, materialized: true, path: path, lease: lease,
 	}
 	if access == SessionAccessWrite {
 		handle.events = cloneSessionEvents(scan.events)
@@ -546,6 +585,7 @@ type JSONLSessionHandle struct {
 	hasTornTail    bool
 	tornTruncateTo int
 	observedLength int
+	lease          io.Closer
 }
 
 func (h *JSONLSessionHandle) ID() string { return h.id }
@@ -637,6 +677,9 @@ func (h *JSONLSessionHandle) Append(ctx context.Context, events []Event) error {
 		return err
 	}
 	defer unlock()
+	if err := h.ensureLease(); err != nil {
+		return err
+	}
 	if h.hasTornTail {
 		if err := truncateJSONLTail(h.path, int64(h.tornTruncateTo)); err != nil {
 			return err
@@ -661,7 +704,6 @@ func (h *JSONLSessionHandle) Append(ctx context.Context, events []Event) error {
 	} else {
 		path := h.store.pathFor(h.header)
 		if err := h.store.materialize(path, h.header, h.inheritedEventCount, batch); err != nil {
-			_ = os.Remove(path)
 			return err
 		}
 		h.path = path
@@ -697,10 +739,12 @@ func (h *JSONLSessionHandle) Flush(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
+	if err := h.ensureLease(); err != nil {
+		return err
+	}
 	path := h.store.pathFor(h.header)
 	h.store.invalidateMemo(h.id)
 	if err := h.store.materialize(path, h.header, h.inheritedEventCount, nil); err != nil {
-		_ = os.Remove(path)
 		return err
 	}
 	h.path = path
@@ -720,8 +764,30 @@ func (h *JSONLSessionHandle) Close() error {
 	}
 	h.closed = true
 	materialized := h.materialized
+	lease := h.lease
+	h.lease = nil
 	h.mu.Unlock()
+	var releaseErr error
+	if lease != nil {
+		releaseErr = lease.Close()
+	}
 	h.store.releaseHandle(h, materialized)
+	return releaseErr
+}
+
+func (h *JSONLSessionHandle) ensureLease() error {
+	if h.lease != nil {
+		return nil
+	}
+	path := h.path
+	if path == "" {
+		path = h.store.pathFor(h.header)
+	}
+	lease, err := acquireSessionWriteLease(filepath.Dir(path), h.id)
+	if err != nil {
+		return err
+	}
+	h.lease = lease
 	return nil
 }
 
@@ -751,6 +817,14 @@ func materializeSessionEventBatch(events []Event, expected int) ([]Event, error)
 		}
 		if detached.Type == "" || detached.Seq < 0 || detached.Time < -maxJSONSafeInteger || detached.Time > maxJSONSafeInteger {
 			return nil, fmt.Errorf("invalid session event %q", event.Type)
+		}
+		physical, err := marshalSessionEvent(detached)
+		if err != nil {
+			return nil, fmt.Errorf("session event %q is not losslessly JSON-serializable: %w", event.Type, err)
+		}
+		decoded, err := decodeSessionStorageRecordVersion(physical, SessionFormatVersion)
+		if err != nil || len(decoded) != 1 {
+			return nil, fmt.Errorf("invalid session event %q: %w", event.Type, err)
 		}
 		batch[index] = detached
 	}
@@ -829,16 +903,16 @@ func (e *Engine) flushSessionPersistence(ctx context.Context, id string) error {
 }
 
 type jsonlArtifact struct {
-	header SessionHeader
-	path   string
+	header  SessionHeader
+	path    string
+	version int
 }
 
 func (s *JSONLSessionStore) listArtifacts(ctx context.Context) ([]jsonlArtifact, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var artifacts []jsonlArtifact
-	seen := map[string]string{}
+	selected := map[string]jsonlArtifact{}
 	err := filepath.WalkDir(s.root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, os.ErrNotExist) && path == s.root {
@@ -849,22 +923,38 @@ func (s *JSONLSessionStore) listArtifacts(ctx context.Context) ([]jsonlArtifact,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if entry.IsDir() {
 			return nil
 		}
-		header, ok, err := readJSONLHeader(path)
+		filenameVersion, canonical := sessionGenerationVersion(entry.Name())
+		if !canonical {
+			return nil
+		}
+		header, sourceVersion, ok, err := readJSONLArtifactHeader(path)
 		if err != nil || !ok {
 			return err
 		}
-		if previous := seen[header.ID]; previous != "" && previous != path {
-			return fmt.Errorf("duplicate JSONL session id %q appears in %q and %q", header.ID, previous, path)
+		if sourceVersion != filenameVersion {
+			return fmt.Errorf("session generation %q identifies v%d, but its header identifies v%d", path, filenameVersion, sourceVersion)
 		}
-		seen[header.ID] = path
-		artifacts = append(artifacts, jsonlArtifact{header: header, path: path})
+		candidate := jsonlArtifact{header: header, path: path, version: sourceVersion}
+		if previous, exists := selected[header.ID]; exists {
+			if filepath.Dir(previous.path) != filepath.Dir(path) {
+				return fmt.Errorf("duplicate JSONL session id %q appears in %q and %q", header.ID, previous.path, path)
+			}
+			if previous.version >= candidate.version {
+				return nil
+			}
+		}
+		selected[header.ID] = candidate
 		return nil
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	artifacts := make([]jsonlArtifact, 0, len(selected))
+	for _, artifact := range selected {
+		artifacts = append(artifacts, artifact)
 	}
 	sort.Slice(artifacts, func(i, j int) bool {
 		if artifacts[i].header.CreatedAt != artifacts[j].header.CreatedAt {
@@ -881,18 +971,6 @@ func (s *JSONLSessionStore) listArtifacts(ctx context.Context) ([]jsonlArtifact,
 }
 
 func (s *JSONLSessionStore) findArtifact(ctx context.Context, id string) (SessionHeader, string, bool, error) {
-	s.mu.Lock()
-	known := s.paths[id]
-	s.mu.Unlock()
-	if known != "" {
-		header, ok, err := readJSONLHeader(known)
-		if err == nil && ok && header.ID == id {
-			return header, known, true, nil
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return SessionHeader{}, "", false, err
-		}
-	}
 	artifacts, err := s.listArtifacts(ctx)
 	if err != nil {
 		return SessionHeader{}, "", false, err
@@ -910,7 +988,29 @@ func (s *JSONLSessionStore) pathFor(meta SessionHeader) string {
 	if meta.CWD != "" {
 		project = SessionProjectKey(meta.CWD)
 	}
-	return filepath.Join(s.root, project, EncodeSessionPathSegment(meta.ID), "session.jsonl")
+	return sessionGenerationPath(filepath.Join(s.root, project, EncodeSessionPathSegment(meta.ID)), SessionFormatVersion)
+}
+
+func sessionGenerationPath(directory string, version int) string {
+	if version == 0 {
+		return filepath.Join(directory, "session.jsonl")
+	}
+	return filepath.Join(directory, fmt.Sprintf("session.v%d.jsonl", version))
+}
+
+func sessionGenerationVersion(name string) (int, bool) {
+	if name == "session.jsonl" {
+		return 0, true
+	}
+	if !strings.HasPrefix(name, "session.v") || !strings.HasSuffix(name, ".jsonl") {
+		return 0, false
+	}
+	raw := strings.TrimSuffix(strings.TrimPrefix(name, "session.v"), ".jsonl")
+	if raw == "" || raw[0] == '0' {
+		return 0, false
+	}
+	version, err := strconv.Atoi(raw)
+	return version, err == nil && version > 0
 }
 
 func EncodeSessionPathSegment(raw string) string {
@@ -1092,6 +1192,7 @@ type jsonlSessionScan struct {
 	events              []Event
 	raw                 []byte
 	committedBytes      int
+	sourceVersion       int
 }
 
 func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
@@ -1103,7 +1204,7 @@ func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
 	if headerEnd < 0 {
 		return jsonlSessionScan{}, errors.New("empty or header-less session log")
 	}
-	meta, ok, err := parseSessionHeader(data[:headerEnd])
+	meta, inheritedEventCount, sourceVersion, ok, err := parseSessionArtifactHeader(data[:headerEnd])
 	if err != nil {
 		return jsonlSessionScan{}, err
 	}
@@ -1125,7 +1226,7 @@ func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
 		}
 		end := offset + relative
 		line++
-		decoded, decodeErr := decodeSessionStorageRecord(data[offset:end])
+		decoded, decodeErr := decodeSessionStorageRecordVersion(data[offset:end], sourceVersion)
 		if decodeErr != nil {
 			if issue == nil {
 				issue = fmt.Errorf("corrupt session log: unparsable committed event at line %d: %w", line, decodeErr)
@@ -1161,16 +1262,37 @@ func scanJSONLSession(path, expectedID string) (jsonlSessionScan, error) {
 		}
 		offset = end + 1
 	}
+	if sourceVersion < SessionFormatVersion {
+		events, inheritedEventCount, err = migrateLegacySessionEvents(meta, inheritedEventCount, sourceVersion, events)
+		if err != nil {
+			return jsonlSessionScan{}, err
+		}
+		meta.SeedLength = int(inheritedEventCount)
+	} else if meta.IsSeeded {
+		marker, found := inheritedSeedMarker(events)
+		if !found {
+			return jsonlSessionScan{}, errors.New("format v2 seeded Session lacks an inherited end-seed marker")
+		}
+		inheritedEventCount = SessionLogOffset(marker)
+		meta.SeedLength = marker
+	} else if _, found := inheritedSeedMarker(events); found {
+		return jsonlSessionScan{}, errors.New("format v2 unseeded Session contains an inherited end-seed marker")
+	}
 	if _, err := foldSurfaceEvents(events, true); err != nil {
 		return jsonlSessionScan{}, err
 	}
-	return jsonlSessionScan{meta: meta, inheritedEventCount: SessionLogOffset(meta.SeedLength), events: events, raw: data, committedBytes: committed}, nil
+	return jsonlSessionScan{meta: meta, inheritedEventCount: inheritedEventCount, events: events, raw: data, committedBytes: committed, sourceVersion: sourceVersion}, nil
 }
 
 func readJSONLHeader(path string) (SessionHeader, bool, error) {
+	header, _, ok, err := readJSONLArtifactHeader(path)
+	return header, ok, err
+}
+
+func readJSONLArtifactHeader(path string) (SessionHeader, int, bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return SessionHeader{}, false, err
+		return SessionHeader{}, 0, false, err
 	}
 	defer file.Close()
 	buffer := make([]byte, 8192)
@@ -1180,17 +1302,18 @@ func readJSONLHeader(path string) (SessionHeader, bool, error) {
 		if n > 0 {
 			data = append(data, buffer[:n]...)
 			if index := bytes.IndexByte(data, '\n'); index >= 0 {
-				return parseSessionHeader(data[:index])
+				header, _, version, ok, parseErr := parseSessionArtifactHeader(data[:index])
+				return header, version, ok, parseErr
 			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return SessionHeader{}, false, nil
+				return SessionHeader{}, 0, false, nil
 			}
-			return SessionHeader{}, false, err
+			return SessionHeader{}, 0, false, err
 		}
 		if len(data) > 1<<20 {
-			return SessionHeader{}, false, errors.New("session header exceeds 1 MiB")
+			return SessionHeader{}, 0, false, errors.New("session header exceeds 1 MiB")
 		}
 	}
 }
@@ -1203,6 +1326,7 @@ type sessionHeaderLine struct {
 	CWD             string `json:"cwd,omitempty"`
 	ParentSession   string `json:"parentSession,omitempty"`
 	SeedLength      *int   `json:"seedLength,omitempty"`
+	IsSeeded        *bool  `json:"isSeeded,omitempty"`
 	Origin          string `json:"origin,omitempty"`
 	DelegationDepth int    `json:"delegationDepth"`
 	AgentPreset     string `json:"agentPreset,omitempty"`
@@ -1210,42 +1334,80 @@ type sessionHeaderLine struct {
 }
 
 func marshalSessionHeader(meta SessionHeader, inheritedEventCount SessionLogOffset) ([]byte, error) {
-	var seedLength *int
-	if meta.IsSeeded {
-		value := int(inheritedEventCount)
-		seedLength = &value
-	}
+	seeded := meta.IsSeeded
 	return json.Marshal(sessionHeaderLine{
-		Type: "session", Version: meta.Version, ID: meta.ID, CreatedAt: meta.CreatedAt,
-		CWD: meta.CWD, ParentSession: meta.ParentSession, SeedLength: seedLength,
+		Type: "session", Version: SessionFormatVersion, ID: meta.ID, CreatedAt: meta.CreatedAt,
+		CWD: meta.CWD, ParentSession: meta.ParentSession, IsSeeded: &seeded,
 		Origin: meta.Origin, DelegationDepth: meta.DelegationDepth,
-		AgentPreset: meta.AgentPreset, Mode: meta.Mode,
+		AgentPreset: meta.AgentPreset,
 	})
 }
 
 func parseSessionHeader(line []byte) (SessionHeader, bool, error) {
+	meta, _, _, ok, err := parseSessionArtifactHeader(line)
+	return meta, ok, err
+}
+
+func parseSessionArtifactHeader(line []byte) (SessionHeader, SessionLogOffset, int, bool, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(line, &raw); err != nil || raw == nil {
+		return SessionHeader{}, 0, 0, false, nil
+	}
 	var header sessionHeaderLine
 	if err := json.Unmarshal(line, &header); err != nil {
-		return SessionHeader{}, false, nil
+		return SessionHeader{}, 0, 0, false, nil
 	}
 	if header.Type != "session" || header.ID == "" {
-		return SessionHeader{}, false, nil
+		return SessionHeader{}, 0, 0, false, nil
 	}
-	if header.Version != SessionFormatVersion {
-		return SessionHeader{}, false, fmt.Errorf("unsupported session format version %d", header.Version)
+	if header.Version < 0 || header.Version > SessionFormatVersion {
+		return SessionHeader{}, 0, 0, false, fmt.Errorf("unsupported session format version %d", header.Version)
+	}
+	allowed := map[string]bool{"type": true, "version": true, "id": true, "createdAt": true, "cwd": true, "parentSession": true, "origin": true, "delegationDepth": true, "agentPreset": true}
+	if header.Version >= 2 {
+		for _, key := range []string{"type", "version", "id", "createdAt", "isSeeded", "delegationDepth"} {
+			if _, exists := raw[key]; !exists {
+				return SessionHeader{}, 0, 0, false, fmt.Errorf("format v2 session header lacks %s", key)
+			}
+		}
+		allowed["isSeeded"] = true
+		if header.IsSeeded == nil {
+			return SessionHeader{}, 0, 0, false, errors.New("format v2 session header lacks isSeeded")
+		}
+		if _, exists := raw["cwd"]; exists && header.CWD == "" {
+			return SessionHeader{}, 0, 0, false, errors.New("format v2 session header cwd must be absolute")
+		}
+	} else {
+		allowed["seedLength"] = true
+		allowed["mode"] = true
+	}
+	for key := range raw {
+		if !allowed[key] {
+			return SessionHeader{}, 0, 0, false, fmt.Errorf("session header has unexpected field %q", key)
+		}
+	}
+	inherited := SessionLogOffset(0)
+	seeded := false
+	if header.Version >= 2 {
+		seeded = *header.IsSeeded
+	} else if header.SeedLength != nil {
+		seeded = true
+		inherited = SessionLogOffset(*header.SeedLength)
 	}
 	meta := SessionHeader{
-		Version: header.Version, ID: header.ID, CreatedAt: header.CreatedAt, CWD: header.CWD,
-		ParentSession: header.ParentSession, IsSeeded: header.SeedLength != nil, Origin: header.Origin,
+		Version: SessionFormatVersion, ID: header.ID, CreatedAt: header.CreatedAt, CWD: header.CWD,
+		ParentSession: header.ParentSession, IsSeeded: seeded, Origin: header.Origin,
 		DelegationDepth: header.DelegationDepth, AgentPreset: header.AgentPreset, Mode: header.Mode,
 	}
-	if header.SeedLength != nil {
-		meta.SeedLength = *header.SeedLength
+	meta.SeedLength = int(inherited)
+	validated := meta
+	if strings.HasPrefix(validated.CWD, "{{") && strings.HasSuffix(validated.CWD, "}}") {
+		validated.CWD = string(filepath.Separator)
 	}
-	if err := validateSessionHeader(meta); err != nil {
-		return SessionHeader{}, false, err
+	if err := validateSessionHeader(validated); err != nil {
+		return SessionHeader{}, 0, 0, false, err
 	}
-	return meta, true, nil
+	return meta, inherited, header.Version, true, nil
 }
 
 func validateSessionHeader(meta SessionHeader) error {
@@ -1285,7 +1447,7 @@ func validateSessionEventBatch(events []Event, expected int) error {
 		if err != nil {
 			return fmt.Errorf("session event %q is not JSON-serializable: %w", event.Type, err)
 		}
-		decoded, err := decodeSessionStorageRecord(encoded)
+		decoded, err := decodeSessionStorageRecordVersion(encoded, SessionFormatVersion)
 		if err != nil {
 			return fmt.Errorf("invalid session event %q: %w", event.Type, err)
 		}
@@ -1299,7 +1461,7 @@ func validateSessionEventBatch(events []Event, expected int) error {
 func marshalSessionEvents(events []Event) ([]byte, error) {
 	var buffer bytes.Buffer
 	for _, event := range events {
-		encoded, err := json.Marshal(event)
+		encoded, err := marshalSessionEvent(event)
 		if err != nil {
 			return nil, fmt.Errorf("session event %q is not JSON-serializable: %w", event.Type, err)
 		}
@@ -1307,6 +1469,26 @@ func marshalSessionEvents(events []Event) ([]byte, error) {
 		buffer.WriteByte('\n')
 	}
 	return buffer.Bytes(), nil
+}
+
+func marshalSessionEvent(event Event) ([]byte, error) {
+	type wireEvent struct {
+		Type            string     `json:"type"`
+		Seq             SessionSeq `json:"seq"`
+		Time            int64      `json:"time"`
+		Data            any        `json:"data"`
+		SourceEventSeqs any        `json:"sourceEventSeqs,omitempty"`
+		SurfaceOp       any        `json:"surfaceOp,omitempty"`
+		Ignorable       bool       `json:"ignorable,omitempty"`
+	}
+	var sources any
+	if event.SourceEventSeqs != nil {
+		sources = encodeSessionSeqRanges(event.SourceEventSeqs)
+	}
+	return json.Marshal(wireEvent{
+		Type: event.Type, Seq: event.Seq, Time: event.Time, Data: event.Data,
+		SourceEventSeqs: sources, SurfaceOp: event.SurfaceOp, Ignorable: event.Ignorable,
+	})
 }
 
 func interruptedSessionClosers(events []Event) []Event {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,19 @@ func TestCreateWorkspaceCanonicalizesSymlinkPath(t *testing.T) {
 	second, created, err := e.CreateWorkspace(target)
 	if err != nil || created || second.WorkspaceID != first.WorkspaceID {
 		t.Fatalf("CreateWorkspace(target) = %#v, %v, created=%v; want same workspace", second, err, created)
+	}
+}
+
+func TestCreateWorkspaceRejectsRelativePathsAndNamesRoot(t *testing.T) {
+	e := newPersistentDomainEngine(t)
+	if _, _, err := e.CreateWorkspace("."); err == nil || !strings.Contains(err.Error(), "workspace-invalid-path") {
+		t.Fatalf("relative workspace error = %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		workspace, created, err := e.CreateWorkspace(string(filepath.Separator))
+		if err != nil || !created || workspace.Title != string(filepath.Separator) {
+			t.Fatalf("root workspace = %#v, created=%v, err=%v", workspace, created, err)
+		}
 	}
 }
 

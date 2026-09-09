@@ -21,8 +21,16 @@ type commandDescriptor struct {
 }
 
 type commandInputDescriptor struct {
-	Hint   string `json:"hint"`
-	Images bool   `json:"images,omitempty"`
+	Hint        string `json:"hint"`
+	Attachments bool   `json:"attachments,omitempty"`
+}
+
+type commandSubmitAttachment struct {
+	Type      string
+	MediaType string
+	Data      string
+	Name      string
+	ReceiptID string
 }
 
 type commandInvocation struct {
@@ -57,9 +65,9 @@ func commandCatalog() []commandDescriptor {
 		{Name: "compact", Description: "Compact older conversation history"},
 		{Name: "export", Description: "Download this Session log as a ZIP archive"},
 		{Name: "feedback", Description: "record feedback about this session", Input: &commandInputDescriptor{Hint: "<text>"}},
-		{Name: "goal", Description: "set or view the goal for a long-running task", Input: &commandInputDescriptor{Hint: "[<objective>|clear|edit <objective>|pause|resume]", Images: true}},
+		{Name: "goal", Description: "set or view the goal for a long-running task", Input: &commandInputDescriptor{Hint: "[<objective>|clear|edit <objective>|pause|resume]", Attachments: true}},
 		{Name: "permission", Description: "Switch the permission preset (sandbox mode + approval policy)", Input: &commandInputDescriptor{Hint: "<preset>"}},
-		{Name: "plan", Description: "Enter or leave plan mode", Input: &commandInputDescriptor{Hint: "[off|message]", Images: true}},
+		{Name: "plan", Description: "Enter or leave plan mode", Input: &commandInputDescriptor{Hint: "[off|message]", Attachments: true}},
 	}
 }
 
@@ -99,7 +107,7 @@ func (e *Engine) commandDefinition(name string) (commandDefinition, bool) {
 	return commandDefinition{}, false
 }
 
-func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, images []EncodedImageAttachment) (*commandExecution, bool, error) {
+func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, submitted []commandSubmitAttachment) (*commandExecution, bool, error) {
 	name, rawInput, ok := parseSlashCommand(line)
 	if !ok {
 		return nil, false, nil
@@ -135,17 +143,30 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, im
 		return nil, true, err
 	}
 	attachments := []ContentBlock(nil)
-	if len(images) > 0 {
-		if definition.Input == nil || !definition.Input.Images {
-			result := CommandResult{Kind: "error", Text: fmt.Sprintf("/%s does not accept image attachments", name)}
+	if len(submitted) > 0 {
+		if definition.Input == nil || !definition.Input.Attachments {
+			result := CommandResult{Kind: "error", Text: fmt.Sprintf("/%s does not accept attachments", name)}
 			if _, err := e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": result.Kind, "text": result.Text}); err != nil {
 				return nil, true, err
 			}
 			return &commandExecution{CommandID: commandID, Result: &result}, true, nil
 		}
-		parts := make([]PromptContentPart, len(images))
-		for index, image := range images {
-			parts[index] = PromptContentPart{Type: "image", MediaType: image.MediaType, Data: image.Data, Name: image.Name}
+		parts := make([]PromptContentPart, 0, len(submitted))
+		fileRefs := map[string]FileAttachmentRef{}
+		for _, attachment := range submitted {
+			if attachment.Type == "image" {
+				parts = append(parts, PromptContentPart{Type: "image", MediaType: attachment.MediaType, Data: attachment.Data, Name: attachment.Name})
+				continue
+			}
+			ref, ok := e.resolveFileReceipt(s.Header.ID, attachment.ReceiptID)
+			if !ok {
+				result := CommandResult{Kind: "error", Text: "attachment-error: File upload receipt is unknown for this session"}
+				if _, err := e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": result.Kind, "text": result.Text}); err != nil {
+					return nil, true, err
+				}
+				return &commandExecution{CommandID: commandID, Result: &result}, true, nil
+			}
+			fileRefs[attachment.ReceiptID] = ref
 		}
 		var admissionErr error
 		attachments, admissionErr = e.durablePromptContentContext(ctx, parts)
@@ -159,6 +180,18 @@ func (e *Engine) executeCommand(ctx context.Context, s *Session, line string, im
 		if err := ctx.Err(); err != nil {
 			_, _ = e.appendEvent(s, "command/done", map[string]any{"commandId": commandID, "kind": "error", "text": err.Error()})
 			return nil, true, err
+		}
+		images := attachments
+		attachments = make([]ContentBlock, 0, len(submitted))
+		imageIndex := 0
+		for _, attachment := range submitted {
+			if attachment.Type == "image" {
+				attachments = append(attachments, images[imageIndex])
+				imageIndex++
+				continue
+			}
+			ref := fileRefs[attachment.ReceiptID]
+			attachments = append(attachments, ContentBlock{Type: "file", FileAttachment: &ref})
 		}
 	}
 	result, handlerErr := definition.Handler(ctx, commandInvocation{
@@ -330,21 +363,8 @@ func (e *Engine) commandFeedback(_ context.Context, invocation commandInvocation
 	if _, err := e.appendEvent(invocation.Session, "feedback/record", map[string]any{"text": text}); err != nil {
 		return CommandResult{}, err
 	}
-	disclosure := "Session sharing is not configured."
-	if sharing, ok := e.SessionTelemetrySharing(); ok {
-		switch sharing {
-		case SessionTelemetrySharingFull:
-			disclosure = "Session sharing is enabled."
-		case SessionTelemetrySharingFeedbackOnly:
-			disclosure = "Session sharing is feedback-gated; recording feedback releases the session prefix for sharing."
-		case SessionTelemetrySharingDisabled:
-			disclosure = "Session sharing is disabled."
-		default:
-			return CommandResult{}, fmt.Errorf("command-feedback: unsupported sharing status %q", sharing)
-		}
-	}
 	userID := anonymousUserID(e.cfg.DataDir)
-	return CommandResult{Kind: "success", Text: fmt.Sprintf("Feedback recorded for session %s\nAnonymous user: %s. %s", invocation.Session.Header.ID, userID, disclosure)}, nil
+	return CommandResult{Kind: "success", Text: fmt.Sprintf("Feedback recorded for session %s\nAnonymous user: %s.", invocation.Session.Header.ID, userID)}, nil
 }
 
 const goalCommandUsage = "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]"
@@ -357,7 +377,7 @@ func (e *Engine) commandGoal(_ context.Context, invocation commandInvocation) (C
 	if len(invocation.Attachments) > 0 && !imageObjective {
 		return CommandResult{
 			Kind: "error",
-			Text: "Image attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.",
+			Text: "Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.",
 		}, nil
 	}
 	current, err := e.GetGoal(invocation.Session.Header.ID)
@@ -555,7 +575,7 @@ func planModeActive(events []Event) bool {
 func (e *Engine) commandPlan(_ context.Context, invocation commandInvocation) (CommandResult, error) {
 	message := strings.TrimSpace(invocation.RawInput)
 	if message == "off" && len(invocation.Attachments) > 0 {
-		return CommandResult{Kind: "error", Text: "Image attachments cannot accompany /plan off."}, nil
+		return CommandResult{Kind: "error", Text: "Attachments cannot accompany /plan off."}, nil
 	}
 	wanted := message != "off"
 	outcome, err := e.setPlanMode(invocation.Session, wanted, true)

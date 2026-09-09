@@ -94,13 +94,12 @@ func TestCancelFinalizesVisibleStreamPrefix(t *testing.T) {
 	session.mu.Lock()
 	events := append([]Event(nil), session.Events...)
 	session.mu.Unlock()
-	chunkSeqs := make([]int, 0)
 	messageIndex, stepEndIndex, turnEndIndex := -1, -1, -1
 	var message Event
 	for index, event := range events {
 		switch event.Type {
 		case "assistant/chunk":
-			chunkSeqs = append(chunkSeqs, int(event.Seq))
+			t.Fatalf("format v2 retained top-level assistant chunk: %#v", event)
 		case "assistant/message":
 			message, messageIndex = event, index
 		case "step/end":
@@ -124,8 +123,11 @@ func TestCancelFinalizesVisibleStreamPrefix(t *testing.T) {
 	if eventInt(usage["inputTokens"]) != 7 || eventInt(usage["outputTokens"]) != 4 {
 		t.Fatalf("interrupted usage = %#v", usage)
 	}
-	if !reflect.DeepEqual(message.SourceEventSeqs, chunkSeqs) {
-		t.Fatalf("source refs = %#v, want %#v", message.SourceEventSeqs, chunkSeqs)
+	if message.SourceEventSeqs != nil {
+		t.Fatalf("source refs = %#v, want nil", message.SourceEventSeqs)
+	}
+	if stream, _ := data["stream"].([]any); len(stream) != 4 {
+		t.Fatalf("embedded interrupted stream = %#v", data["stream"])
 	}
 
 	if text, err := engine.Run(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "continue"}}}); err != nil || text != "after" {

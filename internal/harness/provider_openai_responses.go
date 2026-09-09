@@ -38,7 +38,7 @@ func NewOpenAIResponsesProvider(id, baseURL, apiKey, model string) *OpenAIRespon
 	}
 	return &OpenAIResponsesProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{}, websockets: newOpenAIResponsesWebSocketPool(),
+		client: newHTTPClient(), websockets: newOpenAIResponsesWebSocketPool(),
 	}
 }
 
@@ -162,7 +162,7 @@ func (p *OpenAIResponsesProvider) requestBody(req ChatRequest) map[string]any {
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
-	if req.MaxTokens > 0 {
+	if req.MaxTokens > 0 && (p.modelSpec.Compat.SupportsMaxOutputTokens == nil || *p.modelSpec.Compat.SupportsMaxOutputTokens) {
 		body["max_output_tokens"] = max(req.MaxTokens, 16)
 	}
 	if req.Temperature != nil {
@@ -418,5 +418,5 @@ func (s *openAIResponsesState) completion() (Completion, error) {
 	if s.text == "" && s.reasoning == "" && len(toolCalls) == 0 {
 		return Completion{}, &ProviderError{Code: "EMPTY_RESPONSE", Message: "model returned a completed response with no content"}
 	}
-	return Completion{Text: s.text, Reasoning: s.reasoning, ToolCalls: toolCalls, Usage: s.usage, Finish: s.finish}, nil
+	return Completion{Text: s.text, Reasoning: s.reasoning, ToolCalls: toolCalls, Usage: s.usage, Finish: s.finish, ResponseID: s.responseID}, nil
 }

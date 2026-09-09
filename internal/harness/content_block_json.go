@@ -9,6 +9,12 @@ var coreContentBlockTypes = map[string]bool{
 type contentBlockJSON ContentBlock
 
 func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	if b.Type == "file" && b.FileAttachment != nil {
+		return json.Marshal(struct {
+			Type       string            `json:"type"`
+			Attachment FileAttachmentRef `json:"attachment"`
+		}{Type: b.Type, Attachment: *b.FileAttachment})
+	}
 	if coreContentBlockTypes[b.Type] || b.Extra == nil {
 		return json.Marshal(contentBlockJSON(b))
 	}
@@ -23,6 +29,17 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 	}
 	if err := json.Unmarshal(data, &selector); err != nil {
 		return err
+	}
+	if selector.Type == "file" {
+		var decoded struct {
+			Type       string            `json:"type"`
+			Attachment FileAttachmentRef `json:"attachment"`
+		}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return err
+		}
+		*b = ContentBlock{Type: decoded.Type, FileAttachment: &decoded.Attachment}
+		return nil
 	}
 	if coreContentBlockTypes[selector.Type] {
 		var decoded contentBlockJSON

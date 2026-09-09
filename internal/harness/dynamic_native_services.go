@@ -708,7 +708,7 @@ func (e *Engine) dynamicCordisMessageFeedbackFacade(run *dynamicCordisRun) *goja
 				if err != nil {
 					panic(vm.ToValue("ctx.messageFeedback." + method + ": request must be JSON"))
 				}
-				value, rpcErr := e.remoteMessageFeedback("messageFeedback/"+method, map[string]json.RawMessage{"request": request})
+				value, rpcErr := e.remoteMessageFeedbackFrom("messageFeedback/"+method, map[string]json.RawMessage{"request": request}, run)
 				if rpcErr != nil {
 					panic(vm.ToValue(rpcErr.Error()))
 				}

@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +21,13 @@ type remoteDescriptor struct {
 }
 
 var remoteDescriptors = map[string]remoteDescriptor{
-	"$events/result": {allowed: []string{"clientId", "eventId", "outcome"}, required: []string{"clientId", "eventId", "outcome"}},
+	"workspaceFiles/list":      {allowed: []string{"agentId", "path"}, required: []string{"agentId", "path"}},
+	"workspaceFiles/stat":      {allowed: []string{"agentId", "path"}, required: []string{"agentId", "path"}},
+	"workspaceFiles/read":      {allowed: []string{"agentId", "path", "range"}, required: []string{"agentId", "path", "range"}},
+	"workspaceFiles/readBytes": {allowed: []string{"agentId", "path", "range"}, required: []string{"agentId", "path", "range"}},
+	"workspaceFiles/changes":   {allowed: []string{"agentId"}, required: []string{"agentId"}},
+	"fileUploads/upload":       {allowed: []string{"agentId", "request"}, required: []string{"agentId", "request"}},
+	"$events/result":           {allowed: []string{"clientId", "eventId", "outcome"}, required: []string{"clientId", "eventId", "outcome"}},
 
 	"agentPresets/copy":         {allowed: []string{"from", "id", "name"}, required: []string{"from", "id"}},
 	"agentPresets/deletePreset": {allowed: []string{"id"}, required: []string{"id"}},
@@ -36,7 +39,7 @@ var remoteDescriptors = map[string]remoteDescriptor{
 	"agentTeams/updateTask": {allowed: []string{"agentId", "request"}, required: []string{"agentId", "request"}},
 	"agentTeams/view":       {allowed: []string{"agentId"}, required: []string{"agentId"}},
 
-	"commands/execute":     {allowed: []string{"agentId", "images", "line"}, required: []string{"agentId", "images", "line"}},
+	"commands/execute":     {allowed: []string{"agentId", "line", "submittedAttachments"}, required: []string{"agentId", "line", "submittedAttachments"}},
 	"commands/list":        {allowed: []string{"agentId"}, required: []string{"agentId"}},
 	"credentials/describe": {allowed: []string{"refs"}, required: []string{"refs"}},
 	"credentials/set":      {allowed: []string{"ref", "value"}, required: []string{"ref", "value"}},
@@ -137,6 +140,12 @@ func (e *Engine) dispatchRemote(ctx context.Context, endpoint string, raw json.R
 		return nil, false, err
 	}
 	switch endpoint {
+	case "workspaceFiles/list", "workspaceFiles/stat", "workspaceFiles/read", "workspaceFiles/readBytes":
+		value, rpcErr := e.remoteWorkspaceFile(ctx, endpoint, args)
+		return value, true, rpcErr
+	case "fileUploads/upload":
+		value, rpcErr := e.remoteFileUpload(ctx, endpoint, args)
+		return value, true, rpcErr
 	case "$events/result":
 		return e.settleRemoteEventResult(endpoint, args)
 	case "agentPresets/list":
@@ -185,6 +194,21 @@ func (e *Engine) dispatchRemote(ctx context.Context, endpoint string, raw json.R
 		payload, _ := json.Marshal(map[string]any{"sessionId": agentID, "agentPreset": preset})
 		value, rpcErr := e.dispatch(ctx, "agentPreset.select", payload)
 		return value, true, rpcErr
+	case "agentTeams/view", "agentTeams/createTask", "agentTeams/updateTask":
+		value, rpcErr := e.remoteAgentTeam(endpoint, args)
+		return value, true, rpcErr
+	case "credentials/describe":
+		method := strings.Replace(endpoint, "/", ".", 1)
+		value, rpcErr := e.dispatch(ctx, method, mustMarshalRemote(rawObject(args)))
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		object, _ := value.(map[string]any)
+		return object["credentials"], true, nil
+	case "credentials/set", "credentials/unset":
+		method := strings.Replace(endpoint, "/", ".", 1)
+		_, rpcErr := e.dispatch(ctx, method, mustMarshalRemote(rawObject(args)))
+		return nil, false, rpcErr
 	case "directoryPicker/pick":
 		path, runErr := e.pickDirectory(ctx)
 		if runErr != nil {
@@ -223,6 +247,79 @@ func (e *Engine) dispatchRemote(ctx context.Context, endpoint string, raw json.R
 			return object["path"], true, nil
 		}
 		return value, true, nil
+	case "llm/listProviders":
+		return e.remoteLLMProviders(), true, nil
+	case "llm/listConfigurableProviders":
+		return e.remoteConfigurableProviders(), true, nil
+	case "llm/discoverModels":
+		request, requestErr := remoteRequiredObject(endpoint, args, "request")
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		settingsNS, rpcErr := remoteString(endpoint, args, "settingsNs")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		request["settingsNs"] = settingsNS
+		value, rpcErr := e.dispatch(ctx, "llm.discoverModels", mustMarshalRemote(request))
+		if rpcErr != nil {
+			return nil, false, rpcError("model-discovery-rejected", rpcErr.Message, map[string]any{"settingsNs": settingsNS})
+		}
+		object, _ := value.(map[string]any)
+		return object["models"], true, nil
+	case "session/list":
+		value, rpcErr := e.dispatch(ctx, "session.list", []byte(`{}`))
+		return value, true, rpcErr
+	case "session/search", "session/create", "session/selectModel", "session/rename", "session/fork", "session/prompt", "session/attachment", "session/updateQueue", "session/cancel":
+		method := strings.Replace(endpoint, "/", ".", 1)
+		request, requestErr := remoteRequiredObject(endpoint, args, "request")
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		value, rpcErr := e.dispatch(ctx, method, mustMarshalRemote(request))
+		return value, true, rpcErr
+	case "session/page":
+		request, requestErr := remoteRequiredObject(endpoint, args, "request")
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		value, rpcErr := e.dispatch(ctx, "session.history", mustMarshalRemote(request))
+		return value, true, rpcErr
+	case "session/modelCatalog":
+		return e.remoteModelCatalog(ctx), true, nil
+	case "session/canOpenWorkspacePath", "settings/canOpenAgentPresetDirectory":
+		return openCommand() != "", true, nil
+	case "session/openWorkspacePath":
+		request, requestErr := remoteRequiredObject(endpoint, args, "request")
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		value, rpcErr := e.dispatch(ctx, "host.openPath", mustMarshalRemote(request))
+		return value, true, rpcErr
+	case "settings/describe":
+		value, rpcErr := e.dispatch(ctx, "settings.describe", []byte(`{}`))
+		return value, true, rpcErr
+	case "settings/update", "settings/replace", "settings/mutate":
+		method := strings.Replace(endpoint, "/", ".", 1)
+		value, rpcErr := e.dispatch(ctx, method, mustMarshalRemote(rawObject(args)))
+		return value, true, rpcErr
+	case "settings/openSettingsDocument":
+		value, rpcErr := e.dispatch(ctx, "settings.openDocument", []byte(`{}`))
+		return value, true, rpcErr
+	case "settings/openAgentPresetDirectory":
+		agentPreset, rpcErr := remoteString(endpoint, args, "agentPreset")
+		if rpcErr != nil {
+			return nil, false, rpcErr
+		}
+		value, rpcErr := e.dispatch(ctx, "agentPreset.openDocument", mustMarshalRemote(map[string]any{"agentPreset": agentPreset}))
+		return value, true, rpcErr
+	case "skills/list":
+		request, requestErr := remoteRequiredObject(endpoint, args, "request")
+		if requestErr != nil {
+			return nil, false, requestErr
+		}
+		value, rpcErr := e.dispatch(ctx, "skill.list", mustMarshalRemote(request))
+		return value, true, rpcErr
 	case "subagents/list":
 		parentID, rpcErr := remoteString(endpoint, args, "parentSessionId")
 		if rpcErr != nil {
@@ -485,6 +582,154 @@ func optionalString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func mustMarshalRemote(value any) json.RawMessage {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+func remoteRequiredObject(endpoint string, args map[string]json.RawMessage, field string) (map[string]any, *RPCError) {
+	object, err := remoteObject(args[field], nil, nil)
+	if err != nil {
+		return nil, remoteInputError(endpoint, field, err)
+	}
+	return rawObject(object), nil
+}
+
+func (e *Engine) remoteLLMProviders() []map[string]any {
+	e.mu.RLock()
+	rows := make([]map[string]any, 0, len(e.providers))
+	for _, provider := range e.providers {
+		rows = append(rows, map[string]any{"id": provider.ID(), "name": provider.Name()})
+	}
+	e.mu.RUnlock()
+	sort.Slice(rows, func(i, j int) bool { return rows[i]["id"].(string) < rows[j]["id"].(string) })
+	return rows
+}
+
+func (e *Engine) remoteConfigurableProviders() []map[string]any {
+	views := e.providerViews()
+	rows := make([]map[string]any, 0, len(views))
+	for _, view := range views {
+		row := map[string]any{
+			"provider": view["provider"], "displayName": view["displayName"],
+			"settingsNs": view["settingsNs"], "settingsPath": view["settingsPath"],
+		}
+		if declared, present := view["declared"]; present {
+			row["declared"] = declared
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func (e *Engine) remoteModelCatalog(ctx context.Context) map[string]any {
+	groups, failures := e.Models(ctx)
+	visible := make([]map[string]any, 0, len(groups))
+	for _, group := range groups {
+		models, _ := group["models"].([]map[string]any)
+		if len(models) == 0 {
+			continue
+		}
+		projected := make([]map[string]any, 0, len(models))
+		for _, model := range models {
+			row := map[string]any{"id": model["id"], "name": model["name"]}
+			if description, present := model["description"]; present {
+				row["description"] = description
+			}
+			if reasoning, present := model["reasoning"]; present {
+				row["reasoning"] = reasoning
+			}
+			projected = append(projected, row)
+		}
+		visible = append(visible, map[string]any{
+			"id": group["id"], "name": group["name"], "models": projected,
+		})
+	}
+	providers := e.remoteLLMProviders()
+	routable := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		routable = append(routable, provider["id"].(string))
+	}
+	return map[string]any{
+		"default":           ModelSelection{Provider: e.cfg.Provider, Model: e.cfg.Model},
+		"routableProviders": routable,
+		"groups":            visible,
+		"failures":          failures,
+	}
+}
+
+func (e *Engine) remoteAgentTeam(endpoint string, args map[string]json.RawMessage) (any, *RPCError) {
+	if e.agentTeams == nil {
+		return nil, rpcError("internal", "Agent Teams service is unavailable", nil)
+	}
+	agentID, rpcErr := remoteString(endpoint, args, "agentId")
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if endpoint == "agentTeams/view" {
+		members, err := e.agentTeams.ListMembers(agentID)
+		if err != nil {
+			return nil, errorToRPC(err)
+		}
+		tasks, err := e.agentTeams.ListTasks(agentID)
+		if err != nil {
+			return nil, errorToRPC(err)
+		}
+		return map[string]any{"members": members, "tasks": tasks}, nil
+	}
+	if endpoint == "agentTeams/createTask" {
+		var request CreateTeamTaskRequest
+		if err := json.Unmarshal(args["request"], &request); err != nil {
+			return nil, remoteInputError(endpoint, "request", err)
+		}
+		value, err := e.agentTeams.CreateTask(agentID, request)
+		return remoteTeamTaskMutation(value, err)
+	}
+	var wire struct {
+		TaskID           string    `json:"taskId"`
+		ExpectedRevision int       `json:"expectedRevision"`
+		Action           string    `json:"action"`
+		Subject          *string   `json:"subject"`
+		Description      *string   `json:"description"`
+		BlockedBy        *[]string `json:"blockedBy"`
+		WriteScopes      *[]string `json:"writeScopes"`
+		Owner            *string   `json:"owner"`
+	}
+	if err := json.Unmarshal(args["request"], &wire); err != nil {
+		return nil, remoteInputError(endpoint, "request", err)
+	}
+	request := UpdateTeamTaskRequest{
+		TaskID: wire.TaskID, ExpectedRevision: wire.ExpectedRevision, Action: wire.Action,
+		Subject: wire.Subject, Description: wire.Description, Owner: wire.Owner,
+	}
+	if wire.BlockedBy != nil {
+		request.BlockedBy, request.BlockedBySet = append([]string(nil), (*wire.BlockedBy)...), true
+	}
+	if wire.WriteScopes != nil {
+		request.WriteScopes, request.WriteScopesSet = append([]string(nil), (*wire.WriteScopes)...), true
+	}
+	value, err := e.agentTeams.UpdateTask(agentID, request)
+	return remoteTeamTaskMutation(value, err)
+}
+
+func remoteTeamTaskMutation(value TeamTaskView, err error) (map[string]any, *RPCError) {
+	if err == nil {
+		return map[string]any{"ok": true, "value": value}, nil
+	}
+	var teamErr *TeamError
+	if errors.As(err, &teamErr) {
+		code := "team-rejected"
+		if teamErr.Code == "TEAM_TASK_STALE_REVISION" {
+			code = "team-task-conflict"
+		}
+		return map[string]any{"ok": false, "error": map[string]any{"code": code, "message": teamErr.Error()}}, nil
+	}
+	return nil, errorToRPC(err)
 }
 
 // remotePluginInventory projects the live Host Loader entries. Client boot
@@ -909,15 +1154,15 @@ func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json
 	if err != nil {
 		return nil, false, err
 	}
-	images, err := remoteEncodedImages(args["images"])
+	attachments, err := remoteCommandAttachments(args["submittedAttachments"])
 	if err != nil {
-		return nil, false, remoteBoundaryError("commands/execute", "images")
+		return nil, false, remoteBoundaryError("commands/execute", "submittedAttachments")
 	}
 	s, sessionErr := e.getSession(id)
 	if sessionErr != nil {
 		return nil, false, errorToRPC(sessionErr)
 	}
-	execution, admitted, runErr := e.executeCommand(ctx, s, line, images)
+	execution, admitted, runErr := e.executeCommand(ctx, s, line, attachments)
 	if runErr != nil {
 		return nil, false, errorToRPC(runErr)
 	}
@@ -927,38 +1172,59 @@ func (e *Engine) remoteCommandsExecute(ctx context.Context, args map[string]json
 	return execution, true, nil
 }
 
-func remoteEncodedImages(raw json.RawMessage) ([]EncodedImageAttachment, *RPCError) {
+func remoteCommandAttachments(raw json.RawMessage) ([]commandSubmitAttachment, *RPCError) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, remoteBoundaryError("commands/execute", "images")
+		return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 	}
 	var rows []json.RawMessage
 	if err := json.Unmarshal(raw, &rows); err != nil || rows == nil {
-		return nil, remoteBoundaryError("commands/execute", "images")
+		return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 	}
-	images := make([]EncodedImageAttachment, len(rows))
+	attachments := make([]commandSubmitAttachment, len(rows))
 	for index, row := range rows {
-		object, err := remoteObject(row, []string{"mediaType", "data", "name"}, []string{"mediaType", "data"})
+		var selector struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(row, &selector) != nil {
+			return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
+		}
+		if selector.Type == "file" {
+			object, objectErr := remoteObject(row, []string{"type", "receiptId"}, []string{"type", "receiptId"})
+			if objectErr != nil {
+				return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
+			}
+			receiptID, rpcErr := remoteString("commands/execute", object, "receiptId")
+			if rpcErr != nil {
+				return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
+			}
+			attachments[index] = commandSubmitAttachment{Type: "file", ReceiptID: receiptID}
+			continue
+		}
+		object, err := remoteObject(row, []string{"type", "mediaType", "data", "name"}, []string{"type", "mediaType", "data"})
 		if err != nil {
-			return nil, remoteBoundaryError("commands/execute", "images")
+			return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
+		}
+		if selector.Type != "image" {
+			return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 		}
 		mediaType, rpcErr := remoteString("commands/execute", object, "mediaType")
 		if rpcErr != nil || imageExtension(mediaType) == "" {
-			return nil, remoteBoundaryError("commands/execute", "images")
+			return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 		}
 		data, rpcErr := remoteString("commands/execute", object, "data")
 		if rpcErr != nil {
-			return nil, remoteBoundaryError("commands/execute", "images")
+			return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 		}
 		name := ""
 		if _, present := object["name"]; present {
 			name, rpcErr = remoteString("commands/execute", object, "name")
 			if rpcErr != nil {
-				return nil, remoteBoundaryError("commands/execute", "images")
+				return nil, remoteBoundaryError("commands/execute", "submittedAttachments")
 			}
 		}
-		images[index] = EncodedImageAttachment{MediaType: mediaType, Data: data, Name: name}
+		attachments[index] = commandSubmitAttachment{Type: "image", MediaType: mediaType, Data: data, Name: name}
 	}
-	return images, nil
+	return attachments, nil
 }
 
 func (e *Engine) remoteFileReferencesList(ctx context.Context, args map[string]json.RawMessage) (any, bool, *RPCError) {
@@ -1119,20 +1385,13 @@ type feedbackItem struct {
 	UpdatedAt int64  `json:"updatedAt"`
 }
 
-type feedbackRow struct {
-	Session feedbackSessionIdentity `json:"session"`
-	Items   []feedbackItem          `json:"items"`
-}
-
-type feedbackSessionIdentity struct {
-	CreatedAt int64  `json:"createdAt"`
-	CWD       string `json:"cwd,omitempty"`
-}
-
-// ponytail: one process-wide lock is enough here; use per-session locks if feedback traffic becomes concurrent.
-var feedbackFileMu sync.Mutex
+var feedbackMu sync.Mutex
 
 func (e *Engine) remoteMessageFeedback(endpoint string, args map[string]json.RawMessage) (any, *RPCError) {
+	return e.remoteMessageFeedbackFrom(endpoint, args, nil)
+}
+
+func (e *Engine) remoteMessageFeedbackFrom(endpoint string, args map[string]json.RawMessage, origin *dynamicCordisRun) (any, *RPCError) {
 	request, err := remoteObject(args["request"], feedbackAllowed(endpoint), feedbackRequired(endpoint))
 	if err != nil {
 		return nil, remoteBoundaryError(endpoint, "request")
@@ -1183,24 +1442,24 @@ func (e *Engine) remoteMessageFeedback(endpoint string, args map[string]json.Raw
 	if sessionErr != nil {
 		return feedbackRejected(map[string]any{"code": "session-not-found", "sessionId": sessionID}), nil
 	}
-	s.mu.Lock()
-	header := s.Header
-	events := append([]Event(nil), s.Events...)
-	s.mu.Unlock()
 
-	feedbackFileMu.Lock()
-	defer feedbackFileMu.Unlock()
-	row, loadErr := e.loadFeedback(sessionID, header)
-	if loadErr != nil {
-		return nil, rpcError("internal", loadErr.Error(), map[string]any{"endpoint": endpoint})
+	feedbackMu.Lock()
+	defer feedbackMu.Unlock()
+	s.mu.Lock()
+	events := cloneSessionEvents(s.Events)
+	attached := s.attached
+	s.mu.Unlock()
+	items, foldErr := foldMessageFeedback(sessionID, events)
+	if foldErr != nil {
+		return nil, rpcError("internal", foldErr.Error(), map[string]any{"endpoint": endpoint})
 	}
 	if endpoint == "messageFeedback/list" {
-		sort.SliceStable(row.Items, func(i, j int) bool { return row.Items[i].CreatedAt < row.Items[j].CreatedAt })
-		return feedbackSuccess(map[string]any{"items": row.Items}), nil
+		sort.SliceStable(items, func(i, j int) bool { return items[i].CreatedAt < items[j].CreatedAt })
+		return feedbackSuccess(map[string]any{"items": items}), nil
 	}
 	index := -1
-	for i := range row.Items {
-		if row.Items[i].MessageID == messageID {
+	for i := range items {
+		if items[i].MessageID == messageID {
 			index = i
 			break
 		}
@@ -1209,12 +1468,11 @@ func (e *Engine) remoteMessageFeedback(endpoint string, args map[string]json.Raw
 		if index < 0 {
 			return feedbackSuccess(map[string]any{"absent": true}), nil
 		}
-		if row.Items[index].Version != ifVersion {
-			return feedbackRejected(feedbackVersionConflict(&row.Items[index])), nil
+		if items[index].Version != ifVersion {
+			return feedbackRejected(feedbackVersionConflict(&items[index])), nil
 		}
-		row.Items = append(row.Items[:index], row.Items[index+1:]...)
-		if saveErr := e.saveFeedback(sessionID, row); saveErr != nil {
-			return nil, rpcError("internal", saveErr.Error(), map[string]any{"endpoint": endpoint})
+		if _, commitErr := e.commitFeedbackEvent(s, attached, origin, "feedback/message-delete", map[string]any{"sessionId": sessionID, "messageId": messageID}); commitErr != nil {
+			return nil, rpcError("internal", commitErr.Error(), map[string]any{"endpoint": endpoint})
 		}
 		return feedbackSuccess(map[string]any{"absent": true}), nil
 	}
@@ -1222,30 +1480,131 @@ func (e *Engine) remoteMessageFeedback(endpoint string, args map[string]json.Raw
 	if !feedbackTarget(events, messageID) {
 		return feedbackRejected(map[string]any{"code": "target-not-found", "sessionId": sessionID, "messageId": messageID}), nil
 	}
-	if index < 0 && requestedVersion != nil || index >= 0 && (requestedVersion == nil || *requestedVersion != row.Items[index].Version) {
+	if index < 0 && requestedVersion != nil || index >= 0 && (requestedVersion == nil || *requestedVersion != items[index].Version) {
 		if index < 0 {
 			return feedbackRejected(feedbackVersionConflict(nil)), nil
 		}
-		return feedbackRejected(feedbackVersionConflict(&row.Items[index])), nil
+		return feedbackRejected(feedbackVersionConflict(&items[index])), nil
 	}
-	if index >= 0 && row.Items[index].Rating == rating && row.Items[index].Note == note {
-		return feedbackSuccess(row.Items[index]), nil
+	if index >= 0 && items[index].Rating == rating && items[index].Note == note {
+		return feedbackSuccess(items[index]), nil
 	}
 	now := time.Now().UnixMilli()
 	item := feedbackItem{MessageID: messageID, Rating: rating, Note: note, Version: feedbackVersion(), CreatedAt: now, UpdatedAt: now}
 	if index < 0 {
-		row.Items = append(row.Items, item)
 	} else {
-		item.CreatedAt = row.Items[index].CreatedAt
-		if now < row.Items[index].UpdatedAt {
-			item.UpdatedAt = row.Items[index].UpdatedAt
+		item.CreatedAt = items[index].CreatedAt
+		if now < items[index].UpdatedAt {
+			item.UpdatedAt = items[index].UpdatedAt
 		}
-		row.Items[index] = item
 	}
-	if saveErr := e.saveFeedback(sessionID, row); saveErr != nil {
-		return nil, rpcError("internal", saveErr.Error(), map[string]any{"endpoint": endpoint})
+	if _, commitErr := e.commitFeedbackEvent(s, attached, origin, "feedback/message-put", map[string]any{"sessionId": sessionID, "item": item}); commitErr != nil {
+		return nil, rpcError("internal", commitErr.Error(), map[string]any{"endpoint": endpoint})
 	}
 	return feedbackSuccess(item), nil
+}
+
+func foldMessageFeedback(sessionID string, events []Event) ([]feedbackItem, error) {
+	items := make([]feedbackItem, 0)
+	for _, event := range events {
+		data, ok := event.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		eventSessionID, _ := data["sessionId"].(string)
+		if eventSessionID != sessionID {
+			continue
+		}
+		switch event.Type {
+		case "feedback/message-put":
+			encoded, err := json.Marshal(data["item"])
+			if err != nil {
+				return nil, fmt.Errorf("invalid feedback item at session seq %d", event.Seq)
+			}
+			var item feedbackItem
+			if err := json.Unmarshal(encoded, &item); err != nil || !validFeedbackItem(item) {
+				return nil, fmt.Errorf("invalid feedback item at session seq %d", event.Seq)
+			}
+			index := feedbackItemIndex(items, item.MessageID)
+			if index < 0 {
+				items = append(items, item)
+			} else {
+				items[index] = item
+			}
+		case "feedback/message-delete":
+			messageID, _ := data["messageId"].(string)
+			if messageID == "" {
+				return nil, fmt.Errorf("invalid feedback deletion at session seq %d", event.Seq)
+			}
+			if index := feedbackItemIndex(items, messageID); index >= 0 {
+				items = append(items[:index], items[index+1:]...)
+			}
+		}
+	}
+	return items, nil
+}
+
+func validFeedbackItem(item feedbackItem) bool {
+	return item.MessageID != "" && (item.Rating == "positive" || item.Rating == "negative") &&
+		item.Version != "" && item.CreatedAt >= 0 && item.UpdatedAt >= item.CreatedAt &&
+		(item.Note == "" || strings.TrimSpace(item.Note) != "")
+}
+
+func feedbackItemIndex(items []feedbackItem, messageID string) int {
+	for index := range items {
+		if items[index].MessageID == messageID {
+			return index
+		}
+	}
+	return -1
+}
+
+func (e *Engine) commitFeedbackEvent(session *Session, attached bool, origin *dynamicCordisRun, eventType string, data map[string]any) (Event, error) {
+	if attached || e.sessionStore == nil {
+		session.mu.Lock()
+		event, err := appendEventLocked(session, eventType, data, nil, nil, false)
+		session.mu.Unlock()
+		if err != nil {
+			return Event{}, err
+		}
+		e.publishEventFrom(origin, session.Header.ID, event)
+		return event, nil
+	}
+	handle, inspection, err := openStoredSessionForWrite(context.Background(), e.sessionStore, session.Header.ID)
+	if err != nil {
+		return Event{}, err
+	}
+	session.mu.Lock()
+	if session.attached {
+		session.mu.Unlock()
+		_ = handle.Close()
+		return Event{}, &SessionAlreadyOwnedError{SessionID: session.Header.ID}
+	}
+	if !sessionQueryHeadersCompatible(session.Header, inspection.Meta) {
+		session.mu.Unlock()
+		_ = handle.Close()
+		return Event{}, fmt.Errorf("session-conflict: persisted header for session %q changed", session.Header.ID)
+	}
+	session.Header = inspection.Meta
+	session.InheritedEventCount = inspection.InheritedEventCount
+	session.Events = cloneSessionEvents(inspection.Events)
+	session.storedEventCount = len(inspection.Events)
+	session.store = handle
+	event, appendErr := appendEventLocked(session, eventType, data, nil, nil, false)
+	session.store = nil
+	session.firstLiveSeq = len(session.Events)
+	session.mu.Unlock()
+	closeErr := handle.Close()
+	if appendErr != nil {
+		return Event{}, appendErr
+	}
+	if closeErr != nil {
+		return Event{}, closeErr
+	}
+	if e.telemetry != nil {
+		e.telemetry.captureSession(session, int(event.Seq))
+	}
+	return event, nil
 }
 
 func feedbackVersion() string {
@@ -1316,105 +1675,4 @@ func feedbackTarget(events []Event, messageID string) bool {
 		}
 	}
 	return false
-}
-
-func (e *Engine) feedbackPath(sessionID string) string {
-	sum := sha256.Sum256([]byte(sessionID))
-	return filepath.Join(e.cfg.DataDir, "message-feedback", hex.EncodeToString(sum[:])+".json")
-}
-
-func (e *Engine) feedbackStorePath() string {
-	return filepath.Join(e.cfg.DataDir, "storages", "message_feedback.json")
-}
-
-type feedbackStoreDocument struct {
-	Unit   map[string]any                        `json:"unit"`
-	Global any                                   `json:"global"`
-	Tables map[string]map[string]json.RawMessage `json:"tables"`
-}
-
-func (e *Engine) loadFeedback(sessionID string, header SessionHeader) (feedbackRow, error) {
-	empty := feedbackRow{Session: feedbackSessionIdentity{CreatedAt: header.CreatedAt, CWD: header.CWD}, Items: []feedbackItem{}}
-	data, err := os.ReadFile(e.feedbackStorePath())
-	if err == nil {
-		var document feedbackStoreDocument
-		if decodeErr := json.Unmarshal(data, &document); decodeErr != nil {
-			return feedbackRow{}, decodeErr
-		}
-		if raw := document.Tables["sessions"][sessionID]; len(raw) > 0 {
-			var row feedbackRow
-			if decodeErr := json.Unmarshal(raw, &row); decodeErr != nil {
-				return feedbackRow{}, decodeErr
-			}
-			if row.Session.CreatedAt == header.CreatedAt && row.Session.CWD == header.CWD {
-				if row.Items == nil {
-					row.Items = []feedbackItem{}
-				}
-				return row, nil
-			}
-		}
-	} else if !os.IsNotExist(err) {
-		return feedbackRow{}, err
-	}
-	// Read the pre-storage-domain Go sidecar layout when upgrading an existing
-	// development checkout; new writes always use the upstream storage shape.
-	legacyData, legacyErr := os.ReadFile(e.feedbackPath(sessionID))
-	if legacyErr == nil {
-		var row feedbackRow
-		if decodeErr := json.Unmarshal(legacyData, &row); decodeErr != nil {
-			return feedbackRow{}, decodeErr
-		}
-		if row.Session.CreatedAt == header.CreatedAt && row.Session.CWD == header.CWD {
-			if row.Items == nil {
-				row.Items = []feedbackItem{}
-			}
-			return row, nil
-		}
-	} else if !os.IsNotExist(legacyErr) {
-		return feedbackRow{}, legacyErr
-	}
-	return empty, nil
-}
-
-func (e *Engine) saveFeedback(sessionID string, row feedbackRow) error {
-	path := e.feedbackStorePath()
-	document := feedbackStoreDocument{
-		Unit:   map[string]any{"name": "message_feedback", "version": 0},
-		Global: nil,
-		Tables: map[string]map[string]json.RawMessage{"sessions": {}},
-	}
-	if existing, readErr := os.ReadFile(path); readErr == nil {
-		if err := json.Unmarshal(existing, &document); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(readErr) {
-		return readErr
-	}
-	if document.Unit == nil {
-		document.Unit = map[string]any{"name": "message_feedback", "version": 0}
-	}
-	if document.Tables == nil {
-		document.Tables = map[string]map[string]json.RawMessage{}
-	}
-	if document.Tables["sessions"] == nil {
-		document.Tables["sessions"] = map[string]json.RawMessage{}
-	}
-	rowData, err := json.Marshal(row)
-	if err != nil {
-		return err
-	}
-	document.Tables["sessions"][sessionID] = rowData
-	data, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }

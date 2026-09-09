@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -195,6 +196,119 @@ func TestAnthropicSignatureDeltaPersistsAndReplays(t *testing.T) {
 	if !persisted {
 		t.Fatalf("signature was not persisted: %#v", events)
 	}
+}
+
+func TestAnthropicReplayPreservesResolvedModelAndMidConversationEffort(t *testing.T) {
+	var mu sync.Mutex
+	requests := make([]map[string]any, 0, 2)
+	betas := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		mu.Lock()
+		requestIndex := len(requests)
+		requests = append(requests, request)
+		betas = append(betas, r.Header.Get("Anthropic-Beta"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if requestIndex == 0 {
+			_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-native\",\"model\":\"claude-native-20261001\",\"usage\":{\"input_tokens\":4}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"native thought\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"native-signature\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-native\",\"name\":\"native_probe\",\"input\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-final\",\"model\":\"claude-native-20261001\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	valueTrue := true
+	provider := NewAnthropicProvider("anthropic-native", server.URL, "key", "claude-alias")
+	provider.modelSpec = piAIModel{
+		ID: "claude-alias", API: "anthropic-messages", Reasoning: true,
+		ThinkingLevelMap: map[string]*string{"high": stringPointer("high")},
+		Compat:           piAIModelCompat{SupportsMidConvoEffort: &valueTrue, ForceAdaptiveThinking: &valueTrue},
+	}
+	engine := newIntegrationEngine(t)
+	engine.RegisterProvider(provider)
+	if err := engine.RegisterTool(Tool{
+		Schema:  ToolSchema{Name: "native_probe", Parameters: map[string]any{"type": "object"}},
+		Execute: func(context.Context, ToolCall) (ToolResult, error) { return textToolResult("tool result"), nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := engine.CreateSession(t.Context(), engine.Config().Workspace, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SelectModel(id, ModelSelection{Provider: provider.ID(), Model: "claude-alias", ReasoningEffort: "high"}); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := engine.Run(t.Context(), id, PromptRequest{Content: []PromptContentPart{{Type: "text", Text: "start"}}}); err != nil || text != "done" {
+		t.Fatalf("Run() = %q, %v", text, err)
+	}
+
+	mu.Lock()
+	deferredRequests := append([]map[string]any(nil), requests...)
+	deferredBetas := append([]string(nil), betas...)
+	mu.Unlock()
+	if len(deferredRequests) != 2 {
+		t.Fatalf("requests = %d", len(deferredRequests))
+	}
+	for index, beta := range deferredBetas {
+		if !strings.Contains(beta, "mid-conversation-output-config-2026-07-01") || !strings.Contains(beta, "thinking-binding-controls-2026-08-01") {
+			t.Fatalf("request %d beta = %q", index, beta)
+		}
+	}
+	thinking := deferredRequests[0]["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" || thinking["block_binding"].(map[string]any)["prefix_mismatch_behavior"] != "drop_block" {
+		t.Fatalf("adaptive thinking = %#v", thinking)
+	}
+	messages := deferredRequests[1]["messages"].([]any)
+	var historicalEffort, replayedReasoning any
+	effortMessages := 0
+	for _, raw := range messages {
+		message := raw.(map[string]any)
+		if message["role"] == "system" {
+			if output, ok := message["output_config"].(map[string]any); ok {
+				historicalEffort = output["effort"]
+				effortMessages++
+			}
+		}
+		if message["role"] == "assistant" {
+			content := message["content"].([]any)
+			replayedReasoning = content[0].(map[string]any)
+		}
+	}
+	if historicalEffort != "high" || effortMessages != 2 {
+		t.Fatalf("historical effort = %#v, messages=%d in %#v", historicalEffort, effortMessages, messages)
+	}
+	if block := replayedReasoning.(map[string]any); block["type"] != "text" || block["text"] != "native thought" || block["signature"] != nil {
+		t.Fatalf("cross-model replay block = %#v", block)
+	}
+
+	session, err := engine.getSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	events := append([]Event(nil), session.Events...)
+	session.mu.Unlock()
+	for _, event := range events {
+		if event.Type != "assistant/message" {
+			continue
+		}
+		source, _ := nestedMessage(event.Data)["source"].(map[string]any)
+		replay, _ := source["replayState"].(map[string]any)
+		response, _ := replay["response"].(map[string]any)
+		if response["responseId"] == "msg-native" {
+			if response["model"] != "claude-alias" || response["responseModel"] != "claude-native-20261001" || response["providerThinkingLevel"] != "high" {
+				t.Fatalf("replay response = %#v", response)
+			}
+			return
+		}
+	}
+	t.Fatal("native replay state was not persisted")
 }
 
 func TestResponsesStrictSamplingRequirement(t *testing.T) {

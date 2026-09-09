@@ -342,3 +342,125 @@ func TestJSONLSessionHandleRejectsInvalidAppendWithoutMutation(t *testing.T) {
 	}
 	_ = handle.Close()
 }
+
+func TestJSONLSessionV2PhysicalEncodingAndStrictAppend(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewJSONLSessionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	meta := testSessionHeader("v2-physical")
+	handle, err := store.Create(ctx, meta, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Append(ctx, []Event{{
+		Type: "assistant/chunk", Seq: 0, Time: 1,
+		Data: map[string]any{"turn": 1, "step": 1, "chunk": map[string]any{"type": "text-delta", "text": "legacy"}},
+	}}); err == nil || !strings.Contains(err.Error(), "top-level assistant/chunk") {
+		t.Fatalf("v2 chunk append error = %v", err)
+	}
+	events := []Event{
+		{Type: "user/message", Seq: 0, Time: 1, SurfaceOp: "append", Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "one"}}}},
+		{Type: "user/message", Seq: 1, Time: 2, SurfaceOp: "append", Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "two"}}}},
+		{Type: "user/message", Seq: 2, Time: 3, SurfaceOp: "append", Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "three"}}}},
+		{Type: "user/message", Seq: 3, Time: 4, SurfaceOp: map[string]any{"op": "replace", "start": 0, "end": 2}, SourceEventSeqs: []int{0, 1, 2}, Data: map[string]any{"content": []ContentBlock{{Type: "text", Text: "replacement"}}}},
+	}
+	if err := handle.Append(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.pathFor(meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 5 || !strings.Contains(lines[0], `"version":2`) || !strings.Contains(lines[0], `"isSeeded":false`) ||
+		strings.Contains(lines[0], `"seedLength"`) || !strings.Contains(lines[4], `"sourceEventSeqs":[[0,2]]`) {
+		t.Fatalf("v2 physical log = %s", raw)
+	}
+}
+
+func TestJSONLSessionWriteOpenPublishesV2BesideImmutableV1(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := NewJSONLSessionStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	meta := testSessionHeader("generation-migration")
+	directory := filepath.Dir(store.pathFor(meta))
+	sourcePath := sessionGenerationPath(directory, 1)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := strings.Join([]string{
+		`{"type":"session","version":1,"id":"generation-migration","createdAt":1,"cwd":"/work","delegationDepth":0}`,
+		`{"type":"turn/start","seq":0,"time":1,"data":{"turn":1}}`,
+		`{"type":"step/start","seq":1,"time":2,"data":{"turn":1,"step":1}}`,
+		`{"type":"assistant/chunk","seq":2,"time":3,"data":{"turn":1,"step":1,"chunk":{"type":"text-delta","index":0,"text":"hello"}}}`,
+		`{"type":"assistant/message","seq":3,"time":4,"data":{"turn":1,"step":1,"message":{"id":"answer","role":"assistant","content":[{"type":"text","text":"hello"}],"source":{"kind":"model","provider":"echo","model":"echo"}}},"surfaceOp":"append"}`,
+		`{"type":"step/end","seq":4,"time":5,"data":{"turn":1,"step":1}}`,
+		`{"type":"turn/end","seq":5,"time":6,"data":{"turn":1,"reason":{"kind":"completed"}}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.Open(ctx, meta.ID, SessionAccessRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := reader.Read(ctx)
+	_ = reader.Close()
+	if err != nil || len(events) != 5 || events[2].Type != "assistant/message" {
+		t.Fatalf("migrated read = %#v, %v", events, err)
+	}
+	if _, err := os.Stat(store.pathFor(meta)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read open published current generation: %v", err)
+	}
+	writer, err := store.Open(ctx, meta.ID, SessionAccessWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged, err := os.ReadFile(sourcePath); err != nil || string(unchanged) != source {
+		t.Fatalf("historical source changed: %v\n%s", err, unchanged)
+	}
+	current, err := os.ReadFile(store.pathFor(meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(current), `"version":2`) || strings.Contains(string(current), `"assistant/chunk"`) ||
+		!strings.Contains(string(current), `"stream"`) {
+		t.Fatalf("current generation = %s", current)
+	}
+	if _, version, ok, err := readJSONLArtifactHeader(store.pathFor(meta)); err != nil || !ok || version != SessionFormatVersion {
+		t.Fatalf("current header version = %d, ok=%v, err=%v", version, ok, err)
+	}
+}
+
+func TestJSONLSessionRejectsMalformedV2Header(t *testing.T) {
+	store, err := NewJSONLSessionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	meta := testSessionHeader("bad-v2-header")
+	path := store.pathFor(meta)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"session","version":2,"id":"bad-v2-header","createdAt":1,"cwd":"/work","isSeeded":false}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(context.Background(), meta.ID, SessionAccessRead); err == nil || !strings.Contains(err.Error(), "lacks delegationDepth") {
+		t.Fatalf("malformed v2 header error = %v", err)
+	}
+}

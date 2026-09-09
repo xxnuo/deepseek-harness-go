@@ -160,6 +160,9 @@ func normalizeRepeatToolReminderConfig(config RepeatToolReminderConfig) RepeatTo
 }
 
 func validateRuntimePolicies(config Config) error {
+	if config.WorkspaceFiles.MaxBytes < 0 || config.WorkspaceFiles.MaxLines < 0 || config.WorkspaceFiles.MaxEntries < 0 {
+		return errors.New("workspace-files limits must be positive")
+	}
 	compact := config.Compaction
 	if compact.ThresholdRatio <= 0 || compact.ThresholdRatio > 1 {
 		return fmt.Errorf("compaction thresholdRatio must be in (0, 1], got %v", compact.ThresholdRatio)

@@ -97,6 +97,15 @@ func restorePromptQueues(events []Event) ([]*queuedPrompt, []*queuedPrompt, erro
 		next = append(next, inserted...)
 		next = append(next, queue[start+removed:]...)
 		queues[target] = next
+		ids := make(map[string]bool)
+		for _, pending := range queues {
+			for _, message := range pending {
+				if ids[message.id] {
+					return nil, nil, fmt.Errorf("invalid persisted inbox splice at session seq %d: message %q is already pending", event.Seq, message.id)
+				}
+				ids[message.id] = true
+			}
+		}
 	}
 	return queues["next-turn"], queues["next-step"], nil
 }
@@ -126,9 +135,9 @@ func blockText(blocks []ContentBlock) string {
 	return b.String()
 }
 
-func promptCommandInput(parts []PromptContentPart) (string, []EncodedImageAttachment, bool) {
+func promptCommandInput(parts []PromptContentPart) (string, []commandSubmitAttachment, bool) {
 	line := ""
-	images := make([]EncodedImageAttachment, 0)
+	attachments := make([]commandSubmitAttachment, 0)
 	for _, part := range parts {
 		switch part.Type {
 		case "text":
@@ -137,14 +146,16 @@ func promptCommandInput(parts []PromptContentPart) (string, []EncodedImageAttach
 			}
 			line = strings.TrimSpace(part.Text)
 		case "image":
-			images = append(images, EncodedImageAttachment{
-				MediaType: part.MediaType, Data: part.Data, Name: part.Name,
+			attachments = append(attachments, commandSubmitAttachment{
+				Type: "image", MediaType: part.MediaType, Data: part.Data, Name: part.Name,
 			})
+		case "file":
+			attachments = append(attachments, commandSubmitAttachment{Type: "file", ReceiptID: part.ReceiptID})
 		default:
 			return "", nil, false
 		}
 	}
-	return line, images, strings.HasPrefix(line, "/")
+	return line, attachments, strings.HasPrefix(line, "/")
 }
 
 func (e *Engine) Prompt(ctx context.Context, id string, req PromptRequest) (PromptResult, error) {
@@ -192,9 +203,9 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 	}
 	// Slash commands remain host-side and never enter the model history. A
 	// command may carry images when its descriptor explicitly admits them.
-	commandLine, commandImages, commandCandidate := promptCommandInput(req.Content)
+	commandLine, commandAttachments, commandCandidate := promptCommandInput(req.Content)
 	if !req.Literal && commandCandidate {
-		execution, admitted, err := e.executeCommand(ctx, s, commandLine, commandImages)
+		execution, admitted, err := e.executeCommand(ctx, s, commandLine, commandAttachments)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -207,9 +218,27 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 	if req.preparedContent != nil {
 		content = cloneContentBlocks(req.preparedContent)
 	} else {
-		content, err = e.durablePromptContentContext(ctx, req.Content)
+		inline, files, _, resolveErr := e.resolvePromptFiles(id, req.Content)
+		if resolveErr != nil {
+			return nil, nil, resolveErr
+		}
+		content, err = e.durablePromptContentContext(ctx, inline)
 		if err != nil {
 			return nil, nil, err
+		}
+		if len(files) > 0 {
+			ordered := make([]ContentBlock, 0, len(req.Content))
+			inlineIndex, fileIndex := 0, 0
+			for _, part := range req.Content {
+				if part.Type == "file" {
+					ordered = append(ordered, files[fileIndex])
+					fileIndex++
+				} else {
+					ordered = append(ordered, content[inlineIndex])
+					inlineIndex++
+				}
+			}
+			content = ordered
 		}
 	}
 	content, parsedReferences, err := parseSessionReferenceContent(content)
@@ -240,6 +269,20 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		source["clientTimeZone"] = canonical
 	}
 	job := &queuedPrompt{id: newID("msg"), text: text, content: content, source: source}
+	_, _, receiptIDs, resolveErr := e.resolvePromptFiles(id, req.Content)
+	if resolveErr != nil {
+		return nil, nil, resolveErr
+	}
+	requestID, _ := source["rpcId"].(string)
+	if len(receiptIDs) > 0 && requestID == "" {
+		requestID = job.id
+		source["rpcId"] = requestID
+	}
+	binding, bindErr := e.bindFileReceipts(id, receiptIDs, requestID)
+	if bindErr != nil {
+		return nil, nil, bindErr
+	}
+	defer binding.close()
 	if prepared.AdditionalContext != nil {
 		job.additionalContexts = []SessionReferenceContext{*prepared.AdditionalContext}
 	}
@@ -281,6 +324,7 @@ func (e *Engine) enqueuePromptFrom(ctx context.Context, id string, req PromptReq
 		s.mu.Unlock()
 		return nil, nil, err
 	}
+	binding.commit()
 	if req.Mode == "steer" {
 		s.steering = append(s.steering, job)
 		s.mu.Unlock()
@@ -821,21 +865,42 @@ func interruptedAssistantContent(deltas []Delta) ([]ContentBlock, map[string]any
 	return content, usage
 }
 
-func (e *Engine) appendInterruptedAssistantMessage(s *Session, turn, step, stepStartSeq int, selection ModelSelection, deltas []Delta) error {
+func (e *Engine) appendInterruptedAssistantMessage(s *Session, turn, step int, selection ModelSelection, deltas []Delta, attempt *assistantAttempt) error {
 	content, usage := interruptedAssistantContent(deltas)
 	if len(content) == 0 {
+		attempt.abandon()
 		return nil
 	}
 	assistant := map[string]any{
 		"id": newID("msg"), "role": "assistant", "content": content,
 		"source": map[string]any{"kind": "model", "provider": selection.Provider, "model": selection.Model},
 	}
-	message := map[string]any{"turn": turn, "step": step, "message": assistant, "interrupted": true}
+	message := map[string]any{"turn": turn, "step": step, "message": assistant, "interrupted": true, "stream": attempt.stream()}
 	if len(usage) > 0 {
 		message["usage"] = usage
 	}
-	_, err := e.appendEvent(s, "assistant/message", message, successfulAttemptChunkSeqs(s, turn, step, stepStartSeq)...)
-	return err
+	event, err := e.appendEvent(s, "assistant/message", message)
+	if err != nil {
+		attempt.abandon()
+		return err
+	}
+	attempt.settle(event)
+	return nil
+}
+
+func (e *Engine) appendFailedAssistantAttempt(s *Session, turn, step int, attempt *assistantAttempt) error {
+	stream := attempt.stream()
+	if len(stream) == 0 {
+		attempt.abandon()
+		return nil
+	}
+	event, err := e.appendEvent(s, "assistant/attempt", map[string]any{"turn": turn, "step": step, "stream": stream})
+	if err != nil {
+		attempt.abandon()
+		return err
+	}
+	attempt.settle(event)
+	return nil
 }
 
 func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output string, resultErr error) {
@@ -928,7 +993,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		if changed, _ := e.compactForPressure(ctx, s, turn, selection, system, tools); changed {
 			messages = e.durableMessages(s, turn)
 		}
-		stepStart, err := e.appendEvent(s, "step/start", map[string]any{"turn": turn, "step": step})
+		_, err = e.appendEvent(s, "step/start", map[string]any{"turn": turn, "step": step})
 		if err != nil {
 			return "", err
 		}
@@ -940,6 +1005,20 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		}
 		messages = e.durableMessages(s, turn)
 		messages = e.dynamicCordisReferenceMessages(s.Header.ID, messages, agentRuntime)
+		if previous, ok := latestLoggedModelSnapshot(s); ok &&
+			(previous.Provider != selection.Provider || previous.Model != selection.Model) {
+			from, to := modelRouteLabel(previous, selection), modelRouteLabel(selection, previous)
+			notice := map[string]any{
+				"id": newID("msg"), "role": "user",
+				"content": []ContentBlock{{Type: "text", Text: fmt.Sprintf("[model changed: assistant turns above this point were generated by %s; the session continues with %s]", from, to)}},
+				"source":  map[string]any{"kind": "plugin", "plugin": "model-selection", "form": "notice", "summary": from + " → " + to},
+			}
+			if _, err := e.appendEvent(s, "user/message", notice); err != nil {
+				return "", err
+			}
+			messages = e.durableMessages(s, turn)
+			messages = e.dynamicCordisReferenceMessages(s.Header.ID, messages, agentRuntime)
+		}
 		header := map[string]any{"config": config}
 		if system != "" {
 			header["system"] = system
@@ -958,6 +1037,7 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		e.startPendingSessionTitle(s, SessionTitleModelProvenance{Provider: routeProvider, Model: selection.Model})
 		var completion Completion
 		var streamed []Delta
+		var activeAttempt *assistantAttempt
 		overflowRetries := 0
 		compactionPolicy := compactionPolicyFor(agentRuntime.compactionConfig, ModelSelection{Provider: routeProvider, Model: selection.Model})
 		for {
@@ -967,39 +1047,25 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 				SessionID: s.Header.ID, Model: selection.Model, System: system, Messages: requestMessages, Tools: tools,
 				Thinking: thinking, ReasoningEffort: effort, Temperature: selection.Temperature, MaxTokens: maxTokens,
 			}
-			completion, streamed, err = e.completeWithRetrySink(ctx, provider, request, s, turn, step, func(delta Delta) error {
-				if delta.Text != "" {
-					_, err := e.appendEvent(s, "assistant/chunk", map[string]any{"turn": turn, "step": step, "chunk": map[string]any{"type": "text-delta", "index": 0, "text": delta.Text}})
-					if err != nil {
-						return err
-					}
-				}
-				if delta.Reasoning != "" {
-					_, err := e.appendEvent(s, "assistant/chunk", map[string]any{"turn": turn, "step": step, "chunk": map[string]any{"type": "reasoning-delta", "index": 0, "text": delta.Reasoning}})
-					if err != nil {
-						return err
-					}
-				}
-				for _, call := range delta.ToolCalls {
-					_, err := e.appendEvent(s, "assistant/chunk", map[string]any{"turn": turn, "step": step, "chunk": map[string]any{"type": "tool-call-delta", "index": call.Index, "id": call.ID, "name": call.Name, "argumentsDelta": call.ArgumentsDelta}})
-					if err != nil {
-						return err
-					}
-				}
-				if len(delta.Usage) > 0 {
-					if _, err := e.appendEvent(s, "assistant/chunk", map[string]any{
-						"turn": turn, "step": step, "chunk": map[string]any{"type": "usage", "usage": delta.Usage},
-					}); err != nil {
-						return err
-					}
-				}
+			completion, streamed, err = e.completeWithRetrySink(ctx, provider, request, s, turn, step, func() error {
+				activeAttempt = e.beginAssistantAttempt(s, turn, step)
 				return nil
+			}, func(delta Delta) error {
+				return activeAttempt.pushDelta(delta)
+			}, func(_ []Delta, _ error) error {
+				appendErr := e.appendFailedAssistantAttempt(s, turn, step, activeAttempt)
+				activeAttempt = nil
+				return appendErr
 			})
 			if err == nil {
 				break
 			}
 			failure := retryFailure(err)
 			if failure.Code == "CONTEXT_WINDOW_EXCEEDED" && agentRuntime.compactionEnabled && agentRuntime.compactionAuto && overflowRetries < compactionPolicy.MaxOverflowRetries && ctx.Err() == nil {
+				if appendErr := e.appendFailedAssistantAttempt(s, turn, step, activeAttempt); appendErr != nil {
+					return "", appendErr
+				}
+				activeAttempt = nil
 				changed, _ := e.compactForOverflow(ctx, s, turn, selection, system, tools)
 				if changed && ctx.Err() == nil {
 					overflowRetries++
@@ -1009,10 +1075,12 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 			}
 			reason := map[string]any{"kind": "error", "error": retryFailurePayload(failure)}
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, ErrEngineClosed) {
-				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, int(stepStart.Seq), selection, streamed); appendErr != nil {
+				if appendErr := e.appendInterruptedAssistantMessage(s, turn, step, selection, streamed, activeAttempt); appendErr != nil {
 					return "", appendErr
 				}
 				reason = turnAbortReason(ctx)
+			} else if appendErr := e.appendFailedAssistantAttempt(s, turn, step, activeAttempt); appendErr != nil {
+				return "", appendErr
 			}
 			e.closeOpenTurn(s, turn, reason)
 			return "", err
@@ -1039,15 +1107,21 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 		for _, call := range toolCalls {
 			content = append(content, ContentBlock{Type: "tool-call", ID: call.ID, Name: call.Name, Arguments: string(call.Arguments)})
 		}
-		assistant := map[string]any{"id": newID("msg"), "role": "assistant", "content": content, "source": map[string]any{"kind": "model", "provider": selection.Provider, "model": selection.Model}}
-		message := map[string]any{"turn": turn, "step": step, "message": assistant}
+		source := map[string]any{"kind": "model", "provider": selection.Provider, "model": selection.Model}
+		if replayState := piAIReplayState(selection, completion, content, finish); replayState != nil {
+			source["replayState"] = replayState
+		}
+		assistant := map[string]any{"id": newID("msg"), "role": "assistant", "content": content, "source": source}
+		message := map[string]any{"turn": turn, "step": step, "message": assistant, "stream": activeAttempt.stream()}
 		if len(completion.Usage) > 0 {
 			message["usage"] = completion.Usage
 		}
-		chunkSeqs := successfulAttemptChunkSeqs(s, turn, step, int(stepStart.Seq))
-		if _, err := e.appendEvent(s, "assistant/message", message, chunkSeqs...); err != nil {
+		assistantEvent, err := e.appendEvent(s, "assistant/message", message)
+		if err != nil {
+			activeAttempt.abandon()
 			return "", err
 		}
+		activeAttempt.settle(assistantEvent)
 		lastText = text
 		if finish == "length" {
 			if _, err := e.appendEvent(s, "step/end", map[string]any{"turn": turn, "step": step}); err != nil {
@@ -1110,6 +1184,19 @@ func (e *Engine) runTurnSync(ctx context.Context, s *Session, turn int) (output 
 	err = fmt.Errorf("agent: maximum tool steps (%d) exceeded", maxToolSteps)
 	e.closeOpenTurn(s, turn, map[string]any{"kind": "error", "error": map[string]any{"message": err.Error(), "code": "MAX_STEPS"}})
 	return "", err
+}
+
+func latestLoggedModelSnapshot(s *Session) (ModelSelection, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return latestLoggedModel(s.Events)
+}
+
+func modelRouteLabel(route, other ModelSelection) string {
+	if route.Provider == other.Provider {
+		return route.Model
+	}
+	return route.Provider + "/" + route.Model
 }
 
 func (e *Engine) claimSteering(s *Session) []*queuedPrompt {

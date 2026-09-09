@@ -18,7 +18,7 @@ import (
 )
 
 func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
-	if piAICatalogPackageVersion != "0.84.2" || piAICatalogManifestHash != "012f19b2e2c92706bc700f4c9dd80a21f1f43d68959bc90c78d2cdb51374d5cc" {
+	if piAICatalogPackageVersion != "0.85.1" || piAICatalogManifestHash != "ff87cfcb3c1decb7ceeb4a5d71282696e108d093b7098f372d6f8a442dfed40d" {
 		t.Fatalf("catalog gate = %s %s", piAICatalogPackageVersion, piAICatalogManifestHash)
 	}
 	models := 0
@@ -29,7 +29,7 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 			byAPI[model.API]++
 		}
 	}
-	if len(piAICatalog) != 40 || models != 1267 {
+	if len(piAICatalog) != 40 || models != 1354 {
 		t.Fatalf("catalog size = %d providers, %d models", len(piAICatalog), models)
 	}
 	wantUnsupported := []string{}
@@ -37,9 +37,9 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 		t.Fatalf("unsupported protocols = %#v", piAIUnsupportedCatalogProtocols)
 	}
 	wantByAPI := map[string]int{
-		"anthropic-messages": 280, "azure-openai-responses": 38, "bedrock-converse-stream": 114,
-		"google-generative-ai": 28, "google-vertex": 13, "mistral-conversations": 31,
-		"openai-codex-responses": 7, "openai-completions": 644, "openai-responses": 112,
+		"anthropic-messages": 325, "azure-openai-responses": 39, "bedrock-converse-stream": 121,
+		"google-generative-ai": 29, "google-vertex": 14, "mistral-conversations": 32,
+		"openai-codex-responses": 8, "openai-completions": 679, "openai-responses": 107,
 	}
 	if !reflect.DeepEqual(byAPI, wantByAPI) {
 		t.Fatalf("catalog APIs = %#v", byAPI)
@@ -74,9 +74,9 @@ func TestPiAICatalogMatchesPinnedUpstream(t *testing.T) {
 		t.Fatalf("opencode/gpt-5.5 compat = %#v", opencode.Models[index].Compat)
 	}
 	fireworks := piAICatalog["fireworks"]
-	index = slices.IndexFunc(fireworks.Models, func(model piAIModel) bool { return model.ID == "accounts/fireworks/models/deepseek-v4-flash" })
+	index = slices.IndexFunc(fireworks.Models, func(model piAIModel) bool { return model.ID == "accounts/fireworks/models/deepseek-v4-flash-0731" })
 	if index < 0 {
-		t.Fatal("catalog is missing fireworks/deepseek-v4-flash")
+		t.Fatal("catalog is missing fireworks/deepseek-v4-flash-0731")
 	}
 	if fireworks.Models[index].Compat.SendSessionAffinityHeaders == nil || !*fireworks.Models[index].Compat.SendSessionAffinityHeaders || fireworks.Models[index].Compat.SupportsCacheControlOnTools == nil || *fireworks.Models[index].Compat.SupportsCacheControlOnTools {
 		t.Fatalf("fireworks/deepseek-v4-flash compat = %#v", fireworks.Models[index].Compat)
@@ -156,6 +156,54 @@ func TestPiAIAlphaCompletionsCompatFields(t *testing.T) {
 	}
 }
 
+func TestPiAI0851CompatFieldsAndWire(t *testing.T) {
+	priority := -2
+	profile, err := resolvePiAIProfile("private-vllm", map[string]any{
+		"api": "openai-completions", "baseURL": "https://example.test/v1",
+		"thinkingBudgets": map[string]any{"high": 4096},
+		"models": []any{map[string]any{
+			"id": "reasoning-local", "maxTokens": 8192,
+			"reasoningEfforts": map[string]any{"off": "off", "high": "provider-high"},
+			"compat": map[string]any{
+				"thinkingFormat": "chat-template", "thinkingTokenBudgetField": "thinking_budget_tokens", "vllmPriority": priority,
+				"chatTemplateKwargs": map[string]any{"budget": map[string]any{"$var": "thinking.budget"}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := profile.models[0]
+	if model.Compat.ThinkingTokenBudgetField != "thinking_budget_tokens" || model.Compat.VLLMPriority == nil || *model.Compat.VLLMPriority != priority {
+		t.Fatalf("compat = %#v", model.Compat)
+	}
+	body := map[string]any{}
+	compat := resolveOpenAICompletionsCompat(profile.route, "https://example.test/v1", model)
+	applyOpenAICompletionsReasoning(body, model, compat, ChatRequest{ReasoningEffort: "high", MaxTokens: 8192}, profile.thinkingBudgets)
+	kwargs, _ := body["chat_template_kwargs"].(map[string]any)
+	if kwargs["budget"] != 4096 {
+		t.Fatalf("chat template budget = %#v", body)
+	}
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	provider := NewOpenAIProvider("private-vllm", server.URL, "key", model.ID)
+	provider.modelSpec = model
+	provider.thinkingBudgets = profile.thinkingBudgets
+	if _, err := provider.Complete(t.Context(), ChatRequest{ReasoningEffort: "high", MaxTokens: 8192}, func(Delta) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if request["thinking_budget_tokens"] != float64(4096) || request["priority"] != float64(priority) {
+		t.Fatalf("vLLM request = %#v", request)
+	}
+}
+
 func TestPiAICompatRejectsWithheldEmptyAndInvalidKwargs(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -165,10 +213,12 @@ func TestPiAICompatRejectsWithheldEmptyAndInvalidKwargs(t *testing.T) {
 		{name: "withheld", compat: map[string]any{"sessionAffinityFormat": "openai"}, want: "not configurable"},
 		{name: "withheld additional tools", compat: map[string]any{"supportsAdditionalTools": true}, want: "not configurable"},
 		{name: "empty", compat: map[string]any{"supportsStore": nil}, want: "with no value"},
-		{name: "variable", compat: map[string]any{"chatTemplateKwargs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled or thinking.effort"},
-		{name: "argument variable", compat: map[string]any{"chatTemplateArgs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled or thinking.effort"},
+		{name: "variable", compat: map[string]any{"chatTemplateKwargs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled, thinking.effort, or thinking.budget"},
+		{name: "argument variable", compat: map[string]any{"chatTemplateArgs": map[string]any{"thinking": map[string]any{"$var": "unknown"}}}, want: "thinking.enabled, thinking.effort, or thinking.budget"},
 		{name: "finish reason type", compat: map[string]any{"supportsFinishReason": "no"}, want: "must be boolean"},
 		{name: "thinking budget type", compat: map[string]any{"supportsThinkingTokenBudget": "yes"}, want: "must be boolean"},
+		{name: "thinking budget field", compat: map[string]any{"thinkingTokenBudgetField": "unknown"}, want: "unsupported"},
+		{name: "vllm priority fraction", compat: map[string]any{"vllmPriority": 0.5}, want: "must be an integer"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := resolvePiAIProfile("custom", map[string]any{
@@ -210,6 +260,23 @@ func TestPiAIReasoningEffortMapping(t *testing.T) {
 	model.ThinkingLevelMap = levels
 	if piAIModelSupportsReasoning(model, "off") {
 		t.Fatalf("omitted off level was reported supported: %#v", levels)
+	}
+}
+
+func TestPiAICatalogRetainsProviderOwnedAnthropicCompat(t *testing.T) {
+	models := piAICatalog["anthropic"].Models
+	foundMidConvo := false
+	foundFallback := false
+	for _, model := range models {
+		if model.Compat.SupportsMidConvoEffort != nil && *model.Compat.SupportsMidConvoEffort {
+			foundMidConvo = true
+		}
+		if len(model.Compat.AllowedFallbackModels) > 0 {
+			foundFallback = true
+		}
+	}
+	if !foundMidConvo || !foundFallback {
+		t.Fatalf("Anthropic catalog compat: mid-conversation=%v fallback=%v", foundMidConvo, foundFallback)
 	}
 }
 

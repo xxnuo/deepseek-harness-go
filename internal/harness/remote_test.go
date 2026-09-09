@@ -37,7 +37,7 @@ func TestTypertRemoteCommandsAndProtocol(t *testing.T) {
 	}
 
 	status, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/clear", "images": []any{}},
+		"args": map[string]any{"agentId": id, "line": "/clear", "submittedAttachments": []any{}},
 	})
 	execution, ok := remoteValue(t, envelope).(map[string]any)
 	if status != http.StatusOK || !ok || execution["commandId"] == "" {
@@ -52,7 +52,7 @@ func TestTypertRemoteCommandsAndProtocol(t *testing.T) {
 	}
 
 	_, envelope = postRPC(t, server.Client(), server.URL, "", "commands/execute", map[string]any{
-		"args": map[string]any{"agentId": id, "line": "/unknown", "images": []any{}},
+		"args": map[string]any{"agentId": id, "line": "/unknown", "submittedAttachments": []any{}},
 	})
 	result := rpcResult(t, envelope)
 	if result["ok"] != true {
@@ -66,6 +66,108 @@ func TestTypertRemoteCommandsAndProtocol(t *testing.T) {
 	result = rpcResult(t, envelope)
 	if result["ok"] != false {
 		t.Fatalf("malformed Remote payload = %#v", result)
+	}
+}
+
+func TestTypertRemoteCoreControllerBridges(t *testing.T) {
+	e := newIntegrationEngine(t)
+	server := httptest.NewServer(e.Handler())
+	t.Cleanup(server.Close)
+	call := func(method string, args map[string]any) any {
+		t.Helper()
+		status, envelope := postRPC(t, server.Client(), server.URL, "", method, map[string]any{"args": args})
+		if status != http.StatusOK {
+			t.Fatalf("%s status = %d", method, status)
+		}
+		return remoteValue(t, envelope)
+	}
+
+	created := call("session/create", map[string]any{"request": map[string]any{
+		"cwd": e.Config().Workspace, "sessionId": "remote-core-session",
+	}}).(map[string]any)
+	if created["sessionId"] != "remote-core-session" {
+		t.Fatalf("session/create = %#v", created)
+	}
+	listed := call("session/list", map[string]any{"_request": map[string]any{}}).(map[string]any)
+	if items, ok := listed["items"].([]any); !ok || len(items) != 1 {
+		t.Fatalf("session/list = %#v", listed)
+	}
+	renamed := call("session/rename", map[string]any{"request": map[string]any{
+		"sessionId": "remote-core-session", "title": "Remote bridge",
+	}}).(map[string]any)
+	if renamed["title"] != "Remote bridge" {
+		t.Fatalf("session/rename = %#v", renamed)
+	}
+	page := call("session/page", map[string]any{"request": map[string]any{
+		"sessionId": "remote-core-session", "beforeSeq": -1, "maxMessages": 50,
+	}}).(map[string]any)
+	if _, ok := page["events"].([]any); !ok {
+		t.Fatalf("session/page = %#v", page)
+	}
+	catalog := call("session/modelCatalog", map[string]any{}).(map[string]any)
+	if catalog["default"] == nil || catalog["routableProviders"] == nil || catalog["groups"] == nil {
+		t.Fatalf("session/modelCatalog = %#v", catalog)
+	}
+	if providers, ok := call("llm/listProviders", map[string]any{}).([]any); !ok || len(providers) == 0 {
+		t.Fatalf("llm/listProviders = %#v", providers)
+	}
+	if providers, ok := call("llm/listConfigurableProviders", map[string]any{}).([]any); !ok {
+		t.Fatalf("llm/listConfigurableProviders = %#v", providers)
+	}
+	settings := call("settings/describe", map[string]any{}).(map[string]any)
+	if settings["namespaces"] == nil {
+		t.Fatalf("settings/describe = %#v", settings)
+	}
+	credentials := call("credentials/describe", map[string]any{"refs": []any{}}).(map[string]any)
+	if len(credentials) != 0 {
+		t.Fatalf("credentials/describe = %#v", credentials)
+	}
+	skills := call("skills/list", map[string]any{"request": map[string]any{"sessionId": "remote-core-session"}}).(map[string]any)
+	if skills["skills"] == nil {
+		t.Fatalf("skills/list = %#v", skills)
+	}
+}
+
+func TestTypertRemoteAgentTeamBridge(t *testing.T) {
+	e := newAgentTeamEngine(t, t.TempDir())
+	t.Cleanup(func() { _ = e.Close() })
+	root, err := e.CreateSession(t.Context(), e.Config().Workspace, "remote-team-root", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(endpoint string, args map[string]any) any {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"args": args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, present, rpcErr := e.dispatchRemote(t.Context(), endpoint, raw)
+		if rpcErr != nil || !present {
+			t.Fatalf("%s = %#v, present=%v, err=%v", endpoint, value, present, rpcErr)
+		}
+		return value
+	}
+	created := call("agentTeams/createTask", map[string]any{
+		"agentId": root,
+		"request": map[string]any{"subject": "Remote task", "description": "Bridge coverage"},
+	}).(map[string]any)
+	if created["ok"] != true {
+		t.Fatalf("agentTeams/createTask = %#v", created)
+	}
+	view := call("agentTeams/view", map[string]any{"agentId": root}).(map[string]any)
+	if members, ok := view["members"].([]TeamMemberView); !ok || len(members) != 1 {
+		t.Fatalf("agentTeams/view members = %#v", view["members"])
+	}
+	if tasks, ok := view["tasks"].([]TeamTaskView); !ok || len(tasks) != 1 {
+		t.Fatalf("agentTeams/view tasks = %#v", view["tasks"])
+	}
+	task := created["value"].(TeamTaskView)
+	conflict := call("agentTeams/updateTask", map[string]any{
+		"agentId": root,
+		"request": map[string]any{"taskId": task.ID, "expectedRevision": 0, "action": "claim"},
+	}).(map[string]any)
+	if conflict["ok"] != false || conflict["error"].(map[string]any)["code"] != "team-task-conflict" {
+		t.Fatalf("agentTeams/updateTask = %#v", conflict)
 	}
 }
 
@@ -205,20 +307,13 @@ func TestTypertRemoteMessageFeedbackPersistsAcrossEngineReload(t *testing.T) {
 		e.Close()
 		t.Fatalf("put = %#v", result)
 	}
-	stored, err := os.ReadFile(filepath.Join(dir, "storages", "message_feedback.json"))
-	if err != nil {
+	s.mu.Lock()
+	feedbackEvent := s.Events[len(s.Events)-1]
+	s.mu.Unlock()
+	if feedbackEvent.Type != "feedback/message-put" {
 		server.Close()
 		e.Close()
-		t.Fatal(err)
-	}
-	var document struct {
-		Unit   map[string]any            `json:"unit"`
-		Tables map[string]map[string]any `json:"tables"`
-	}
-	if json.Unmarshal(stored, &document) != nil || document.Unit["name"] != "message_feedback" || document.Tables["sessions"][id] == nil {
-		server.Close()
-		e.Close()
-		t.Fatalf("feedback storage document = %s", stored)
+		t.Fatalf("feedback event = %#v", feedbackEvent)
 	}
 	server.Close()
 	if err := e.Close(); err != nil {
@@ -239,6 +334,30 @@ func TestTypertRemoteMessageFeedbackPersistsAcrossEngineReload(t *testing.T) {
 	items := listed["value"].(map[string]any)["items"].([]any)
 	if len(items) != 1 || items[0].(map[string]any)["messageId"] != "msg-persist" {
 		t.Fatalf("reloaded feedback = %#v", listed)
+	}
+	current := items[0].(map[string]any)
+	_, envelope = postRPC(t, server.Client(), server.URL, "", "messageFeedback/put", map[string]any{
+		"args": map[string]any{"request": map[string]any{
+			"sessionId": id, "messageId": "msg-persist", "rating": "negative", "note": "cold edit", "ifVersion": current["version"],
+		}},
+	})
+	edited := remoteValue(t, envelope).(map[string]any)
+	if edited["ok"] != true {
+		t.Fatalf("cold edit = %#v", edited)
+	}
+	_, envelope = postRPC(t, server.Client(), server.URL, "", "messageFeedback/delete", map[string]any{
+		"args": map[string]any{"request": map[string]any{
+			"sessionId": id, "messageId": "msg-persist", "ifVersion": edited["value"].(map[string]any)["version"],
+		}},
+	})
+	if deleted := remoteValue(t, envelope).(map[string]any); deleted["ok"] != true {
+		t.Fatalf("cold delete = %#v", deleted)
+	}
+	cold, _ := reloaded.getSession(id)
+	cold.mu.Lock()
+	defer cold.mu.Unlock()
+	if cold.attached || len(cold.Events) < 4 || cold.Events[len(cold.Events)-2].Type != "feedback/message-put" || cold.Events[len(cold.Events)-1].Type != "feedback/message-delete" {
+		t.Fatalf("cold feedback lifecycle = attached:%v events:%#v", cold.attached, cold.Events)
 	}
 }
 

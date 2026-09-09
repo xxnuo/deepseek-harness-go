@@ -607,7 +607,7 @@ func (e *Engine) dispatch(ctx context.Context, method string, raw json.RawMessag
 		return map[string]any{"sessionId": sid}, nil
 	case "session.updateQueue":
 		if id, _ := p["sessionId"].(string); id != "" {
-			if _, fenceErr := e.requireOrdinary(id); fenceErr != nil {
+			if _, fenceErr := e.requireQueueMutable(id); fenceErr != nil {
 				return nil, fenceErr
 			}
 		}
@@ -1266,10 +1266,14 @@ func (e *Engine) forkSessionAtFrom(ctx context.Context, id string, atSeq *int, c
 			return "", appendErr
 		}
 	}
+	seedBoundary := len(s.Events)
+	if _, appendErr := e.appendEvent(s, "session/end-seed", map[string]any{"inherited": true}); appendErr != nil {
+		return "", appendErr
+	}
 	s.mu.Lock()
-	s.Header.SeedLength = len(s.Events)
+	s.Header.SeedLength = seedBoundary
 	s.Header.IsSeeded = true
-	s.InheritedEventCount = SessionLogOffset(len(s.Events))
+	s.InheritedEventCount = SessionLogOffset(seedBoundary)
 	s.mu.Unlock()
 	goal, hasGoal, goalErr := foldGoalState(events)
 	if goalErr != nil {

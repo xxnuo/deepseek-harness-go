@@ -3,6 +3,7 @@ package harness
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,7 +39,7 @@ func (e *Engine) ExportSessionZIP(id string, includeDescendants bool, w io.Write
 	entries := []struct {
 		id   string
 		path string
-	}{{id: id, path: "session.jsonl"}}
+	}{{id: id, path: "session.v2.jsonl"}}
 	if includeDescendants {
 		// Do not hold the Engine lock while reading Session headers. Persistence
 		// takes the same locks in Engine -> Session order.
@@ -77,19 +78,20 @@ func (e *Engine) ExportSessionZIP(id string, includeDescendants bool, w io.Write
 				entries = append(entries, struct {
 					id   string
 					path string
-				}{id: child, path: "subagents/" + safeExportSegment(child) + "/session.jsonl"})
+				}{id: child, path: "subagents/" + safeExportSegment(child) + "/session.v2.jsonl"})
 				walk(child)
 			}
 		}
 		walk(id)
 	}
 	media := map[string]ImageAttachmentRef{}
+	files := map[string]FileAttachmentRef{}
 	for _, entry := range entries {
 		data, err := e.sessionJSONL(entry.id)
 		if err != nil {
 			return err
 		}
-		collectExportImageRefs(data, media)
+		collectExportAttachmentRefs(data, media, files)
 	}
 	zw := zip.NewWriter(w)
 	for _, entry := range entries {
@@ -130,13 +132,36 @@ func (e *Engine) ExportSessionZIP(id string, includeDescendants bool, w io.Write
 			return err
 		}
 	}
+	fileIDs := make([]string, 0, len(files))
+	for id := range files {
+		fileIDs = append(fileIDs, id)
+	}
+	sort.Strings(fileIDs)
+	for _, id := range fileIDs {
+		ref := files[id]
+		data, err := e.readFileAttachment(context.Background(), ref)
+		if err != nil {
+			_ = zw.Close()
+			return err
+		}
+		digest := strings.TrimPrefix(ref.AttachmentID, "sha256:")
+		file, err := zw.CreateHeader(&zip.FileHeader{Name: "files/" + digest[:2] + "/" + digest + "/" + fileAttachmentName(ref.Name), Method: zip.Deflate})
+		if err != nil {
+			_ = zw.Close()
+			return err
+		}
+		if _, err := file.Write(data); err != nil {
+			_ = zw.Close()
+			return err
+		}
+	}
 	if err := zw.Close(); err != nil {
 		return fmt.Errorf("close session archive: %w", err)
 	}
 	return nil
 }
 
-func collectExportImageRefs(data []byte, refs map[string]ImageAttachmentRef) {
+func collectExportAttachmentRefs(data []byte, images map[string]ImageAttachmentRef, files map[string]FileAttachmentRef) {
 	var lines = strings.Split(string(data), "\n")
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
@@ -146,27 +171,35 @@ func collectExportImageRefs(data []byte, refs map[string]ImageAttachmentRef) {
 		if json.Unmarshal([]byte(line), &value) != nil {
 			continue
 		}
-		collectExportImageValue(value, refs)
+		collectExportAttachmentValue(value, images, files)
 	}
 }
 
-func collectExportImageValue(value any, refs map[string]ImageAttachmentRef) {
+func collectExportAttachmentValue(value any, images map[string]ImageAttachmentRef, files map[string]FileAttachmentRef) {
 	switch value := value.(type) {
 	case map[string]any:
 		if blockType, _ := value["type"].(string); blockType == "image" {
 			if raw, ok := value["attachment"].(map[string]any); ok {
 				var ref ImageAttachmentRef
 				if data, err := json.Marshal(raw); err == nil && json.Unmarshal(data, &ref) == nil && ref.AttachmentID != "" {
-					refs[ref.AttachmentID] = ref
+					images[ref.AttachmentID] = ref
+				}
+			}
+		}
+		if blockType, _ := value["type"].(string); blockType == "file" {
+			if raw, ok := value["attachment"].(map[string]any); ok {
+				var ref FileAttachmentRef
+				if data, err := json.Marshal(raw); err == nil && json.Unmarshal(data, &ref) == nil && ref.AttachmentID != "" {
+					files[ref.AttachmentID+"\x00"+ref.Name] = ref
 				}
 			}
 		}
 		for _, child := range value {
-			collectExportImageValue(child, refs)
+			collectExportAttachmentValue(child, images, files)
 		}
 	case []any:
 		for _, child := range value {
-			collectExportImageValue(child, refs)
+			collectExportAttachmentValue(child, images, files)
 		}
 	}
 }

@@ -413,6 +413,12 @@ func eventInt(value any) int {
 		return int(number)
 	case float64:
 		return int(number)
+	case json.Number:
+		value, err := number.Int64()
+		if err == nil {
+			return int(value)
+		}
+		return -1
 	default:
 		return -1
 	}
@@ -437,7 +443,7 @@ func (e *Engine) retryPolicyFor(provider Provider) RetryPolicy {
 // invoked for every streamed delta, including failed attempts; callers must
 // only use the returned completion to build a durable assistant message.
 func (e *Engine) completeWithRetry(ctx context.Context, provider Provider, request ChatRequest, session *Session, turn, step int) (Completion, []Delta, error) {
-	return e.completeWithRetrySink(ctx, provider, request, session, turn, step, nil)
+	return e.completeWithRetrySink(ctx, provider, request, session, turn, step, nil, nil, nil)
 }
 
 func cloneContentBlocks(blocks []ContentBlock) []ContentBlock {
@@ -450,6 +456,10 @@ func cloneContentBlocks(blocks []ContentBlock) []ContentBlock {
 		if cloned[index].Attachment != nil {
 			attachment := *cloned[index].Attachment
 			cloned[index].Attachment = &attachment
+		}
+		if cloned[index].FileAttachment != nil {
+			attachment := *cloned[index].FileAttachment
+			cloned[index].FileAttachment = &attachment
 		}
 	}
 	return cloned
@@ -481,7 +491,7 @@ func cloneChatRequest(request ChatRequest) ChatRequest {
 	return clone
 }
 
-func (e *Engine) completeWithRetrySink(ctx context.Context, provider Provider, request ChatRequest, session *Session, turn, step int, onDelta func(Delta) error) (Completion, []Delta, error) {
+func (e *Engine) completeWithRetrySink(ctx context.Context, provider Provider, request ChatRequest, session *Session, turn, step int, onAttemptStart func() error, onDelta func(Delta) error, onRetryFailure func([]Delta, error) error) (Completion, []Delta, error) {
 	if provider == nil {
 		return Completion{}, nil, errors.New("model-unavailable")
 	}
@@ -503,6 +513,11 @@ func (e *Engine) completeWithRetrySink(ctx context.Context, provider Provider, r
 		e.mu.RUnlock()
 		if closed {
 			return Completion{}, nil, ErrEngineClosed
+		}
+		if onAttemptStart != nil {
+			if err := onAttemptStart(); err != nil {
+				return Completion{}, nil, err
+			}
 		}
 		deltas := make([]Delta, 0, 8)
 		completion, err := provider.Complete(ctx, cloneChatRequest(request), func(delta Delta) error {
@@ -539,6 +554,11 @@ func (e *Engine) completeWithRetrySink(ctx context.Context, provider Provider, r
 			return Completion{}, nil, err
 		}
 		retry = next
+		if onRetryFailure != nil {
+			if appendErr := onRetryFailure(deltas, err); appendErr != nil {
+				return Completion{}, nil, appendErr
+			}
+		}
 		if session != nil {
 			data := map[string]any{
 				"retryId": retryID, "turn": turn, "step": step,

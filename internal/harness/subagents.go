@@ -305,7 +305,7 @@ func (e *Engine) SendAdjacentAgentMessage(ctx context.Context, senderID, targetI
 	if !attached || draining {
 		return "", errors.New("subagent-unauthorized: send_message requires an exact live sender")
 	}
-	framed := append([]ContentBlock{{Type: "text", Text: "Agent " + senderID + " sent a message:"}}, cloneContentBlocks(content)...)
+	framed := append([]ContentBlock{{Type: "text", Text: "Agent " + senderID + " sent a message: "}}, cloneContentBlocks(content)...)
 	source := map[string]any{"kind": "agent-message", "form": "relay", "senderSessionId": senderID}
 
 	if _, rpcErr := e.childFor(senderID, targetID); rpcErr == nil {
@@ -531,4 +531,27 @@ func (e *Engine) requireOrdinary(id string) (*Session, *RPCError) {
 		return nil, ordinarySessionError(s)
 	}
 	return s, nil
+}
+
+func (e *Engine) requireQueueMutable(id string) (*Session, *RPCError) {
+	s, err := e.getSession(id)
+	if err != nil {
+		return nil, errorToRPC(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Header.Origin != "subagent" {
+		return s, nil
+	}
+	for _, event := range s.Events {
+		if event.Type != "subagent/descriptor" {
+			continue
+		}
+		descriptor, supported, parseErr := parseSubagentDescriptor(event.Data)
+		if parseErr == nil && supported && descriptor.Mode == "continuable" && int(event.Seq) >= int(s.InheritedEventCount) {
+			return s, nil
+		}
+		break
+	}
+	return nil, ordinarySessionError(s)
 }

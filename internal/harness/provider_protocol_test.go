@@ -96,6 +96,16 @@ func TestOpenAIResponsesProviderWireAndStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesCompatCanOmitMaxOutputTokens(t *testing.T) {
+	disabled := false
+	provider := NewOpenAIResponsesProvider("test", "https://example.test/v1", "key", "model")
+	provider.modelSpec = piAIModel{ID: "model", Compat: piAIModelCompat{SupportsMaxOutputTokens: &disabled}}
+	body := provider.requestBody(ChatRequest{MaxTokens: 1234})
+	if _, exists := body["max_output_tokens"]; exists {
+		t.Fatalf("request body retained disabled max_output_tokens: %#v", body)
+	}
+}
+
 func TestAnthropicProviderWireAndStream(t *testing.T) {
 	var request map[string]any
 	var requestHeader http.Header

@@ -61,11 +61,13 @@ var piAICompatProtocolFields = map[string]map[string]bool{
 		"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
 		"requiresReasoningContentOnAssistantMessages": true, "thinkingFormat": true,
 		"chatTemplateKwargs": true, "chatTemplateArgs": true, "supportsThinkingTokenBudget": true,
+		"thinkingTokenBudgetField": true, "vllmPriority": true,
 		"supportsStrictMode": true, "cacheControlFormat": true,
 		"supportsLongCacheRetention": true,
 	},
 	"openai-responses": {
 		"supportsDeveloperRole": true, "supportsStrictMode": true, "supportsLongCacheRetention": true,
+		"supportsMaxOutputTokens": true,
 	},
 	"azure-openai-responses": {
 		"supportsDeveloperRole": true, "supportsStrictMode": true, "supportsLongCacheRetention": true,
@@ -87,6 +89,7 @@ var piAIWithheldCompatFields = map[string]bool{
 	"deferredToolsMode": true, "sessionAffinityFormat": true, "supportsToolSearch": true,
 	"supportsExplicitPromptCacheMode": true, "supportsToolReferences": true,
 	"supportsAdditionalTools": true,
+	"supportsMidConvoEffort":  true, "allowedFallbackModels": true,
 }
 
 var piAIBooleanCompatFields = map[string]bool{
@@ -96,6 +99,7 @@ var piAIBooleanCompatFields = map[string]bool{
 	"requiresAssistantAfterToolResult": true, "requiresThinkingAsText": true,
 	"requiresReasoningContentOnAssistantMessages": true, "supportsStrictMode": true,
 	"supportsLongCacheRetention": true, "supportsEagerToolInputStreaming": true,
+	"supportsMaxOutputTokens":     true,
 	"supportsCacheControlOnTools": true, "supportsTemperature": true,
 	"forceAdaptiveThinking": true, "allowEmptySignature": true, "supportsStrictTools": true,
 }
@@ -191,6 +195,13 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		headers = removePIAIHeaders(headers, "authorization", "x-api-key")
 	}
 	headers = mergePIAIHeaders(headers, auth.Headers)
+	complete := func(run func(context.Context, ChatRequest, func(Delta) error) (Completion, error)) (Completion, error) {
+		completion, completeErr := run(ctx, req, onDelta)
+		if completeErr == nil && completion.ReplayAPI == "" {
+			completion.ReplayAPI = model.API
+		}
+		return completion, completeErr
+	}
 	switch model.API {
 	case "openai-completions":
 		provider := NewOpenAIProvider(p.profile.route, baseURL, apiKey, model.ID)
@@ -202,7 +213,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "openai-responses":
 		provider := NewOpenAIResponsesProvider(p.profile.route, baseURL, apiKey, model.ID)
 		provider.headers = headers
@@ -216,7 +227,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "anthropic-messages":
 		provider := NewAnthropicProvider(p.profile.route, baseURL, apiKey, model.ID)
 		provider.headers = headers
@@ -231,7 +242,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "google-generative-ai", "google-vertex":
 		provider := newGoogleProvider(p.profile.route, baseURL, apiKey, model.ID, model.API == "google-vertex")
 		provider.headers = headers
@@ -242,7 +253,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "mistral-conversations":
 		provider := newMistralProvider(p.profile.route, baseURL, apiKey, model.ID)
 		provider.headers = headers
@@ -252,7 +263,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "azure-openai-responses", "openai-codex-responses":
 		provider := newCatalogResponsesProvider(p.profile.route, baseURL, apiKey, model.ID, model.API == "openai-codex-responses")
 		provider.headers = headers
@@ -266,7 +277,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	case "bedrock-converse-stream":
 		provider := newBedrockProvider(p.profile.route, baseURL, apiKey, model.ID)
 		provider.headers = headers
@@ -278,7 +289,7 @@ func (p *managedPiAIProvider) Complete(ctx context.Context, req ChatRequest, onD
 		if p.profile.timeout > 0 {
 			provider.client.Timeout = p.profile.timeout
 		}
-		return provider.Complete(ctx, req, onDelta)
+		return complete(provider.Complete)
 	default:
 		return Completion{}, &ProviderError{Code: "PROVIDER", Message: fmt.Sprintf("llm-pi-ai: unsupported api %q", model.API)}
 	}
@@ -395,6 +406,7 @@ func piAISettingsSchema() map[string]any {
 		"requiresAssistantAfterToolResult": 24, "requiresThinkingAsText": 24,
 		"requiresReasoningContentOnAssistantMessages": 24, "thinkingFormat": 2,
 		"chatTemplateKwargs": 27, "chatTemplateArgs": 27, "supportsThinkingTokenBudget": 24,
+		"thinkingTokenBudgetField": 2, "vllmPriority": 32, "supportsMaxOutputTokens": 24,
 		"supportsStrictMode": 24, "cacheControlFormat": 2,
 		"supportsLongCacheRetention": 24, "supportsEagerToolInputStreaming": 24,
 		"supportsCacheControlOnTools": 24, "supportsTemperature": 24,
@@ -439,6 +451,7 @@ func piAISettingsSchema() map[string]any {
 			"29": map[string]any{"type": "number", "meta": map[string]any{}},
 			"30": map[string]any{"type": "const", "meta": map[string]any{}, "value": nil},
 			"31": map[string]any{"type": "object", "meta": map[string]any{}, "dict": map[string]any{"$var": 2, "omitWhenOff": 24}},
+			"32": map[string]any{"type": "number", "meta": map[string]any{"step": 1}},
 		},
 	}
 }
@@ -884,6 +897,14 @@ func applyPiAICompat(compat *piAIModelCompat, raw any, api string) {
 			compat.SupportsFinishReason = piAIBool(value)
 		case "supportsThinkingTokenBudget":
 			compat.SupportsThinkingTokenBudget = piAIBool(value)
+		case "thinkingTokenBudgetField":
+			compat.ThinkingTokenBudgetField = value.(string)
+		case "vllmPriority":
+			priority, _ := eventInt64(value)
+			integer := int(priority)
+			compat.VLLMPriority = &integer
+		case "supportsMaxOutputTokens":
+			compat.SupportsMaxOutputTokens = piAIBool(value)
 		case "requiresToolResultName":
 			compat.RequiresToolResultName = piAIBool(value)
 		case "requiresAssistantAfterToolResult":
@@ -979,6 +1000,15 @@ func validatePiAICompat(raw any, path string) error {
 			if !ok || field != "anthropic" {
 				return fmt.Errorf("%s cacheControlFormat is unsupported", path)
 			}
+		case key == "thinkingTokenBudgetField":
+			field, ok := rawValue.(string)
+			if !ok || field != "thinking_token_budget" && field != "thinking_budget" && field != "thinking_budget_tokens" {
+				return fmt.Errorf("%s thinkingTokenBudgetField is unsupported", path)
+			}
+		case key == "vllmPriority":
+			if _, ok := eventInt64(rawValue); !ok {
+				return fmt.Errorf("%s vllmPriority must be an integer", path)
+			}
 		case key == "chatTemplateKwargs" || key == "chatTemplateArgs":
 			kwargs, ok := rawValue.(map[string]any)
 			if !ok {
@@ -1009,8 +1039,8 @@ func validatePiAIChatTemplateKwarg(value any) error {
 			}
 		}
 		variable, ok := value["$var"].(string)
-		if !ok || variable != "thinking.enabled" && variable != "thinking.effort" {
-			return errors.New("must name $var thinking.enabled or thinking.effort")
+		if !ok || variable != "thinking.enabled" && variable != "thinking.effort" && variable != "thinking.budget" {
+			return errors.New("must name $var thinking.enabled, thinking.effort, or thinking.budget")
 		}
 		if raw, exists := value["omitWhenOff"]; exists {
 			if _, ok := raw.(bool); !ok {

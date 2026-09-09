@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsPowerShellContract(t *testing.T) {
@@ -60,6 +62,9 @@ func TestWindowsACLSandboxWorkspaceBoundary(t *testing.T) {
 	cmd.Dir = workspace
 	cmd.Env = scrubbedChildEnv(shellEnvironment())
 	configureChildProcess(cmd)
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Fatal("Windows subprocess is not configured to hide its console window")
+	}
 	state, err := prepareShellChild(cmd, sandboxWorkspaceWrite, workspace)
 	if err != nil {
 		t.Fatal(err)

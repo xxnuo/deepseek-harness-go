@@ -34,7 +34,7 @@ func NewAnthropicProvider(id, baseURL, apiKey, model string) *AnthropicProvider 
 	}
 	return &AnthropicProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{},
+		client: newHTTPClient(),
 	}
 }
 
@@ -69,7 +69,16 @@ func anthropicCacheControl(retention string, model piAIModel) map[string]any {
 	return cache
 }
 
-func anthropicMessages(messages []ChatMessage, cacheControl map[string]any, allowEmptySignature bool) []map[string]any {
+func isAnthropicEffort(value string) bool {
+	switch value {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+func anthropicMessages(messages []ChatMessage, cacheControl map[string]any, allowEmptySignature bool, model, provider string, supportsMidConvoEffort bool, activeEffort string) []map[string]any {
 	out := make([]map[string]any, 0, len(messages))
 	appendMessage := func(role string, blocks []any) {
 		if len(blocks) == 0 {
@@ -98,9 +107,13 @@ func anthropicMessages(messages []ChatMessage, cacheControl map[string]any, allo
 			}
 			appendMessage("user", blocks)
 		case "assistant":
+			if supportsMidConvoEffort && message.ReplayValid && message.NativeAPI == "anthropic-messages" && message.NativeProvider == provider && message.ProviderThinkingLevel != nil && isAnthropicEffort(*message.ProviderThinkingLevel) {
+				out = append(out, map[string]any{"role": "system", "content": []any{}, "output_config": map[string]any{"effort": *message.ProviderThinkingLevel}})
+			}
 			blocks := make([]any, 0, len(message.ToolCalls)+2)
 			if message.Reasoning != "" {
-				if strings.TrimSpace(message.ReasoningSignature) != "" {
+				sameModel := !message.ReplayStatePresent || message.ReplayValid && message.NativeAPI == "anthropic-messages" && message.NativeProvider == provider && message.NativeModel == model
+				if strings.TrimSpace(message.ReasoningSignature) != "" && sameModel {
 					blocks = append(blocks, map[string]any{"type": "thinking", "thinking": message.Reasoning, "signature": message.ReasoningSignature})
 				} else if allowEmptySignature {
 					blocks = append(blocks, map[string]any{"type": "thinking", "thinking": message.Reasoning, "signature": ""})
@@ -144,13 +157,22 @@ func anthropicMessages(messages []ChatMessage, cacheControl map[string]any, allo
 			}})
 		}
 	}
-	if cacheControl != nil && len(out) > 0 && out[len(out)-1]["role"] == "user" {
-		blocks := out[len(out)-1]["content"].([]any)
-		if len(blocks) > 0 {
-			if last, ok := blocks[len(blocks)-1].(map[string]any); ok {
-				last["cache_control"] = cacheControl
+	if cacheControl != nil {
+		for index := len(out) - 1; index >= 0; index-- {
+			if out[index]["role"] != "user" {
+				continue
 			}
+			blocks := out[index]["content"].([]any)
+			if len(blocks) > 0 {
+				if last, ok := blocks[len(blocks)-1].(map[string]any); ok {
+					last["cache_control"] = cacheControl
+				}
+			}
+			break
 		}
+	}
+	if supportsMidConvoEffort {
+		out = append(out, map[string]any{"role": "system", "content": []any{}, "output_config": map[string]any{"effort": activeEffort}})
 	}
 	return out
 }
@@ -205,11 +227,13 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	allowEmptySignature := p.modelSpec.Compat.AllowEmptySignature != nil && *p.modelSpec.Compat.AllowEmptySignature
 	supportsEagerToolInput := p.modelSpec.Compat.SupportsEagerToolInputStreaming == nil || *p.modelSpec.Compat.SupportsEagerToolInputStreaming
 	supportsStrictTools := p.modelSpec.Compat.SupportsStrictTools != nil && *p.modelSpec.Compat.SupportsStrictTools
+	supportsMidConvoEffort := p.modelSpec.Compat.SupportsMidConvoEffort != nil && *p.modelSpec.Compat.SupportsMidConvoEffort
+	activeEffort := anthropicAdaptiveEffort(p.modelSpec, req.ReasoningEffort)
 	if err := validateToolSampling(req.Tools, supportsStrictTools); err != nil {
 		return Completion{}, err
 	}
 	body := map[string]any{
-		"model": model, "messages": anthropicMessages(req.Messages, cacheControl, allowEmptySignature),
+		"model": model, "messages": anthropicMessages(req.Messages, cacheControl, allowEmptySignature, model, p.id, supportsMidConvoEffort, activeEffort),
 		"max_tokens": maxTokens, "stream": true,
 	}
 	if p.oauth {
@@ -252,7 +276,11 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 		body["tools"] = tools
 	}
 	thinkingEnabled := false
-	if p.modelSpec.ID == "" {
+	if supportsMidConvoEffort {
+		thinkingEnabled = true
+		body["thinking"] = map[string]any{"type": "adaptive", "display": "summarized", "block_binding": map[string]any{"prefix_mismatch_behavior": "drop_block"}}
+		body["output_config"] = map[string]any{"effort": activeEffort}
+	} else if p.modelSpec.ID == "" {
 		if req.ReasoningEffort == "off" || req.Thinking == "disabled" {
 			body["thinking"] = map[string]any{"type": "disabled"}
 		} else if req.ReasoningEffort != "" || req.Thinking == "enabled" {
@@ -304,8 +332,14 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	if len(req.Tools) > 0 && !supportsEagerToolInput {
 		betas = append(betas, "fine-grained-tool-streaming-2025-05-14")
 	}
-	if p.modelSpec.Compat.ForceAdaptiveThinking == nil || !*p.modelSpec.Compat.ForceAdaptiveThinking {
+	if !supportsMidConvoEffort && (p.modelSpec.Compat.ForceAdaptiveThinking == nil || !*p.modelSpec.Compat.ForceAdaptiveThinking) {
 		betas = append(betas, "interleaved-thinking-2025-05-14")
+	}
+	if len(p.modelSpec.Compat.AllowedFallbackModels) > 0 {
+		betas = append(betas, "server-side-fallback-2026-07-01")
+	}
+	if supportsMidConvoEffort {
+		betas = append(betas, "mid-conversation-output-config-2026-07-01", "thinking-binding-controls-2026-08-01")
 	}
 	if len(betas) > 0 {
 		hreq.Header.Set("Anthropic-Beta", strings.Join(betas, ","))
@@ -333,7 +367,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 		return Completion{}, providerHTTPFailure(resp, string(payload))
 	}
 
-	var text, reasoning, reasoningSignature, finish string
+	var text, reasoning, reasoningSignature, finish, responseModel, responseID string
 	usage := map[string]any{}
 	calls := map[int]*ToolCall{}
 	order := make([]int, 0)
@@ -355,6 +389,8 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 		switch typeName {
 		case "message_start":
 			if message, ok := event["message"].(map[string]any); ok {
+				responseModel = stringSetting(message["model"])
+				responseID = stringSetting(message["id"])
 				if value, ok := message["usage"].(map[string]any); ok {
 					for key, raw := range value {
 						usage[key] = raw
@@ -459,7 +495,11 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req ChatRequest, onDel
 	if text == "" && reasoning == "" && len(toolCalls) == 0 {
 		return Completion{}, &ProviderError{Code: "EMPTY_RESPONSE", Message: "model returned a completed response with no content"}
 	}
-	return Completion{Text: text, Reasoning: reasoning, ReasoningSignature: reasoningSignature, ToolCalls: toolCalls, Usage: usage, Finish: finish}, nil
+	completion := Completion{Text: text, Reasoning: reasoning, ReasoningSignature: reasoningSignature, ToolCalls: toolCalls, Usage: usage, Finish: finish, ReplayAPI: "anthropic-messages", ResponseModel: responseModel, ResponseID: responseID}
+	if supportsMidConvoEffort {
+		completion.ProviderThinkingLevel = &activeEffort
+	}
+	return completion, nil
 }
 
 func jsonInt(value any) int {

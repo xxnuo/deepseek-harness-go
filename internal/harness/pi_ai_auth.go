@@ -27,7 +27,7 @@ type piAIAuthResolution struct {
 }
 
 var (
-	piAIAuthHTTPClient       = &http.Client{Timeout: 30 * time.Second}
+	piAIAuthHTTPClient       = func() *http.Client { client := newHTTPClient(); client.Timeout = 30 * time.Second; return client }()
 	piAIAnthropicTokenURL    = "https://platform.claude.com/v1/oauth/token"
 	piAIOpenAICodexTokenURL  = "https://auth.openai.com/oauth/token"
 	piAIXAITokenURL          = "https://auth.x.ai/oauth2/token"

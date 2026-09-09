@@ -7,43 +7,48 @@ import (
 	"strings"
 )
 
-const piAICatalogPackageVersion = "0.84.2"
-const piAICatalogManifestHash = "012f19b2e2c92706bc700f4c9dd80a21f1f43d68959bc90c78d2cdb51374d5cc"
+const piAICatalogPackageVersion = "0.85.1"
+const piAICatalogManifestHash = "ff87cfcb3c1decb7ceeb4a5d71282696e108d093b7098f372d6f8a442dfed40d"
 
 //go:embed pi_ai_catalog.json
 var piAICatalogJSON []byte
 
 type piAIModelCompat struct {
-	ThinkingFormat                   string         `json:"thinkingFormat,omitempty"`
-	CacheControlFormat               string         `json:"cacheControlFormat,omitempty"`
-	MaxTokensField                   string         `json:"maxTokensField,omitempty"`
-	SessionAffinityFormat            string         `json:"sessionAffinityFormat,omitempty"`
-	DeferredToolsMode                string         `json:"deferredToolsMode,omitempty"`
-	ChatTemplateKwargs               map[string]any `json:"chatTemplateKwargs,omitempty"`
-	ChatTemplateArgs                 map[string]any `json:"chatTemplateArgs,omitempty"`
-	SupportsReasoningEffort          *bool          `json:"supportsReasoningEffort,omitempty"`
-	SupportsLongCacheRetention       *bool          `json:"supportsLongCacheRetention,omitempty"`
-	SupportsExplicitPromptCacheMode  *bool          `json:"supportsExplicitPromptCacheMode,omitempty"`
-	SupportsStore                    *bool          `json:"supportsStore,omitempty"`
-	SupportsUsageInStreaming         *bool          `json:"supportsUsageInStreaming,omitempty"`
-	SupportsFinishReason             *bool          `json:"supportsFinishReason,omitempty"`
-	SupportsThinkingTokenBudget      *bool          `json:"supportsThinkingTokenBudget,omitempty"`
-	RequiresToolResultName           *bool          `json:"requiresToolResultName,omitempty"`
-	RequiresAssistantAfterToolResult *bool          `json:"requiresAssistantAfterToolResult,omitempty"`
-	RequiresThinkingAsText           *bool          `json:"requiresThinkingAsText,omitempty"`
-	ForceAdaptiveThinking            *bool          `json:"forceAdaptiveThinking,omitempty"`
-	SendSessionAffinityHeaders       *bool          `json:"sendSessionAffinityHeaders,omitempty"`
-	SupportsCacheControlOnTools      *bool          `json:"supportsCacheControlOnTools,omitempty"`
-	SupportsDeveloperRole            *bool          `json:"supportsDeveloperRole,omitempty"`
-	RequiresReasoningContent         *bool          `json:"requiresReasoningContentOnAssistantMessages,omitempty"`
-	SupportsEagerToolInputStreaming  *bool          `json:"supportsEagerToolInputStreaming,omitempty"`
-	SupportsStrictMode               *bool          `json:"supportsStrictMode,omitempty"`
-	SupportsOpenAIGrammarTools       *bool          `json:"supportsOpenAIGrammarTools,omitempty"`
-	SupportsToolSearch               *bool          `json:"supportsToolSearch,omitempty"`
-	SupportsTemperature              *bool          `json:"supportsTemperature,omitempty"`
-	SupportsStrictTools              *bool          `json:"supportsStrictTools,omitempty"`
-	AllowEmptySignature              *bool          `json:"allowEmptySignature,omitempty"`
-	ZaiToolStream                    *bool          `json:"zaiToolStream,omitempty"`
+	ThinkingFormat                   string            `json:"thinkingFormat,omitempty"`
+	CacheControlFormat               string            `json:"cacheControlFormat,omitempty"`
+	MaxTokensField                   string            `json:"maxTokensField,omitempty"`
+	SessionAffinityFormat            string            `json:"sessionAffinityFormat,omitempty"`
+	DeferredToolsMode                string            `json:"deferredToolsMode,omitempty"`
+	ChatTemplateKwargs               map[string]any    `json:"chatTemplateKwargs,omitempty"`
+	ChatTemplateArgs                 map[string]any    `json:"chatTemplateArgs,omitempty"`
+	SupportsReasoningEffort          *bool             `json:"supportsReasoningEffort,omitempty"`
+	SupportsLongCacheRetention       *bool             `json:"supportsLongCacheRetention,omitempty"`
+	SupportsExplicitPromptCacheMode  *bool             `json:"supportsExplicitPromptCacheMode,omitempty"`
+	SupportsStore                    *bool             `json:"supportsStore,omitempty"`
+	SupportsUsageInStreaming         *bool             `json:"supportsUsageInStreaming,omitempty"`
+	SupportsFinishReason             *bool             `json:"supportsFinishReason,omitempty"`
+	SupportsThinkingTokenBudget      *bool             `json:"supportsThinkingTokenBudget,omitempty"`
+	ThinkingTokenBudgetField         string            `json:"thinkingTokenBudgetField,omitempty"`
+	VLLMPriority                     *int              `json:"vllmPriority,omitempty"`
+	SupportsMaxOutputTokens          *bool             `json:"supportsMaxOutputTokens,omitempty"`
+	RequiresToolResultName           *bool             `json:"requiresToolResultName,omitempty"`
+	RequiresAssistantAfterToolResult *bool             `json:"requiresAssistantAfterToolResult,omitempty"`
+	RequiresThinkingAsText           *bool             `json:"requiresThinkingAsText,omitempty"`
+	ForceAdaptiveThinking            *bool             `json:"forceAdaptiveThinking,omitempty"`
+	SendSessionAffinityHeaders       *bool             `json:"sendSessionAffinityHeaders,omitempty"`
+	SupportsCacheControlOnTools      *bool             `json:"supportsCacheControlOnTools,omitempty"`
+	SupportsDeveloperRole            *bool             `json:"supportsDeveloperRole,omitempty"`
+	RequiresReasoningContent         *bool             `json:"requiresReasoningContentOnAssistantMessages,omitempty"`
+	SupportsEagerToolInputStreaming  *bool             `json:"supportsEagerToolInputStreaming,omitempty"`
+	SupportsStrictMode               *bool             `json:"supportsStrictMode,omitempty"`
+	SupportsOpenAIGrammarTools       *bool             `json:"supportsOpenAIGrammarTools,omitempty"`
+	SupportsToolSearch               *bool             `json:"supportsToolSearch,omitempty"`
+	SupportsTemperature              *bool             `json:"supportsTemperature,omitempty"`
+	SupportsMidConvoEffort           *bool             `json:"supportsMidConvoEffort,omitempty"`
+	AllowedFallbackModels            []json.RawMessage `json:"allowedFallbackModels,omitempty"`
+	SupportsStrictTools              *bool             `json:"supportsStrictTools,omitempty"`
+	AllowEmptySignature              *bool             `json:"allowEmptySignature,omitempty"`
+	ZaiToolStream                    *bool             `json:"zaiToolStream,omitempty"`
 }
 
 type piAIModel struct {

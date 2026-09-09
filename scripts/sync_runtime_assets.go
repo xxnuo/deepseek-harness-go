@@ -26,9 +26,9 @@ const testAssetDestination = "testdata/upstream"
 const clientBuildVerificationProgram = `import { officialClientBuildEnvironment, readClientBuildRecord } from './scripts/client-build-environment.ts'; const root = process.cwd(); readClientBuildRecord(root, officialClientBuildEnvironment(root));`
 
 var testAssetPaths = []string{
-	"snapshots/sdk/text-turn/session.jsonl",
-	"snapshots/sdk/bash-tool/session.jsonl",
-	"snapshots/session/compaction-recovery/session.jsonl",
+	"snapshots/sdk/text-turn/session.v2.jsonl",
+	"snapshots/sdk/bash-tool/session.v2.jsonl",
+	"snapshots/session/compaction-recovery/session.v2.jsonl",
 }
 
 func main() {

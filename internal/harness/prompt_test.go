@@ -1501,8 +1501,11 @@ func TestShippedPresetFiltersModelToolCatalog(t *testing.T) {
 			t.Fatalf("standard preset omitted %q: %#v", name, standard)
 		}
 	}
+	if standard["str_replace_editor"] {
+		t.Fatalf("standard preset retained opt-in str_replace_editor: %#v", standard)
+	}
 	minimal := toolNames("minimal")
-	if !minimal["bash"] || !minimal["embedding_tool"] {
+	if !minimal["bash"] || !minimal["embedding_tool"] || !minimal["str_replace_editor"] {
 		t.Fatalf("minimal preset tools = %#v", minimal)
 	}
 	for _, name := range []string{"read", "write", "edit", "glob", "grep"} {

@@ -733,6 +733,14 @@ func TestSessionExportZIPDeduplicatesMedia(t *testing.T) {
 	if _, err := e.appendEvent(mustSession(t, e, id), "tool/result", map[string]any{"message": map[string]any{"content": []ContentBlock{{Type: "tool-result", Content: []ContentBlock{{Type: "image", Attachment: &ref}}}}}}); err != nil {
 		t.Fatal(err)
 	}
+	fileData := []byte("exported generic file")
+	fileRef, err := e.StoreFile(base64.StdEncoding.EncodeToString(fileData), "../notes.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.appendEvent(mustSession(t, e, id), "user/message", map[string]any{"content": []ContentBlock{{Type: "file", FileAttachment: &fileRef}, {Type: "file", FileAttachment: &fileRef}}}); err != nil {
+		t.Fatal(err)
+	}
 	var archive bytes.Buffer
 	if err := e.ExportSessionZIP(id, false, &archive); err != nil {
 		t.Fatal(err)
@@ -742,8 +750,11 @@ func TestSessionExportZIPDeduplicatesMedia(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantMedia := "media/" + ref.AttachmentID + ".png"
+	digest := strings.TrimPrefix(fileRef.AttachmentID, "sha256:")
+	wantFile := "files/" + digest[:2] + "/" + digest + "/notes.txt"
 	seen := map[string]int{}
 	var media []byte
+	var generic []byte
 	for _, file := range zr.File {
 		seen[file.Name]++
 		if file.Name == wantMedia {
@@ -757,12 +768,26 @@ func TestSessionExportZIPDeduplicatesMedia(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		if file.Name == wantFile {
+			reader, err := file.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			generic, err = io.ReadAll(reader)
+			_ = reader.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	if seen["session.jsonl"] != 1 || seen[wantMedia] != 1 || len(seen) != 2 {
-		t.Fatalf("zip entries = %#v, want session.jsonl + %s", seen, wantMedia)
+	if seen["session.v2.jsonl"] != 1 || seen[wantMedia] != 1 || seen[wantFile] != 1 || len(seen) != 3 {
+		t.Fatalf("zip entries = %#v, want session.v2.jsonl + %s + %s", seen, wantMedia, wantFile)
 	}
 	if !bytes.Equal(media, pngData) {
 		t.Fatalf("exported media differs: %d vs %d bytes", len(media), len(pngData))
+	}
+	if !bytes.Equal(generic, fileData) {
+		t.Fatalf("exported generic file differs: %d vs %d bytes", len(generic), len(fileData))
 	}
 }
 

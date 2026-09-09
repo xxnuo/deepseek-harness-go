@@ -26,7 +26,7 @@ type mistralProvider struct {
 func newMistralProvider(id, baseURL, apiKey, model string) *mistralProvider {
 	return &mistralProvider{
 		id: id, baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, model: model,
-		client: &http.Client{},
+		client: newHTTPClient(),
 	}
 }
 

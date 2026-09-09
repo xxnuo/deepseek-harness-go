@@ -139,14 +139,17 @@ func TestOpenAIProviderModelDiscoveryKeepsGatewayMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 2 {
+	if len(models) != 3 {
 		t.Fatalf("models = %#v", models)
 	}
 	if models[0].ID != "large" || models[0].Name != "Large" || models[0].ContextWindow != 65536 || models[0].MaxTokens != 4096 {
 		t.Fatalf("large metadata = %#v", models[0])
 	}
-	if models[1].ID != "small" || models[1].Name != "small" {
-		t.Fatalf("small metadata = %#v", models[1])
+	if models[1].ID != "large" || models[1].Name != "large" {
+		t.Fatalf("duplicate metadata = %#v", models[1])
+	}
+	if models[2].ID != "small" || models[2].Name != "small" {
+		t.Fatalf("small metadata = %#v", models[2])
 	}
 }
 

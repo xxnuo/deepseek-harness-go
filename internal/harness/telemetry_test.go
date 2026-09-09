@@ -185,7 +185,7 @@ func TestSessionTelemetryFeedbackOnlyAndDisabled(t *testing.T) {
 			t.Fatal(err)
 		}
 		records, shutdowns := sink.snapshot()
-		if len(records) != 0 || shutdowns != 0 || len(warnings) != 1 || !strings.Contains(warnings[0], "remains local") {
+		if len(records) != 0 || shutdowns != 0 || len(warnings) != 1 || !strings.Contains(warnings[0], "not uploaded through OpenTelemetry") {
 			t.Fatalf("records=%#v shutdowns=%d warnings=%v", records, shutdowns, warnings)
 		}
 	})

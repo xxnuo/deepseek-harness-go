@@ -12,6 +12,14 @@ func finalAssistantOutput(events []Event) []ContentBlock {
 			if len(blocks) > 0 {
 				selected = cloneContentBlocks(blocks)
 			}
+			fallthrough
+		case "assistant/attempt":
+			data, _ := event.Data.(map[string]any)
+			for _, timed := range assistantStreamChunks(data["stream"]) {
+				if timed.chunk["type"] == "text-delta" {
+					partial.WriteString(stringValue(timed.chunk["text"]))
+				}
+			}
 		case "assistant/chunk":
 			data, _ := event.Data.(map[string]any)
 			chunk, _ := data["chunk"].(map[string]any)
